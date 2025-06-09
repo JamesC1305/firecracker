@@ -50,6 +50,9 @@ pub enum VmmAction {
     /// Configure the metrics using as input the `MetricsConfig`. This action can only be called
     /// before the microVM has booted.
     ConfigureMetrics(MetricsConfig),
+    /// Create an in-memory checkpoint that the VM can later reset back to. This action can only be
+    /// called after the microVM is created, and only when the microVM is in `Paused` state.
+    CreateResetCheckpoint,
     /// Create a snapshot using as input the `CreateSnapshotParams`. This action can only be called
     /// after the microVM has booted and only when the microVM is in `Paused` state.
     CreateSnapshot(CreateSnapshotParams),
@@ -76,6 +79,9 @@ pub enum VmmAction {
     /// `NetworkInterfaceConfig` as input. This action can only be called before the microVM has
     /// booted.
     InsertNetworkDevice(NetworkInterfaceConfig),
+    /// Load the previously saved in-memory microVM checkpoint. This action can only be called
+    /// after the microVM has booted and only when the microVM is in `Paused` state.     
+    LoadResetCheckpoint,
     /// Load the microVM state using as input the `LoadSnapshotParams`. This action can only be
     /// called before the microVM has booted. If this action is successful, the loaded microVM will
     /// be in `Paused` state. Should change this state to `Resumed` for the microVM to run.
@@ -438,7 +444,9 @@ impl<'a> PrebootApiController<'a> {
             SetEntropyDevice(config) => self.set_entropy_device(config),
             // Operations not allowed pre-boot.
             CreateSnapshot(_)
+            | CreateResetCheckpoint
             | FlushMetrics
+            | LoadResetCheckpoint
             | Pause
             | Resume
             | GetBalloonStats
@@ -618,6 +626,7 @@ impl RuntimeApiController {
         use self::VmmAction::*;
         match request {
             // Supported operations allowed post-boot.
+            CreateResetCheckpoint => self.create_reset_checkpoint(),
             CreateSnapshot(snapshot_create_cfg) => self.create_snapshot(&snapshot_create_cfg),
             FlushMetrics => self.flush_metrics(),
             GetBalloonConfig => self
@@ -645,6 +654,7 @@ impl RuntimeApiController {
             GetVmmVersion => Ok(VmmData::VmmVersion(
                 self.vmm.lock().expect("Poisoned lock").version(),
             )),
+            LoadResetCheckpoint => self.load_reset_checkpoint(),
             PatchMMDS(value) => self.patch_mmds(value),
             Pause => self.pause(),
             PutMMDS(value) => self.put_mmds(value),
@@ -837,6 +847,16 @@ impl RuntimeApiController {
             .map(|()| VmmData::Empty)
             .map_err(NetworkInterfaceError::DeviceUpdate)
             .map_err(VmmActionError::NetworkConfig)
+    }
+
+    fn create_reset_checkpoint(&self) -> Result<VmmData, VmmActionError> {
+        info!("Create checkpoint!");
+        Ok(VmmData::Empty)
+    }
+
+    fn load_reset_checkpoint(&self) -> Result<VmmData, VmmActionError> {
+        info!("Load checkpoint!");
+        Ok(VmmData::Empty)
     }
 }
 
