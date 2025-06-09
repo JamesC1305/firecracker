@@ -13,6 +13,7 @@ use super::ApiServer;
 use super::request::actions::parse_put_actions;
 use super::request::balloon::{parse_get_balloon, parse_patch_balloon, parse_put_balloon};
 use super::request::boot_source::parse_put_boot_source;
+use super::request::checkpoint::parse_put_checkpoint;
 use super::request::cpu_configuration::parse_put_cpu_config;
 use super::request::drive::{parse_patch_drive, parse_put_drive};
 use super::request::entropy::parse_put_entropy;
@@ -87,6 +88,7 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "actions", Some(body)) => parse_put_actions(body),
             (Method::Put, "balloon", Some(body)) => parse_put_balloon(body),
             (Method::Put, "boot-source", Some(body)) => parse_put_boot_source(body),
+            (Method::Put, "checkpoint", None) => parse_put_checkpoint(path_tokens.next()),
             (Method::Put, "cpu-config", Some(body)) => parse_put_cpu_config(body),
             (Method::Put, "drives", Some(body)) => parse_put_drive(body, path_tokens.next()),
             (Method::Put, "logger", Some(body)) => parse_put_logger(body),
@@ -992,6 +994,25 @@ pub mod tests {
         let body = "{ \"iface_id\": \"string\" }";
         sender
             .write_all(http_request("PATCH", "/network-interfaces/string", Some(body)).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        ParsedRequest::try_from(&req).unwrap();
+    }
+
+    #[test]
+    fn test_try_from_put_checkpoint() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        sender
+            .write_all(http_request("PUT", "/checkpoint/create", None).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        ParsedRequest::try_from(&req).unwrap();
+
+        sender
+            .write_all(http_request("PUT", "/checkpoint/load", None).as_bytes())
             .unwrap();
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();
