@@ -15,8 +15,10 @@ use std::sync::{Arc, Mutex};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use vm_memory::{GuestMemory, GuestMemoryRegion, MemoryRegionAddress};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
+use crate::arch::ArchVmError;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::vcpu::get_manufacturer_id_from_host;
 use crate::builder::{self, BuildMicrovmFromSnapshotError};
@@ -36,10 +38,10 @@ use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
-use crate::vstate::memory;
+use crate::vstate::memory::{self, GuestMemoryExtension};
 use crate::vstate::memory::{GuestMemoryState, GuestRegionMmap, MemoryError};
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
-use crate::vstate::vm::VmState;
+use crate::vstate::vm::{VmError, VmState};
 use crate::{EventManager, Vmm, vstate};
 
 /// Holds information related to the VM that is not part of VmState.
@@ -582,11 +584,119 @@ fn send_uffd_handshake(
     Ok(())
 }
 
+/// Errors associated with creating a checkpoint
+#[rustfmt::skip]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum CreateCheckpointError {
+    /// Cannot save the microVM state: {0}
+    MicrovmState(MicrovmStateError),
+    /// Failed to allocate memory for the checkpoint: {0}
+    AllocatingCheckpointMemory(MemoryError),
+    /// Checkpoint regions do not match memory regions 
+    MismatchedRegions,
+    /// Cannot create volatile slices of memory
+    CreateSlice(vm_memory::GuestMemoryError),
+}
+
+/// Errors associated with restoring from a checkpoint
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum RestoreCheckpointError {
+    /// No checkpoint exists in the VMM
+    MissingCheckpoint,
+    /// Failed to register memory regions: {0}
+    RegisterMemoryRegions(VmError),
+    /// Failed to restore microVM state: {0}
+    RestoreState(ArchVmError),
+    /// Failed to unregister old memory regions: {0}
+    UnregisterMemoryRegions(VmError),
+    /// Failed to replace old memory regions with checkpoint mappings: {0}
+    ReplaceMemoryRegions(MemoryError),
+}
+
 /// Stores the state of a microVM in memory
 #[derive(Debug)]
 pub struct Checkpoint {
     microvm_state: MicrovmState,
     checkpoint_memory: Vec<GuestRegionMmap>,
+}
+
+/// Create an in-memory checkpoint of the current VM state.
+pub fn create_checkpoint(
+    vmm: &mut Vmm,
+    vm_resources: &VmResources,
+) -> Result<Checkpoint, CreateCheckpointError> {
+    let vm_info = VmInfo::from(vm_resources);
+
+    let microvm_state = vmm
+        .save_state(&vm_info)
+        .map_err(CreateCheckpointError::MicrovmState)?;
+
+    let checkpoint_guest_mem = vm_resources
+        .allocate_guest_memory(true)
+        .map_err(CreateCheckpointError::AllocatingCheckpointMemory)?;
+
+    // Copy the contents of the guest's memory regions to the allocated checkpoint regions
+    vmm.vm
+        .guest_memory()
+        .iter()
+        .zip(checkpoint_guest_mem.iter())
+        .try_for_each(|(mem_region, checkpoint_region)| {
+            if checkpoint_region.size() != mem_region.size() {
+                return Err(CreateCheckpointError::MismatchedRegions);
+            }
+
+            let mem_slice = mem_region
+                .get_slice(MemoryRegionAddress(0), mem_region.size())
+                .map_err(CreateCheckpointError::CreateSlice)?;
+
+            let checkpoint_slice = checkpoint_region
+                .get_slice(MemoryRegionAddress(0), checkpoint_region.size())
+                .map_err(CreateCheckpointError::CreateSlice)?;
+
+            // TODO: This doesn't require any additional unsafe code to be written, but is also
+            // quite a lot slower than a memcpy (~950ms vs. 1600ms). Would need some performance
+            // profiling to see where the time is being spent, and if rust-vmm could be extended
+            // to improve the speed of this.
+
+            mem_slice.copy_to_volatile_slice(checkpoint_slice);
+
+            Ok(())
+        })?;
+
+    let checkpoint = Checkpoint {
+        microvm_state,
+        checkpoint_memory: checkpoint_guest_mem,
+    };
+
+    Ok(checkpoint)
+}
+
+/// Load a VM state checkpoint, resetting back to a previous state
+pub fn load_checkpoint(vmm: &mut Vmm) -> Result<(), RestoreCheckpointError> {
+    let checkpoint = vmm
+        .checkpoint
+        .as_ref()
+        .ok_or(RestoreCheckpointError::MissingCheckpoint)?;
+
+    vmm.vm
+        .unregister_all_memory_regions()
+        .map_err(RestoreCheckpointError::UnregisterMemoryRegions)?;
+
+    let new_regions = vmm
+        .vm
+        .guest_memory()
+        .create_regions_from_checkpoint(&checkpoint.checkpoint_memory)
+        .map_err(RestoreCheckpointError::ReplaceMemoryRegions)?;
+
+    vmm.vm
+        .register_memory_regions(new_regions)
+        .map_err(RestoreCheckpointError::RegisterMemoryRegions)?;
+
+    vmm.vm
+        .restore_state(&checkpoint.microvm_state.vm_state)
+        .map_err(RestoreCheckpointError::RestoreState)?;
+
+    Ok(())
 }
 
 #[cfg(test)]

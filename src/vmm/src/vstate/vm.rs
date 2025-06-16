@@ -175,6 +175,31 @@ impl Vm {
         Ok(())
     }
 
+    /// Unregister all regions currently registered to this [`Vm`].
+    pub fn unregister_all_memory_regions(&mut self) -> Result<(), VmError> {
+        for (region, slot) in self.guest_memory().iter().zip(0u32..) {
+            let kvm_memory_region = kvm_userspace_memory_region {
+                slot,
+                guest_phys_addr: region.start_addr().raw_value(),
+                memory_size: 0,
+                userspace_addr: region.as_ptr() as u64,
+                flags: 0,
+            };
+
+            // SAFETY: the fd is a valid KVM file descriptor, and the region has not been
+            // previously unregistered.
+            unsafe {
+                self.fd()
+                    .set_user_memory_region(kvm_memory_region)
+                    .map_err(VmError::SetUserMemoryRegion)?;
+            }
+        }
+
+        self.common.guest_memory = GuestMemoryMmap::default();
+
+        Ok(())
+    }
+
     /// Gets a reference to the kvm file descriptor owned by this VM.
     pub fn fd(&self) -> &VmFd {
         &self.common.fd

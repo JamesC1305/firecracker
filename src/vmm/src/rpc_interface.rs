@@ -8,7 +8,7 @@ use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
 
 use super::builder::build_and_boot_microvm;
-use super::persist::{create_snapshot, restore_from_snapshot};
+use super::persist::{create_checkpoint, create_snapshot, restore_from_snapshot};
 use super::resources::VmResources;
 use super::{Vmm, VmmError};
 use crate::EventManager;
@@ -16,7 +16,10 @@ use crate::builder::StartMicrovmError;
 use crate::cpu_config::templates::{CustomCpuTemplate, GuestConfigError};
 use crate::logger::{LoggerConfig, info, warn, *};
 use crate::mmds::data_store::{self, Mmds};
-use crate::persist::{CreateSnapshotError, RestoreFromSnapshotError, VmInfo};
+use crate::persist::{
+    CreateCheckpointError, CreateSnapshotError, RestoreCheckpointError, RestoreFromSnapshotError,
+    VmInfo, load_checkpoint,
+};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
 use crate::vmm_config::balloon::{
@@ -136,6 +139,8 @@ pub enum VmmActionError {
     BalloonConfig(#[from] BalloonConfigError),
     /// Boot source error: {0}
     BootSource(#[from] BootSourceConfigError),
+    /// Create checkpoint error: {0}
+    CreateCheckpoint(#[from] CreateCheckpointError),
     /// Create snapshot error: {0}
     CreateSnapshot(#[from] CreateSnapshotError),
     /// Configure CPU error: {0}
@@ -170,6 +175,8 @@ pub enum VmmActionError {
     OperationNotSupportedPostBoot,
     /// The requested operation is not supported before starting the microVM.
     OperationNotSupportedPreBoot,
+    /// Checkpoint restore error: {0}
+    RestoreCheckpoint(#[from] RestoreCheckpointError),
     /// Start microvm error: {0}
     StartMicrovm(#[from] StartMicrovmError),
     /// Vsock config error: {0}
@@ -850,12 +857,21 @@ impl RuntimeApiController {
     }
 
     fn create_checkpoint(&self) -> Result<VmmData, VmmActionError> {
-        info!("Create checkpoint!");
+        let mut locked_vmm = self.vmm.lock().expect("Poisoned lock");
+
+        let checkpoint = create_checkpoint(&mut locked_vmm, &self.vm_resources)
+            .map_err(VmmActionError::CreateCheckpoint)?;
+
+        locked_vmm.register_checkpoint(checkpoint);
+
         Ok(VmmData::Empty)
     }
 
     fn load_checkpoint(&self) -> Result<VmmData, VmmActionError> {
-        info!("Load checkpoint!");
+        let mut locked_vmm = self.vmm.lock().expect("Poisoned lock");
+
+        load_checkpoint(&mut locked_vmm).map_err(VmmActionError::RestoreCheckpoint)?;
+
         Ok(VmmData::Empty)
     }
 }

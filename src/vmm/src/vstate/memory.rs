@@ -48,6 +48,10 @@ pub enum MemoryError {
     MemfdSetLen(std::io::Error),
     /// Total sum of memory regions exceeds largest possible file offset
     OffsetTooLarge,
+    /// The provided checkpoint regions do not match the VM's current regions
+    CheckpointUnmatchedRegions,
+    /// The checkpoint provided is missing a memfd descriptor
+    CheckpointMissingMemfd,
 }
 
 /// Creates a `Vec` of `GuestRegionMmap` with the given configuration
@@ -158,6 +162,12 @@ where
 
     /// Store the dirty bitmap in internal store
     fn store_dirty_bitmap(&self, dirty_bitmap: &DirtyBitmap, page_size: usize);
+
+    /// Replace the current GuestMemoryRegions with valid checkpointed regions
+    fn create_regions_from_checkpoint(
+        &self,
+        checkpointed_regions: &[GuestRegionMmap],
+    ) -> Result<Vec<GuestRegionMmap>, MemoryError>;
 }
 
 /// State of a guest memory region saved to file/buffer.
@@ -307,6 +317,40 @@ impl GuestMemoryExtension for GuestMemoryMmap {
                 }
             }
         });
+    }
+
+    fn create_regions_from_checkpoint(
+        &self,
+        checkpointed_regions: &[GuestRegionMmap],
+    ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+        checkpointed_regions
+            .iter()
+            .map(|checkpoint_region| {
+                let size = checkpoint_region.size();
+
+                let file_offset = match checkpoint_region.file_offset() {
+                    Some(offset) => Ok(offset.clone()),
+                    None => Err(MemoryError::CheckpointMissingMemfd),
+                }?;
+
+                let builder = MmapRegionBuilder::new_with_bitmap(
+                    size,
+                    checkpoint_region
+                        .bitmap()
+                        .is_some()
+                        .then(|| AtomicBitmap::with_len(size)),
+                )
+                .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
+                .with_mmap_flags(libc::MAP_NORESERVE | libc::MAP_PRIVATE)
+                .with_file_offset(file_offset);
+
+                GuestRegionMmap::new(
+                    builder.build().map_err(MemoryError::MmapRegionError)?,
+                    checkpoint_region.start_addr(),
+                )
+                .map_err(MemoryError::VmMemoryError)
+            })
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
