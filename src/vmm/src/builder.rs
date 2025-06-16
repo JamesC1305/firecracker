@@ -191,6 +191,7 @@ fn create_vmm_and_vcpus(
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
         acpi_device_manager,
+        checkpoint: None,
     };
 
     Ok((vmm, vcpus))
@@ -914,6 +915,7 @@ pub(crate) mod tests {
             #[cfg(target_arch = "x86_64")]
             pio_device_manager,
             acpi_device_manager,
+            checkpoint: None,
         }
     }
 

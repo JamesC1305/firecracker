@@ -125,6 +125,7 @@ use device_manager::acpi::ACPIDeviceManager;
 use device_manager::resources::ResourceAllocator;
 use devices::acpi::vmgenid::VmGenIdError;
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
+use persist::Checkpoint;
 use seccomp::BpfProgram;
 use userfaultfd::Uffd;
 use vmm_sys_util::epoll::EventSet;
@@ -321,6 +322,9 @@ pub struct Vmm {
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
     acpi_device_manager: ACPIDeviceManager,
+
+    // Optional checkpoint for resetting.
+    checkpoint: Option<Checkpoint>,
 }
 
 impl Vmm {
@@ -801,6 +805,11 @@ impl Vmm {
     #[cfg(feature = "gdb")]
     pub fn vm(&self) -> &Vm {
         &self.vm
+    }
+
+    /// Register a checkpoint of VM state within the VMM
+    pub fn register_checkpoint(&mut self, checkpoint: Checkpoint) {
+        self.checkpoint = Some(checkpoint);
     }
 }
 

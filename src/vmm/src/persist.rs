@@ -582,6 +582,13 @@ fn send_uffd_handshake(
     Ok(())
 }
 
+/// Stores the state of a microVM in memory
+#[derive(Debug)]
+pub struct Checkpoint {
+    microvm_state: MicrovmState,
+    checkpoint_memory: Vec<GuestRegionMmap>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::net::UnixListener;
