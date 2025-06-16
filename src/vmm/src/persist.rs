@@ -15,8 +15,10 @@ use std::sync::{Arc, Mutex};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use vm_memory::GuestMemory;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
+use crate::arch::ArchVmError;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::vcpu::get_manufacturer_id_from_host;
 use crate::builder::{self, BuildMicrovmFromSnapshotError};
@@ -39,7 +41,7 @@ use crate::vstate::kvm::KvmState;
 use crate::vstate::memory;
 use crate::vstate::memory::{GuestMemoryState, GuestRegionMmap, MemoryError};
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
-use crate::vstate::vm::VmState;
+use crate::vstate::vm::{VmError, VmState};
 use crate::{EventManager, Vmm, vstate};
 
 /// Holds information related to the VM that is not part of VmState.
@@ -582,6 +584,31 @@ fn send_uffd_handshake(
     Ok(())
 }
 
+/// Errors associated with creating a checkpoint
+#[rustfmt::skip]
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum CreateCheckpointError {
+    /// Cannot save the microVM state: {0}
+    MicrovmState(MicrovmStateError),
+    /// Failed to allocate memory for the checkpoint: {0}
+    AllocatingCheckpointMemory(MemoryError),
+    /// Failed to create GuestMemoryMmap: {0}
+    CreateMemoryMmap(vm_memory::Error),
+}
+
+/// Errors associated with restoring from a checkpoint
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum RestoreCheckpointError {
+    /// No checkpoint exists in the VMM
+    MissingCheckpoint,
+    /// Failed to create GuestMemoryMmap: {0}
+    CreateMemoryMmap(vm_memory::Error),
+    /// Failed to register memory regions: {0}
+    RegisterMemoryRegions(VmError),
+    /// Failed to restore microVM state: {0}
+    RestoreState(ArchVmError),
+}
+
 /// Stores the state of a microVM in memory
 #[derive(Debug)]
 pub struct Checkpoint {
@@ -590,6 +617,80 @@ pub struct Checkpoint {
 }
 
 /// Create an in-memory checkpoint of the current VM state.
+pub fn create_checkpoint(
+    vmm: &mut Vmm,
+    vm_resources: &VmResources,
+) -> Result<Checkpoint, CreateCheckpointError> {
+    let vm_info = VmInfo::from(vm_resources);
+
+    let checkpoint_guest_mem = vm_resources
+        .allocate_guest_memory()
+        .map_err(CreateCheckpointError::AllocatingCheckpointMemory)?;
+
+    let microvm_state = vmm
+        .save_state(&vm_info)
+        .map_err(CreateCheckpointError::MicrovmState)?;
+
+    // Copy the contents of the guest's memory regions to the allocated checkpoint regions
+    vmm.vm
+        .guest_memory()
+        .iter()
+        .zip(checkpoint_guest_mem.iter())
+        .for_each(|(mem_region, checkpoint_region)| {
+            assert_eq!(checkpoint_region.size(), mem_region.size());
+            let checkpoint_base_addr = checkpoint_region.as_ptr();
+            let mem_base_addr = mem_region.as_ptr();
+            // TODO: Ensure safety
+            // SAFETY: TBD
+            unsafe {
+                libc::memcpy(
+                    checkpoint_base_addr.cast::<libc::c_void>(),
+                    mem_base_addr as *const libc::c_void,
+                    mem_region.size(),
+                );
+            }
+        });
+
+    let checkpoint = Checkpoint {
+        microvm_state,
+        checkpoint_memory: checkpoint_guest_mem,
+    };
+
+    Ok(checkpoint)
+}
+
+/// Load a VM state checkpoint, resetting back to a previous state
+pub fn load_checkpoint(vmm: &mut Vmm) -> Result<(), RestoreCheckpointError> {
+    let checkpoint = vmm
+        .checkpoint
+        .as_ref()
+        .ok_or(RestoreCheckpointError::MissingCheckpoint)?;
+
+    vmm.vm
+        .restore_state(&checkpoint.microvm_state.vm_state)
+        .map_err(RestoreCheckpointError::RestoreState)?;
+
+    vmm.vm
+        .guest_memory()
+        .iter()
+        .zip(checkpoint.checkpoint_memory.iter())
+        .for_each(|(mem_region, checkpoint_region)| {
+            assert_eq!(checkpoint_region.size(), mem_region.size());
+            let checkpoint_base_addr = checkpoint_region.as_ptr();
+            let mem_base_addr = mem_region.as_ptr();
+            // SAFETY: TBD
+            unsafe {
+                libc::memcpy(
+                    mem_base_addr.cast::<libc::c_void>(),
+                    checkpoint_base_addr as *const libc::c_void,
+                    checkpoint_region.size(),
+                );
+            }
+        });
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::net::UnixListener;
