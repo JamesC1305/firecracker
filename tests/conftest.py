@@ -144,6 +144,13 @@ def pytest_runtest_logreport(report):
             "cpu_model": global_props.cpu_model,
             "host_kernel": "linux-" + global_props.host_linux_version,
         },
+        # per coarse-grained test name, dropping parameters and other dimensions to reduce metric count for dashboard
+        # Note: noideid is formatted as below
+        # - with parameters: "path/to/test.py::test_name[parameter0,parameter1]"
+        # - without parameters: "path/to/test.py::test_name"
+        {
+            "test_name": report.nodeid.split("[")[0],
+        },
         # per phase
         {"phase": report.when},
         # per host kernel
@@ -249,6 +256,17 @@ def waitpkg_bin(test_fc_session_root_path):
         extra_flags="-mwaitpkg",
     )
     yield waitpkg_bin_path
+
+
+@pytest.fixture(scope="session")
+def msr_reader_bin(test_fc_session_root_path):
+    """Build a binary that reads msrs"""
+    msr_reader_bin_path = os.path.join(test_fc_session_root_path, "msr_reader")
+    build_tools.gcc_compile(
+        "data/msr/msr_reader.c",
+        msr_reader_bin_path,
+    )
+    yield msr_reader_bin_path
 
 
 @pytest.fixture
