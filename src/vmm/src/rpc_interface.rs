@@ -857,20 +857,28 @@ impl RuntimeApiController {
     }
 
     fn create_checkpoint(&self) -> Result<VmmData, VmmActionError> {
+        let create_start_us = get_time_us(ClockType::Monotonic);
+
         let mut locked_vmm = self.vmm.lock().expect("Poisoned lock");
 
         let checkpoint = create_checkpoint(&mut locked_vmm, &self.vm_resources)
             .map_err(VmmActionError::CreateCheckpoint)?;
 
         locked_vmm.register_checkpoint(checkpoint);
+        let elapsed_time_us = get_time_us(ClockType::Monotonic) - create_start_us;
+        debug!("Creating checkpoint took {} us", elapsed_time_us);
 
         Ok(VmmData::Empty)
     }
 
     fn load_checkpoint(&self) -> Result<VmmData, VmmActionError> {
+        let create_start_us = get_time_us(ClockType::Monotonic);
         let mut locked_vmm = self.vmm.lock().expect("Poisoned lock");
 
         load_checkpoint(&mut locked_vmm).map_err(VmmActionError::RestoreCheckpoint)?;
+
+        let elapsed_time_us = get_time_us(ClockType::Monotonic) - create_start_us;
+        debug!("Loading checkpoint took {} us", elapsed_time_us);
 
         Ok(VmmData::Empty)
     }
