@@ -455,7 +455,10 @@ impl VmResources {
     ///
     /// If vhost-user-blk devices are in use, allocates memfd-backed shared memory, otherwise
     /// prefers anonymous memory for performance reasons.
-    pub fn allocate_guest_memory(&self) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    pub fn allocate_guest_memory(
+        &self,
+        use_memfd: bool,
+    ) -> Result<Vec<GuestRegionMmap>, MemoryError> {
         let vhost_user_device_used = self
             .block
             .devices
@@ -473,7 +476,7 @@ impl VmResources {
         // that would not be worth the effort.
         let regions =
             crate::arch::arch_memory_regions(0, mib_to_bytes(self.machine_config.mem_size_mib));
-        if vhost_user_device_used {
+        if vhost_user_device_used || use_memfd {
             memory::memfd_backed(
                 regions.as_ref(),
                 self.machine_config.track_dirty_pages,

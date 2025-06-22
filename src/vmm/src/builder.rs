@@ -220,7 +220,7 @@ pub fn build_microvm_for_boot(
         .ok_or(MissingKernelConfig)?;
 
     let guest_memory = vm_resources
-        .allocate_guest_memory()
+        .allocate_guest_memory(false)
         .map_err(StartMicrovmError::GuestMemory)?;
 
     // Clone the command-line so that a failed boot doesn't pollute the original.
