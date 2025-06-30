@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use userfaultfd::{FeatureFlags, RegisterMode, Uffd, UffdBuilder};
+use vm_memory::GuestMemory;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
@@ -586,10 +587,52 @@ fn send_uffd_handshake(
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+/// Errors related to creating an in-memory checkpoint.
+pub enum CreateCheckpointError {
+    /// Error saving the VM state: {0}
+    MicrovmState(MicrovmStateError),
+    /// Couldn't register memory region with uffd: {0}
+    RegisterWithUffd(userfaultfd::Error),
+    /// Couldn't write protect memory region: {0}
+    WriteProtect(userfaultfd::Error),
+}
 
 #[derive(Debug)]
 pub struct Checkpoint {
     microvm_state: MicrovmState,
+}
+
+/// Create an in-memory checkpoint of the VM state
+pub fn create_checkpoint(
+    vmm: &mut Vmm,
+    vm_resources: &VmResources,
+) -> Result<Checkpoint, CreateCheckpointError> {
+    let vm_info = VmInfo::from(vm_resources);
+
+    let microvm_state = vmm
+        .save_state(&vm_info)
+        .map_err(CreateCheckpointError::MicrovmState)?;
+
+    // In this case, snapshotting is already in use
+    if let Some(uffd) = vmm.uffd.as_ref() {
+        for region in vmm.vm.guest_memory().iter() {
+            // Have to specify both missing and write protected
+            uffd.register_with_mode(
+                region.as_ptr().cast(),
+                region.size(),
+                RegisterMode::MISSING | RegisterMode::WRITE_PROTECT,
+            )
+            .map_err(CreateCheckpointError::RegisterWithUffd)?;
+
+            uffd.write_protect(region.as_ptr().cast(), region.size())
+                .map_err(CreateCheckpointError::WriteProtect)?;
+        }
+    };
+
+    let checkpoint = Checkpoint { microvm_state };
+
+    Ok(checkpoint)
 }
 
 #[cfg(test)]

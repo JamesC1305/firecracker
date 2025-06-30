@@ -16,7 +16,9 @@ use crate::builder::StartMicrovmError;
 use crate::cpu_config::templates::{CustomCpuTemplate, GuestConfigError};
 use crate::logger::{LoggerConfig, info, warn, *};
 use crate::mmds::data_store::{self, Mmds};
-use crate::persist::{CreateSnapshotError, RestoreFromSnapshotError, VmInfo};
+use crate::persist::{
+    CreateCheckpointError, CreateSnapshotError, RestoreFromSnapshotError, VmInfo, create_checkpoint,
+};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
 use crate::vmm_config::balloon::{
@@ -136,6 +138,8 @@ pub enum VmmActionError {
     BalloonConfig(#[from] BalloonConfigError),
     /// Boot source error: {0}
     BootSource(#[from] BootSourceConfigError),
+    /// Create checkpoint error: {0}
+    CreateCheckpoint(#[from] CreateCheckpointError),
     /// Create snapshot error: {0}
     CreateSnapshot(#[from] CreateSnapshotError),
     /// Configure CPU error: {0}
@@ -850,7 +854,13 @@ impl RuntimeApiController {
     }
 
     fn create_checkpoint(&self) -> Result<VmmData, VmmActionError> {
-        info!("Create checkpoint!");
+        let vmm = &mut self.vmm.lock().expect("Poisoned lock");
+
+        let checkpoint =
+            create_checkpoint(vmm, &self.vm_resources).map_err(VmmActionError::CreateCheckpoint)?;
+
+        vmm.checkpoint = Some(checkpoint);
+
         Ok(VmmData::Empty)
     }
 
