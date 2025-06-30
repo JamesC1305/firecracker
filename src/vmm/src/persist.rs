@@ -586,6 +586,12 @@ fn send_uffd_handshake(
     Ok(())
 }
 
+
+#[derive(Debug)]
+pub struct Checkpoint {
+    microvm_state: MicrovmState,
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::net::UnixListener;

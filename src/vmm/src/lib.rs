@@ -125,6 +125,7 @@ use device_manager::acpi::ACPIDeviceManager;
 use device_manager::resources::ResourceAllocator;
 use devices::acpi::vmgenid::VmGenIdError;
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
+use persist::Checkpoint;
 use seccomp::BpfProgram;
 use userfaultfd::Uffd;
 use vmm_sys_util::epoll::EventSet;
@@ -313,6 +314,8 @@ pub struct Vmm {
     vcpus_handles: Vec<VcpuHandle>,
     // Used by Vcpus and devices to initiate teardown; Vmm should never write here.
     vcpus_exit_evt: EventFd,
+
+    checkpoint: Option<Checkpoint>,
 
     // Allocator for guest resources
     resource_allocator: ResourceAllocator,
