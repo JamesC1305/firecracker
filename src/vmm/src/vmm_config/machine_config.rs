@@ -97,6 +97,9 @@ pub struct MachineConfig {
     pub vcpu_count: u8,
     /// The memory size in MiB.
     pub mem_size_mib: usize,
+    /// Enables or disables memfd for guest memory backing.
+    #[serde(default)]
+    pub use_memfd: bool,
     /// Enables or disabled SMT.
     #[serde(default)]
     pub smt: bool,
@@ -153,6 +156,7 @@ impl Default for MachineConfig {
         Self {
             vcpu_count: 1,
             mem_size_mib: DEFAULT_MEM_SIZE_MIB,
+            use_memfd: false,
             smt: false,
             cpu_template: None,
             track_dirty_pages: false,
@@ -178,6 +182,9 @@ pub struct MachineConfigUpdate {
     /// The memory size in MiB.
     #[serde(default)]
     pub mem_size_mib: Option<usize>,
+    #[serde(default)]
+    /// Whether to use memfd for guest memory or not.
+    pub use_memfd: Option<bool>,
     /// Enables or disabled SMT.
     #[serde(default)]
     pub smt: Option<bool>,
@@ -210,6 +217,7 @@ impl From<MachineConfig> for MachineConfigUpdate {
         MachineConfigUpdate {
             vcpu_count: Some(cfg.vcpu_count),
             mem_size_mib: Some(cfg.mem_size_mib),
+            use_memfd: Some(cfg.use_memfd),
             smt: Some(cfg.smt),
             cpu_template: cfg.static_template(),
             track_dirty_pages: Some(cfg.track_dirty_pages),
@@ -261,6 +269,7 @@ impl MachineConfig {
             return Err(MachineConfigError::InvalidVcpuCount);
         }
 
+        let use_memfd = update.use_memfd.unwrap_or(self.use_memfd);
         let mem_size_mib = update.mem_size_mib.unwrap_or(self.mem_size_mib);
         let page_config = update.huge_pages.unwrap_or(self.huge_pages);
 
@@ -277,6 +286,7 @@ impl MachineConfig {
         Ok(MachineConfig {
             vcpu_count,
             mem_size_mib,
+            use_memfd,
             smt,
             cpu_template,
             track_dirty_pages: update.track_dirty_pages.unwrap_or(self.track_dirty_pages),
