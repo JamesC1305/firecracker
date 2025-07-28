@@ -8,7 +8,7 @@ use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
 
 use super::builder::build_and_boot_microvm;
-use super::persist::{create_snapshot, restore_from_snapshot};
+use super::persist::{create_checkpoint, create_snapshot, restore_from_snapshot};
 use super::resources::VmResources;
 use super::{Vmm, VmmError};
 use crate::EventManager;
@@ -17,7 +17,8 @@ use crate::cpu_config::templates::{CustomCpuTemplate, GuestConfigError};
 use crate::logger::{LoggerConfig, info, warn, *};
 use crate::mmds::data_store::{self, Mmds};
 use crate::persist::{
-    CreateCheckpointError, CreateSnapshotError, RestoreFromSnapshotError, VmInfo, create_checkpoint,
+    CreateCheckpointError, CreateSnapshotError, LoadCheckpointError, RestoreFromSnapshotError,
+    VmInfo, load_checkpoint,
 };
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
@@ -150,6 +151,8 @@ pub enum VmmActionError {
     EntropyDevice(#[from] EntropyDeviceError),
     /// Internal VMM error: {0}
     InternalVmm(#[from] VmmError),
+    /// Load checkpoint error: {0}
+    LoadCheckpoint(#[from] LoadCheckpointError),
     /// Load snapshot error: {0}
     LoadSnapshot(#[from] LoadSnapshotError),
     /// Logger error: {0}
@@ -865,7 +868,10 @@ impl RuntimeApiController {
     }
 
     fn load_checkpoint(&self) -> Result<VmmData, VmmActionError> {
-        info!("Load checkpoint!");
+        let vmm = &mut self.vmm.lock().expect("Poisoned lock");
+
+        load_checkpoint(vmm).map_err(VmmActionError::LoadCheckpoint)?;
+
         Ok(VmmData::Empty)
     }
 }

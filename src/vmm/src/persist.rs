@@ -16,8 +16,10 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use userfaultfd::{FeatureFlags, RegisterMode, Uffd, UffdBuilder};
 use vm_memory::GuestMemory;
+use vm_memory::bitmap::Bitmap;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
+use crate::arch::ArchVmError;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::vcpu::get_manufacturer_id_from_host;
 use crate::builder::{self, BuildMicrovmFromSnapshotError};
@@ -37,8 +39,8 @@ use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
-use crate::vstate::memory;
-use crate::vstate::memory::{GuestMemoryState, GuestRegionMmap, MemoryError};
+use crate::vstate::memory::{self, GuestRegionMmap};
+use crate::vstate::memory::{GuestMemoryState, MemoryError};
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::VmState;
 use crate::{EventManager, Vmm, vstate};
@@ -592,15 +594,60 @@ fn send_uffd_handshake(
 pub enum CreateCheckpointError {
     /// Error saving the VM state: {0}
     MicrovmState(MicrovmStateError),
-    /// Couldn't register memory region with uffd: {0}
-    RegisterWithUffd(userfaultfd::Error),
+    /// Error creating UFFD: {0}
+    CreateUffd(userfaultfd::Error),
     /// Couldn't write protect memory region: {0}
+    RegisterAndWriteProtect(userfaultfd::Error),
+    /// Couldn't read guest memory
+    MissingGuestMemory,
+    /// No memfd found
+    MissingMemfd,
+}
+
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+/// Errors related to loading an in-memory checkpoint.
+pub enum LoadCheckpointError {
+    /// No checkpoint found
+    MissingCheckpoint,
+    /// Couldn't restore microVM state: {0}
+    RestoreState(ArchVmError),
+    /// No userfault fd was found.
+    MissingUffd,
+    /// Error write protecting memory: {0}
     WriteProtect(userfaultfd::Error),
+    /// Error when punching a hole in memfd
+    PunchHole(PunchHoleError),
+}
+
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+/// Errors related to hole punching as part of the checkpoint load process.
+pub enum PunchHoleError {
+    /// Error converting i64 to u64: {0}
+    Conversion(#[from] std::num::TryFromIntError),
+    /// fallocate syscall error: {0}
+    Errno(i32),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+/// Messages that can be sent over the checkpoint control socket.
+enum CheckpointMessage {
+    RegisterMemfd {
+        pid: u32,
+    },
+    CreateCheckpoint {
+        pid: u32,
+        mappings: Vec<GuestRegionUffdMapping>,
+    },
+    LoadCheckpoint {
+        pid: u32,
+    },
 }
 
 #[derive(Debug)]
+/// Stores state required for loading checkpoint.
 pub struct Checkpoint {
     microvm_state: MicrovmState,
+    memfd: i32,
 }
 
 /// Create an in-memory checkpoint of the VM state
@@ -610,29 +657,263 @@ pub fn create_checkpoint(
 ) -> Result<Checkpoint, CreateCheckpointError> {
     let vm_info = VmInfo::from(vm_resources);
 
+    let regions = vmm.vm.guest_memory();
+
+    // If a checkpoint already exists, just reapply write protection, save VM state again, and
+    // clear the dirty log.
+    if let Some(checkpoint) = vmm.checkpoint.as_mut() {
+        let uffd = vmm.uffd.as_ref().expect("Missing uffd");
+        regions
+            .iter()
+            .try_for_each(|region| uffd.write_protect(region.as_ptr().cast(), region.size()))
+            .map_err(CreateCheckpointError::RegisterAndWriteProtect)?;
+
+        let memfd = checkpoint.memfd;
+
+        let microvm_state = vmm
+            .save_state(&vm_info)
+            .map_err(CreateCheckpointError::MicrovmState)?;
+
+        let new_checkpoint = Checkpoint {
+            microvm_state,
+            memfd,
+        };
+
+        let _ = vmm.vm.get_dirty_bitmap().unwrap();
+
+        return Ok(new_checkpoint);
+    }
+
+    let memfd = regions
+        .iter()
+        .next()
+        .ok_or(CreateCheckpointError::MissingGuestMemory)?
+        .file_offset()
+        .ok_or(CreateCheckpointError::MissingMemfd)?
+        .file()
+        .as_raw_fd();
+
+    let reset_stream = loop {
+        match UnixStream::connect("/tmp/reset.socket") {
+            Ok(stream) => break stream,
+            Err(e) => println!("{:?}", e),
+        }
+    };
+
+    let (uffd, register_mode) = match vmm.uffd.as_ref() {
+        Some(uffd) => (uffd, RegisterMode::MISSING | RegisterMode::WRITE_PROTECT),
+        None => {
+            let mut uffd_builder = UffdBuilder::new();
+
+            uffd_builder
+                .require_features(FeatureFlags::PAGEFAULT_FLAG_WP | FeatureFlags::MISSING_SHMEM);
+
+            let uffd = uffd_builder
+                .close_on_exec(true)
+                .non_blocking(true)
+                .user_mode_only(false)
+                .create()
+                .map_err(CreateCheckpointError::CreateUffd)?;
+
+            vmm.uffd = Some(uffd);
+
+            (
+                vmm.uffd.as_ref().unwrap(),
+                RegisterMode::MISSING | RegisterMode::WRITE_PROTECT,
+            )
+        }
+    };
+
+    register_and_write_protect(vmm, uffd, register_mode)
+        .map_err(CreateCheckpointError::RegisterAndWriteProtect)?;
+
+    let mut backend_mappings: Vec<GuestRegionUffdMapping> =
+        Vec::with_capacity(regions.num_regions());
+
+    let mut offset = 0;
+    for mem_region in regions.iter() {
+        #[allow(deprecated)]
+        backend_mappings.push(GuestRegionUffdMapping {
+            base_host_virt_addr: mem_region.as_ptr() as u64,
+            size: mem_region.size(),
+            offset,
+            page_size: vm_resources.machine_config.huge_pages.page_size(),
+            page_size_kib: vm_resources.machine_config.huge_pages.page_size(),
+        });
+        offset += mem_region.size() as u64;
+    }
+
+    let uffd_message = CheckpointMessage::CreateCheckpoint {
+        pid: std::process::id(),
+        mappings: backend_mappings,
+    };
+    let uffd_message_json = serde_json::to_string(&uffd_message).unwrap();
+    info!("uffd_message_json: {:?}", uffd_message_json);
+
+    reset_stream
+        .send_with_fd(uffd_message_json.as_bytes(), uffd.as_raw_fd())
+        .unwrap();
+
+    let memfd_message = CheckpointMessage::RegisterMemfd {
+        pid: std::process::id(),
+    };
+    let memfd_message_json = serde_json::to_string(&memfd_message).unwrap();
+    info!("memfd_message_json: {:?}", memfd_message_json);
+
+    reset_stream
+        .send_with_fd(memfd_message_json.as_bytes(), memfd)
+        .unwrap();
+
     let microvm_state = vmm
         .save_state(&vm_info)
         .map_err(CreateCheckpointError::MicrovmState)?;
 
-    // In this case, snapshotting is already in use
-    if let Some(uffd) = vmm.uffd.as_ref() {
-        for region in vmm.vm.guest_memory().iter() {
-            // Have to specify both missing and write protected
-            uffd.register_with_mode(
-                region.as_ptr().cast(),
-                region.size(),
-                RegisterMode::MISSING | RegisterMode::WRITE_PROTECT,
-            )
-            .map_err(CreateCheckpointError::RegisterWithUffd)?;
-
-            uffd.write_protect(region.as_ptr().cast(), region.size())
-                .map_err(CreateCheckpointError::WriteProtect)?;
-        }
+    let checkpoint = Checkpoint {
+        microvm_state,
+        memfd,
     };
 
-    let checkpoint = Checkpoint { microvm_state };
+    // This calls KVM_GET_DIRTY_LOG, which clears the dirty bitmap.
+    // This ensures that we only track dirty pages post checkpoint creation.
+    let _ = vmm.vm.get_dirty_bitmap().unwrap();
 
     Ok(checkpoint)
+}
+
+/// Load a previously created, in-memory checkpoint
+pub fn load_checkpoint(vmm: &mut Vmm) -> Result<(), LoadCheckpointError> {
+    let checkpoint = vmm
+        .checkpoint
+        .as_ref()
+        .ok_or(LoadCheckpointError::MissingCheckpoint)?;
+
+    let uffd = vmm.uffd.as_ref().ok_or(LoadCheckpointError::MissingUffd)?;
+
+    // register_and_write_protect(
+    //     vmm,
+    //     uffd,
+    //     RegisterMode::WRITE_PROTECT | RegisterMode::MISSING,
+    // )
+    // .unwrap();
+
+    let memfd = checkpoint.memfd.as_raw_fd();
+
+    let dirty_bitmap = vmm.vm.get_dirty_bitmap().unwrap();
+
+    let mut writer_offset = 0;
+    let page_size = crate::utils::get_page_size().unwrap();
+    for (region, slot) in vmm.vm.guest_memory().iter().zip(0u32..) {
+        let kvm_bitmap = dirty_bitmap.get(&slot).unwrap();
+        let firecracker_bitmap = region.bitmap();
+        let mut write_size = 0;
+        let mut dirty_batch_start: u64 = 0;
+
+        for (i, v) in kvm_bitmap.iter().enumerate() {
+            for j in 0..64 {
+                let is_kvm_page_dirty = ((v >> j) & 1u64) != 0u64;
+                let page_offset = ((i * 64) + j) * page_size;
+                let is_firecracker_page_dirty = firecracker_bitmap.dirty_at(page_offset);
+
+                if is_kvm_page_dirty {
+                    // We are at the start of a new batch of dirty pages.
+                    if write_size == 0 {
+                        dirty_batch_start = page_offset as u64;
+                    }
+                    write_size += page_size;
+                } else if write_size > 0 {
+                    // We are at the end of a batch of dirty pages.
+
+                    let offset: i64 =
+                        (writer_offset + dirty_batch_start)
+                            .try_into()
+                            .map_err(|e| {
+                                LoadCheckpointError::PunchHole(PunchHoleError::Conversion(e))
+                            })?;
+                    let len: i64 = write_size.try_into().map_err(|e| {
+                        LoadCheckpointError::PunchHole(PunchHoleError::Conversion(e))
+                    })?;
+                    // SAFETY: TBD
+                    unsafe {
+                        libc::madvise(
+                            (region.as_ptr() as i64 + offset) as *mut _,
+                            write_size,
+                            libc::MADV_DONTNEED,
+                        );
+                        let falloc_errno = libc::fallocate64(
+                            memfd,
+                            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                            offset,
+                            len,
+                        );
+                        if falloc_errno != 0 {
+                            return Err(LoadCheckpointError::PunchHole(PunchHoleError::Errno(
+                                falloc_errno,
+                            )));
+                        }
+                    };
+
+                    write_size = 0;
+                }
+            }
+        }
+
+        if write_size > 0 {
+            let offset: i64 = (writer_offset + dirty_batch_start)
+                .try_into()
+                .map_err(|e| LoadCheckpointError::PunchHole(PunchHoleError::Conversion(e)))?;
+            let len: i64 = write_size
+                .try_into()
+                .map_err(|e| LoadCheckpointError::PunchHole(PunchHoleError::Conversion(e)))?;
+            // SAFETY: TBD
+            unsafe {
+                libc::madvise(
+                    (region.as_ptr() as i64 + offset) as *mut _,
+                    write_size,
+                    libc::MADV_DONTNEED,
+                );
+                let falloc_errno = libc::fallocate64(
+                    memfd,
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    offset,
+                    len,
+                );
+                if falloc_errno != 0 {
+                    return Err(LoadCheckpointError::PunchHole(PunchHoleError::Errno(
+                        falloc_errno,
+                    )));
+                }
+            };
+        }
+        writer_offset += region.size() as u64;
+    }
+
+    for region in vmm.vm.guest_memory().iter() {
+        uffd.write_protect(region.as_ptr().cast(), region.size())
+            .map_err(LoadCheckpointError::WriteProtect)?;
+    }
+
+    // Reset dirty bitmap
+    let _ = vmm.vm.get_dirty_bitmap().unwrap();
+
+    vmm.vm
+        .restore_state(&checkpoint.microvm_state.vm_state)
+        .map_err(LoadCheckpointError::RestoreState)?;
+
+    Ok(())
+}
+
+fn register_and_write_protect(
+    vmm: &Vmm,
+    uffd: &Uffd,
+    register_mode: RegisterMode,
+) -> Result<(), userfaultfd::Error> {
+    for region in vmm.vm.guest_memory().iter() {
+        uffd.register_with_mode(region.as_ptr().cast(), region.size(), register_mode)?;
+
+        uffd.write_protect(region.as_ptr().cast(), region.size())?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
