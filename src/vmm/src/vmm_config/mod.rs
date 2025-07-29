@@ -16,6 +16,8 @@ use crate::rate_limiter::{BucketUpdate, RateLimiter, TokenBucket};
 pub mod balloon;
 /// Wrapper for configuring the microVM boot source.
 pub mod boot_source;
+/// Wrapper for configuring microVM checkpoints.
+pub mod checkpoint;
 /// Wrapper for configuring the block devices.
 pub mod drive;
 /// Wrapper for configuring the entropy device attached to the microVM.

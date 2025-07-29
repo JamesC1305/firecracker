@@ -88,7 +88,7 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Put, "actions", Some(body)) => parse_put_actions(body),
             (Method::Put, "balloon", Some(body)) => parse_put_balloon(body),
             (Method::Put, "boot-source", Some(body)) => parse_put_boot_source(body),
-            (Method::Put, "checkpoint", None) => parse_put_checkpoint(path_tokens.next()),
+            (Method::Put, "checkpoint", body) => parse_put_checkpoint(body, path_tokens.next()),
             (Method::Put, "cpu-config", Some(body)) => parse_put_cpu_config(body),
             (Method::Put, "drives", Some(body)) => parse_put_drive(body, path_tokens.next()),
             (Method::Put, "logger", Some(body)) => parse_put_logger(body),
@@ -1004,8 +1004,9 @@ pub mod tests {
     fn test_try_from_put_checkpoint() {
         let (mut sender, receiver) = UnixStream::pair().unwrap();
         let mut connection = HttpConnection::new(receiver);
+        let body = "{\"uffd_path\": \"foo\"}";
         sender
-            .write_all(http_request("PUT", "/checkpoint/create", None).as_bytes())
+            .write_all(http_request("PUT", "/checkpoint/create", Some(body)).as_bytes())
             .unwrap();
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();
