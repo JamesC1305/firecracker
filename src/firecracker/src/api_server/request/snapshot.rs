@@ -6,7 +6,7 @@ use vmm::logger::{IncMetric, METRICS};
 use vmm::rpc_interface::VmmAction;
 use vmm::vmm_config::snapshot::{
     CreateSnapshotParams, LoadSnapshotConfig, LoadSnapshotParams, MemBackendConfig, MemBackendType,
-    Vm, VmState,
+    ResetSnapshotConfig, ResetSnapshotParams, SnapshotFiles, Vm, VmState,
 };
 
 use super::super::parsed_request::{ParsedRequest, RequestError};
@@ -23,6 +23,12 @@ pub const MISSING_FIELD: &str =
 pub const TOO_MANY_FIELDS: &str =
     "too many fields: either `mem_backend` or `mem_file_path` exclusively is required";
 
+pub const CONFLICTING_FIELDS: &str =
+    "conflicting fields: `enable_write_protection` can only be used with `MemBackend::Uffd`";
+
+pub const MISSING_RESET_FIELDS: &str = "missing fields: both `mem_file_path` and `snapshot_path` \
+                                        are required if resetting to a different snapshot";
+
 pub(crate) fn parse_put_snapshot(
     body: &Body,
     request_type_from_path: Option<&str>,
@@ -31,6 +37,7 @@ pub(crate) fn parse_put_snapshot(
         Some(request_type) => match request_type {
             "create" => parse_put_snapshot_create(body),
             "load" => parse_put_snapshot_load(body),
+            "reset" => parse_put_snapshot_reset(body),
             _ => Err(RequestError::InvalidPathMethod(
                 format!("/snapshot/{}", request_type),
                 Method::Put,
@@ -102,6 +109,17 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         }
     };
 
+    // Write-protection is only supported for `Uffd`-backed snapshots.
+    // Attempting to enable this with `File` backing should result in an error
+    match &mem_backend.backend_type {
+        MemBackendType::File if snapshot_config.enable_write_protection => {
+            return Err(RequestError::SerdeJson(serde_json::Error::custom(
+                CONFLICTING_FIELDS,
+            )));
+        }
+        _ => (),
+    }
+
     let snapshot_params = LoadSnapshotParams {
         snapshot_path: snapshot_config.snapshot_path,
         mem_backend,
@@ -111,6 +129,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         resume_vm: snapshot_config.resume_vm,
         network_overrides: snapshot_config.network_overrides,
         vsock_override: snapshot_config.vsock_override,
+        enable_write_protection: snapshot_config.enable_write_protection,
     };
 
     // Construct the `ParsedRequest` object.
@@ -122,6 +141,35 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
     }
 
     Ok(parsed_req)
+}
+
+fn parse_put_snapshot_reset(body: &Body) -> Result<ParsedRequest, RequestError> {
+    let reset_config = serde_json::from_slice::<ResetSnapshotConfig>(body.raw())?;
+
+    // Create the reset config from the parameters. `snapshot_path` and `mem_file_path` must either
+    // both be present, or both be absent. One without the other is an error condition.
+    let reset_config = match (reset_config.snapshot_path, reset_config.mem_file_path) {
+        (Some(snapshot_path), Some(mem_file_path)) => ResetSnapshotParams {
+            reset_socket_path: reset_config.reset_socket_path,
+            new_snapshot: Some(SnapshotFiles {
+                snapshot_path,
+                mem_file_path,
+            }),
+        },
+        (None, None) => ResetSnapshotParams {
+            reset_socket_path: reset_config.reset_socket_path,
+            new_snapshot: None,
+        },
+        _ => {
+            return Err(RequestError::SerdeJson(serde_json::Error::custom(
+                MISSING_RESET_FIELDS,
+            )));
+        }
+    };
+
+    Ok(ParsedRequest::new_sync(VmmAction::ResetSnapshot(
+        reset_config,
+    )))
 }
 
 #[cfg(test)]
@@ -189,6 +237,7 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             vsock_override: None,
+            enable_write_protection: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -220,6 +269,7 @@ mod tests {
             resume_vm: false,
             network_overrides: vec![],
             vsock_override: None,
+            enable_write_protection: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -251,6 +301,7 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             vsock_override: None,
+            enable_write_protection: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -291,6 +342,7 @@ mod tests {
                 host_dev_name: String::from("vmtap2"),
             }],
             vsock_override: None,
+            enable_write_protection: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
@@ -302,6 +354,111 @@ mod tests {
         assert_eq!(
             vmm_action_from_request(parsed_request),
             VmmAction::LoadSnapshot(expected_config)
+        );
+
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": {
+                "backend_path": "bar",
+                "backend_type": "Uffd"
+            },
+            "resume_vm": true,
+            "network_overrides": [
+                {
+                    "iface_id": "eth0",
+                    "host_dev_name": "vmtap2"
+                }
+            ]
+        }"#;
+        let expected_config = LoadSnapshotParams {
+            snapshot_path: PathBuf::from("foo"),
+            mem_backend: MemBackendConfig {
+                backend_path: PathBuf::from("bar"),
+                backend_type: MemBackendType::Uffd,
+            },
+            track_dirty_pages: false,
+            resume_vm: true,
+            network_overrides: vec![NetworkOverride {
+                iface_id: String::from("eth0"),
+                host_dev_name: String::from("vmtap2"),
+            }],
+            enable_write_protection: false,
+        };
+        let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+        assert!(
+            parsed_request
+                .parsing_info()
+                .take_deprecation_message()
+                .is_none()
+        );
+        assert_eq!(
+            vmm_action_from_request(parsed_request),
+            VmmAction::LoadSnapshot(expected_config)
+        );
+
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": {
+                "backend_path": "bar",
+                "backend_type": "Uffd"
+            },
+            "resume_vm": true,
+            "network_overrides": [
+                {
+                    "iface_id": "eth0",
+                    "host_dev_name": "vmtap2"
+                }
+            ],
+            "enable_write_protection": true
+        }"#;
+        let expected_config = LoadSnapshotParams {
+            snapshot_path: PathBuf::from("foo"),
+            mem_backend: MemBackendConfig {
+                backend_path: PathBuf::from("bar"),
+                backend_type: MemBackendType::Uffd,
+            },
+            track_dirty_pages: false,
+            resume_vm: true,
+            network_overrides: vec![NetworkOverride {
+                iface_id: String::from("eth0"),
+                host_dev_name: String::from("vmtap2"),
+            }],
+            enable_write_protection: true,
+        };
+        let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+        assert!(
+            parsed_request
+                .parsing_info()
+                .take_deprecation_message()
+                .is_none()
+        );
+        assert_eq!(
+            vmm_action_from_request(parsed_request),
+            VmmAction::LoadSnapshot(expected_config)
+        );
+
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_backend": {
+                "backend_path": "bar",
+                "backend_type": "File"
+            },
+            "resume_vm": true,
+            "network_overrides": [
+                {
+                    "iface_id": "eth0",
+                    "host_dev_name": "vmtap2"
+                }
+            ],
+            "enable_write_protection": true
+        }"#;
+        assert_eq!(
+            parse_put_snapshot(&Body::new(body), Some("load"))
+                .err()
+                .unwrap()
+                .to_string(),
+            RequestError::SerdeJson(serde_json::Error::custom(CONFLICTING_FIELDS.to_string()))
+                .to_string()
         );
 
         let body = r#"{
@@ -319,6 +476,7 @@ mod tests {
             resume_vm: true,
             network_overrides: vec![],
             vsock_override: None,
+            enable_write_protection: false,
         };
         let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert_eq!(
@@ -399,6 +557,57 @@ mod tests {
             "An error occurred when deserializing the json body of a request: missing field \
              `snapshot_path` at line 6 column 9."
         );
+
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_file_path": "bar"
+        }"#;
+        let expected_config = ResetSnapshotParams {
+            reset_socket_path: PathBuf::new(),
+            new_snapshot: Some(SnapshotFiles {
+                snapshot_path: "foo".into(),
+                mem_file_path: "bar".into(),
+            }),
+        };
+        let parsed_request = parse_put_snapshot(&Body::new(body), Some("reset")).unwrap();
+        assert_eq!(
+            vmm_action_from_request(parsed_request),
+            VmmAction::ResetSnapshot(expected_config)
+        );
+
+        let body = "{}";
+        let expected_config = ResetSnapshotParams {
+            reset_socket_path: PathBuf::new(),
+            new_snapshot: None,
+        };
+        let parsed_request = parse_put_snapshot(&Body::new(body), Some("reset")).unwrap();
+        assert_eq!(
+            vmm_action_from_request(parsed_request),
+            VmmAction::ResetSnapshot(expected_config)
+        );
+
+        let body = r#"{
+            "snapshot_path": "foo"
+        }"#;
+        assert_eq!(
+            parse_put_snapshot(&Body::new(body), Some("reset"))
+                .err()
+                .unwrap()
+                .to_string(),
+            RequestError::SerdeJson(serde_json::Error::custom(MISSING_RESET_FIELDS)).to_string()
+        );
+
+        let body = r#"{
+            "mem_file_path": "bar"
+        }"#;
+        assert_eq!(
+            parse_put_snapshot(&Body::new(body), Some("reset"))
+                .err()
+                .unwrap()
+                .to_string(),
+            RequestError::SerdeJson(serde_json::Error::custom(MISSING_RESET_FIELDS)).to_string()
+        );
+
         parse_put_snapshot(&Body::new(body), Some("invalid")).unwrap_err();
         parse_put_snapshot(&Body::new(body), None).unwrap_err();
     }
