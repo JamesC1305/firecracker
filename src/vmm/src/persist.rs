@@ -366,7 +366,7 @@ pub fn restore_from_snapshot(
         .update_machine_config(&MachineConfigUpdate {
             vcpu_count: Some(vcpu_count),
             mem_size_mib: Some(u64_to_usize(microvm_state.vm_info.mem_size_mib)),
-            use_memfd: Some(false),
+            use_memfd: Some(microvm_state.vm_info.use_memfd),
             smt: Some(microvm_state.vm_info.smt),
             cpu_template: Some(microvm_state.vm_info.cpu_template),
             track_dirty_pages: Some(track_dirty_pages),
@@ -400,6 +400,7 @@ pub fn restore_from_snapshot(
             mem_backend_path,
             mem_state,
             track_dirty_pages,
+            microvm_state.vm_info.use_memfd,
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
@@ -483,10 +484,11 @@ fn guest_memory_from_uffd(
     mem_uds_path: &Path,
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
+    use_memfd: bool,
     huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
     let (guest_memory, backend_mappings) =
-        create_guest_memory(mem_state, track_dirty_pages, huge_pages)?;
+        create_guest_memory(mem_state, track_dirty_pages, use_memfd, huge_pages)?;
 
     let mut uffd_builder = UffdBuilder::new();
 
@@ -516,9 +518,17 @@ fn guest_memory_from_uffd(
 fn create_guest_memory(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
+    use_memfd: bool,
     huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
-    let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
+    let guest_memory = {
+        if use_memfd {
+            let regions: Vec<(GuestAddress, usize)> = mem_state.regions().collect();
+            memory::memfd_backed(regions.as_slice(), track_dirty_pages, huge_pages)?
+        } else {
+            memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?
+        }
+    };
     let mut backend_mappings = Vec::with_capacity(guest_memory.len());
     let mut offset = 0;
     for mem_region in guest_memory.iter() {
@@ -1035,7 +1045,7 @@ mod tests {
         };
 
         let (_, uffd_regions) =
-            create_guest_memory(&mem_state, false, HugePageConfig::None).unwrap();
+            create_guest_memory(&mem_state, false, false, HugePageConfig::None).unwrap();
 
         assert_eq!(uffd_regions.len(), 1);
         assert_eq!(uffd_regions[0].size, 0x20000);
