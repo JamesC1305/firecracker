@@ -40,7 +40,9 @@ use crate::vmm_config::net::{
 };
 use crate::vmm_config::pmem::{PmemConfig, PmemConfigError};
 use crate::vmm_config::serial::SerialConfig;
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, SnapshotType};
+use crate::vmm_config::snapshot::{
+    CreateSnapshotParams, LoadSnapshotParams, ResetSnapshotParams, SnapshotType,
+};
 use crate::vmm_config::vsock::{VsockConfigError, VsockDeviceConfig};
 use crate::vmm_config::{self, RateLimiterUpdate};
 
@@ -99,6 +101,10 @@ pub enum VmmAction {
     PutMMDS(Value),
     /// Configure the guest vCPU features.
     PutCpuConfiguration(CustomCpuTemplate),
+    /// Reset the microVM's state using as input `ResetSnapshotParams`. This can only be called
+    /// post-boot, after a snapshot restore, and requires Uffd to be used as the backend for the
+    /// loaded snapshot.
+    ResetSnapshot(ResetSnapshotParams),
     /// Resume the guest, by resuming the microVM VCPUs.
     Resume,
     /// Set the balloon device or update the one that already exists using the
@@ -485,6 +491,7 @@ impl<'a> PrebootApiController<'a> {
             CreateSnapshot(_)
             | FlushMetrics
             | Pause
+            | ResetSnapshot(_)
             | Resume
             | GetBalloonStats
             | GetMemoryHotplugStatus
@@ -748,6 +755,7 @@ impl RuntimeApiController {
                     .expect("Poisoned lock"),
                 value,
             ),
+            ResetSnapshot(snapshot_reset_cfg) => self.reset_to_snapshot(snapshot_reset_cfg),
             Resume => self.resume(),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => self.send_ctrl_alt_del(),
@@ -960,6 +968,13 @@ impl RuntimeApiController {
             .map(|()| VmmData::Empty)
             .map_err(NetworkInterfaceError::DeviceUpdate)
             .map_err(VmmActionError::NetworkConfig)
+    }
+
+    fn reset_to_snapshot(
+        &mut self,
+        snapshot_reset_cfg: ResetSnapshotParams,
+    ) -> Result<VmmData, VmmActionError> {
+        Ok(VmmData::Empty)
     }
 }
 
@@ -1175,6 +1190,12 @@ mod tests {
                 mem_file_path: PathBuf::new(),
             },
         )));
+        check_unsupported(preboot_request(VmmAction::ResetSnapshot(
+            ResetSnapshotParams {
+                reset_socket_path: PathBuf::new(),
+                new_snapshot: None,
+            },
+        )));
         #[cfg(target_arch = "x86_64")]
         check_unsupported(preboot_request(VmmAction::SendCtrlAltDel));
         check_unsupported(preboot_request(VmmAction::UpdateMemoryHotplugSize(
@@ -1285,6 +1306,7 @@ mod tests {
                 track_dirty_pages: false,
                 resume_vm: false,
                 network_overrides: vec![],
+                enable_write_protection: false,
             },
         )));
         check_unsupported(runtime_request(VmmAction::SetEntropyDevice(

@@ -72,6 +72,8 @@ pub struct LoadSnapshotParams {
     pub resume_vm: bool,
     /// The network devices to override on load.
     pub network_overrides: Vec<NetworkOverride>,
+    /// Whether write-protection via Uffd is enabled.
+    pub enable_write_protection: bool,
 }
 
 /// Stores the configuration for loading a snapshot that is provided by the user.
@@ -101,6 +103,9 @@ pub struct LoadSnapshotConfig {
     /// The network devices to override on load.
     #[serde(default)]
     pub network_overrides: Vec<NetworkOverride>,
+    /// Whether write protection via Uffd should be enabled.
+    #[serde(default)]
+    pub enable_write_protection: bool,
 }
 
 /// Stores the configuration used for managing snapshot memory.
@@ -111,6 +116,36 @@ pub struct MemBackendConfig {
     pub backend_path: PathBuf,
     /// Specifies the guest memory backend type.
     pub backend_type: MemBackendType,
+}
+
+/// Stores the configuration for resetting to a snapshot that is provided by the user.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResetSnapshotConfig {
+    /// Path to the backend used to handle reset messages.
+    pub reset_socket_path: PathBuf,
+    /// Path to a new snapshot file to reset to.
+    pub snapshot_path: Option<PathBuf>,
+    /// Path to a new mem_file to reset to.
+    pub mem_file_path: Option<PathBuf>,
+}
+
+/// Stores snapshot file paths.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotFiles {
+    /// Path to the new snapshot file to reset to.
+    pub snapshot_path: PathBuf,
+    /// Path to the new mem_file to reset to.
+    pub mem_file_path: PathBuf,
+}
+
+/// Stores the configuration for resetting to a snapshot.
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+pub struct ResetSnapshotParams {
+    /// Path to the backend used to handle reset messages.
+    pub reset_socket_path: PathBuf,
+    /// Snapshot files to reset to.
+    pub new_snapshot: Option<SnapshotFiles>,
 }
 
 /// The microVM state options.
