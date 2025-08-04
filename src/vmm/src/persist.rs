@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use std::mem::forget;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use semver::Version;
@@ -654,6 +654,7 @@ pub struct Checkpoint {
 pub fn create_checkpoint(
     vmm: &mut Vmm,
     vm_resources: &VmResources,
+    reset_uffd_path: &PathBuf,
 ) -> Result<Checkpoint, CreateCheckpointError> {
     let vm_info = VmInfo::from(vm_resources);
 
@@ -694,7 +695,7 @@ pub fn create_checkpoint(
         .as_raw_fd();
 
     let reset_stream = loop {
-        match UnixStream::connect("/tmp/reset.socket") {
+        match UnixStream::connect(reset_uffd_path) {
             Ok(stream) => break stream,
             Err(e) => println!("{:?}", e),
         }
@@ -834,11 +835,6 @@ pub fn load_checkpoint(vmm: &mut Vmm) -> Result<(), LoadCheckpointError> {
                     })?;
                     // SAFETY: TBD
                     unsafe {
-                        libc::madvise(
-                            (region.as_ptr() as i64 + offset) as *mut _,
-                            write_size,
-                            libc::MADV_DONTNEED,
-                        );
                         let falloc_errno = libc::fallocate64(
                             memfd,
                             libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
@@ -866,11 +862,6 @@ pub fn load_checkpoint(vmm: &mut Vmm) -> Result<(), LoadCheckpointError> {
                 .map_err(|e| LoadCheckpointError::PunchHole(PunchHoleError::Conversion(e)))?;
             // SAFETY: TBD
             unsafe {
-                libc::madvise(
-                    (region.as_ptr() as i64 + offset) as *mut _,
-                    write_size,
-                    libc::MADV_DONTNEED,
-                );
                 let falloc_errno = libc::fallocate64(
                     memfd,
                     libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,

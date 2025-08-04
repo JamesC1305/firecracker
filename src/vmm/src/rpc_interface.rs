@@ -27,6 +27,7 @@ use crate::vmm_config::balloon::{
     BalloonUpdateStatsConfig,
 };
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
+use crate::vmm_config::checkpoint::CreateCheckpointParams;
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
 use crate::vmm_config::instance_info::InstanceInfo;
@@ -55,7 +56,7 @@ pub enum VmmAction {
     ConfigureMetrics(MetricsConfig),
     /// Create an in-memory checkpoint that the VM can later reset back to. This action can only be
     /// called after the microVM is created, and only when the microVM is in `Paused` state.
-    CreateCheckpoint,
+    CreateCheckpoint(CreateCheckpointParams),
     /// Create a snapshot using as input the `CreateSnapshotParams`. This action can only be called
     /// after the microVM has booted and only when the microVM is in `Paused` state.
     CreateSnapshot(CreateSnapshotParams),
@@ -451,7 +452,7 @@ impl<'a> PrebootApiController<'a> {
             SetEntropyDevice(config) => self.set_entropy_device(config),
             // Operations not allowed pre-boot.
             CreateSnapshot(_)
-            | CreateCheckpoint
+            | CreateCheckpoint(_)
             | FlushMetrics
             | LoadCheckpoint
             | Pause
@@ -633,7 +634,9 @@ impl RuntimeApiController {
         use self::VmmAction::*;
         match request {
             // Supported operations allowed post-boot.
-            CreateCheckpoint => self.create_checkpoint(),
+            CreateCheckpoint(checkpoint_create_cfg) => {
+                self.create_checkpoint(checkpoint_create_cfg)
+            }
             CreateSnapshot(snapshot_create_cfg) => self.create_snapshot(&snapshot_create_cfg),
             FlushMetrics => self.flush_metrics(),
             GetBalloonConfig => self
@@ -856,11 +859,14 @@ impl RuntimeApiController {
             .map_err(VmmActionError::NetworkConfig)
     }
 
-    fn create_checkpoint(&self) -> Result<VmmData, VmmActionError> {
+    fn create_checkpoint(
+        &self,
+        create_params: CreateCheckpointParams,
+    ) -> Result<VmmData, VmmActionError> {
         let vmm = &mut self.vmm.lock().expect("Poisoned lock");
 
-        let checkpoint =
-            create_checkpoint(vmm, &self.vm_resources).map_err(VmmActionError::CreateCheckpoint)?;
+        let checkpoint = create_checkpoint(vmm, &self.vm_resources, &create_params.uffd_path)
+            .map_err(VmmActionError::CreateCheckpoint)?;
 
         vmm.checkpoint = Some(checkpoint);
 
