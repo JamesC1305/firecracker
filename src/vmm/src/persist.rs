@@ -396,6 +396,7 @@ pub fn restore_from_snapshot(
             mem_backend_path,
             mem_state,
             track_dirty_pages,
+            params.enable_write_protection,
             vm_resources.machine_config.huge_pages,
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
@@ -480,6 +481,7 @@ fn guest_memory_from_uffd(
     mem_uds_path: &Path,
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
+    enable_write_protection: bool,
     huge_pages: HugePageConfig,
 ) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
     let (guest_memory, backend_mappings) =
@@ -487,11 +489,22 @@ fn guest_memory_from_uffd(
 
     let mut uffd_builder = UffdBuilder::new();
 
-    // We only make use of this if balloon devices are present, but we can enable it unconditionally
-    // because the only place the kernel checks this is in a hook from madvise, e.g. it doesn't
-    // actively change the behavior of UFFD, only passively. Without balloon devices
-    // we never call madvise anyway, so no need to put this into a conditional.
-    uffd_builder.require_features(FeatureFlags::EVENT_REMOVE);
+    // We only make use `EVENT_REMOVE` if balloon devices are present, but we can enable it
+    // unconditionally because the only place the kernel checks this is in a hook from madvise,
+    // e.g. it doesn't actively change the behavior of UFFD, only passively. Without balloon
+    // devices we never call madvise anyway, so no need to put this into a conditional.
+    //
+    // If write-protection is enabled, we must additionally require `PAGEFAULT_FLAG_WP` to apply 
+    // write-protection to guest memory regions and receive write-protected faults
+    let (features, register_mode) = match enable_write_protection {
+        true => (
+            FeatureFlags::EVENT_REMOVE | FeatureFlags::PAGEFAULT_FLAG_WP,
+            RegisterMode::MISSING | RegisterMode::WRITE_PROTECT,
+        ),
+        false => (FeatureFlags::EVENT_REMOVE, RegisterMode::MISSING),
+    };
+
+    uffd_builder.require_features(features);
 
     let uffd = uffd_builder
         .close_on_exec(true)
@@ -504,9 +517,14 @@ fn guest_memory_from_uffd(
         uffd.register_with_mode(
             mem_region.as_ptr().cast(),
             mem_region.size() as _,
-            RegisterMode::MISSING | RegisterMode::WRITE_PROTECT,
+            register_mode,
         )
         .map_err(GuestMemoryFromUffdError::Register)?;
+
+        if enable_write_protection {
+            uffd.write_protect(mem_region.as_ptr().cast(), mem_region.size() as _)
+                .map_err(GuestMemoryFromUffdError::Register)?;
+        }
     }
 
     send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
