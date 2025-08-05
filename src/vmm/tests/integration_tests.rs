@@ -296,6 +296,7 @@ fn verify_load_snapshot(snapshot_file: TempFile, memory_file: TempFile) {
             resume_vm: true,
             network_overrides: vec![],
             vsock_override: None,
+            enable_write_protection: false,
         }))
         .unwrap();
 
@@ -381,6 +382,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         resume_vm: false,
         network_overrides: vec![],
         vsock_override: None,
+        enable_write_protection: false,
     });
     let err = preboot_api_controller.handle_preboot_request(req);
     assert!(
