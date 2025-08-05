@@ -128,6 +128,7 @@ use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEvent
 use seccomp::BpfProgram;
 use snapshot::Persist;
 use userfaultfd::Uffd;
+use vmm_config::snapshot::Checkpoint;
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::terminal::Terminal;
@@ -329,6 +330,7 @@ pub struct Vmm {
     vcpus_exit_evt: EventFd,
     // Device manager
     device_manager: DeviceManager,
+    checkpoint: Option<Checkpoint>,
 }
 
 impl Vmm {

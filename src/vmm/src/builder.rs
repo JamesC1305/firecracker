@@ -49,6 +49,7 @@ use crate::utils::mib_to_bytes;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
+use crate::vmm_config::snapshot::Checkpoint;
 use crate::vstate::kvm::{Kvm, KvmError};
 use crate::vstate::memory::GuestRegionMmap;
 #[cfg(target_arch = "aarch64")]
@@ -319,6 +320,7 @@ pub fn build_microvm_for_boot(
         uffd: None,
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
+        checkpoint: None,
         device_manager,
     };
     let vmm = Arc::new(Mutex::new(vmm));
@@ -440,6 +442,7 @@ pub fn build_microvm_from_snapshot(
     uffd: Option<Uffd>,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
+    enable_resetting: bool,
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
@@ -491,7 +494,7 @@ pub fn build_microvm_from_snapshot(
     vm.restore_state(&microvm_state.vm_state)?;
 
     // Restore the boot source config paths.
-    vm_resources.boot_source.config = microvm_state.vm_info.boot_source;
+    vm_resources.boot_source.config = microvm_state.vm_info.boot_source.clone();
 
     let vm = Arc::new(vm);
 
@@ -522,6 +525,7 @@ pub fn build_microvm_from_snapshot(
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
         device_manager,
+        checkpoint: None,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -532,6 +536,10 @@ pub fn build_microvm_from_snapshot(
             .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
             .clone(),
     )?;
+
+    if enable_resetting {
+        vmm.checkpoint = Some(Checkpoint { microvm_state });
+    }
 
     let vmm = Arc::new(Mutex::new(vmm));
     event_manager.add_subscriber(vmm.clone());
@@ -843,6 +851,7 @@ pub(crate) mod tests {
             vcpus_handles: Vec::new(),
             vcpus_exit_evt,
             device_manager: default_device_manager(),
+            checkpoint: None,
         }
     }
 

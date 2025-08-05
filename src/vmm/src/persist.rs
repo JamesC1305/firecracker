@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
+use userfaultfd::{FeatureFlags, RegisterMode, Uffd, UffdBuilder};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[cfg(target_arch = "aarch64")]
@@ -34,7 +34,9 @@ use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
+use crate::vmm_config::snapshot::{
+    Checkpoint, CreateSnapshotParams, LoadSnapshotParams, MemBackendType,
+};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
     self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
@@ -363,6 +365,7 @@ pub fn restore_from_snapshot(
     vm_resources: &mut VmResources,
 ) -> Result<Arc<Mutex<Vmm>>, RestoreFromSnapshotError> {
     let mut microvm_state = snapshot_state_from_file(&params.snapshot_path)?;
+
     for entry in &params.network_overrides {
         microvm_state
             .device_states
@@ -440,6 +443,7 @@ pub fn restore_from_snapshot(
         uffd,
         seccomp_filters,
         vm_resources,
+        params.enable_write_protection,
     )
     .map_err(RestoreFromSnapshotError::Build)
 }
@@ -525,8 +529,12 @@ fn guest_memory_from_uffd(
         .map_err(GuestMemoryFromUffdError::Create)?;
 
     for mem_region in guest_memory.iter() {
-        uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
-            .map_err(GuestMemoryFromUffdError::Register)?;
+        uffd.register_with_mode(
+            mem_region.as_ptr().cast(),
+            mem_region.size() as _,
+            RegisterMode::MISSING | RegisterMode::WRITE_PROTECT,
+        )
+        .map_err(GuestMemoryFromUffdError::Register)?;
     }
 
     send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;

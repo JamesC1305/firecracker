@@ -9,6 +9,8 @@ use std::path::PathBuf;
 pub use semver::Version;
 use serde::{Deserialize, Serialize};
 
+use crate::persist::MicrovmState;
+
 /// The snapshot type options that are available when
 /// creating a new snapshot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -146,6 +148,13 @@ pub struct ResetSnapshotParams {
     pub reset_socket_path: PathBuf,
     /// Snapshot files to reset to.
     pub new_snapshot: Option<SnapshotFiles>,
+}
+
+/// Stores the snapshot state in memory for later use.
+#[derive(Debug)]
+pub struct Checkpoint {
+    /// Microvm state at the time of snapshot load.
+    pub microvm_state: MicrovmState,
 }
 
 /// The microVM state options.
