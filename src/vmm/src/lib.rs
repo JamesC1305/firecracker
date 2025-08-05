@@ -127,6 +127,7 @@ use devices::acpi::vmgenid::VmGenIdError;
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
 use seccomp::BpfProgram;
 use userfaultfd::Uffd;
+use vmm_config::snapshot::Checkpoint;
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::terminal::Terminal;
@@ -321,6 +322,7 @@ pub struct Vmm {
     #[cfg(target_arch = "x86_64")]
     pio_device_manager: PortIODeviceManager,
     acpi_device_manager: ACPIDeviceManager,
+    checkpoint: Option<Checkpoint>,
 }
 
 impl Vmm {

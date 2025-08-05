@@ -58,6 +58,7 @@ use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Persist;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::MachineConfigError;
+use crate::vmm_config::snapshot::Checkpoint;
 use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::GuestRegionMmap;
 use crate::vstate::vcpu::{Vcpu, VcpuError};
@@ -191,6 +192,7 @@ fn create_vmm_and_vcpus(
         #[cfg(target_arch = "x86_64")]
         pio_device_manager,
         acpi_device_manager,
+        checkpoint: None,
     };
 
     Ok((vmm, vcpus))
@@ -430,6 +432,7 @@ pub fn build_microvm_from_snapshot(
     uffd: Option<Uffd>,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
+    enable_resetting: bool,
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
@@ -491,7 +494,7 @@ pub fn build_microvm_from_snapshot(
     vmm.vm.restore_state(&microvm_state.vm_state)?;
 
     // Restore the boot source config paths.
-    vm_resources.boot_source.config = microvm_state.vm_info.boot_source;
+    vm_resources.boot_source.config = microvm_state.vm_info.boot_source.clone();
 
     // Restore devices states.
     let mmio_ctor_args = MMIODevManagerConstructorArgs {
@@ -535,6 +538,10 @@ pub fn build_microvm_from_snapshot(
             .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
             .clone(),
     )?;
+
+    if enable_resetting {
+        vmm.checkpoint = Some(Checkpoint { microvm_state });
+    }
 
     let vmm = Arc::new(Mutex::new(vmm));
     event_manager.add_subscriber(vmm.clone());
@@ -914,6 +921,7 @@ pub(crate) mod tests {
             #[cfg(target_arch = "x86_64")]
             pio_device_manager,
             acpi_device_manager,
+            checkpoint: None,
         }
     }
 

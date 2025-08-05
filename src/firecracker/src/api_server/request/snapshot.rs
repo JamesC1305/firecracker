@@ -98,10 +98,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
     // If `mem_file_path` is specified instead of `mem_backend`, we construct the
     // `MemBackendConfig` object from the path specified, with `File` as backend type.
     let mem_backend = match snapshot_config.mem_backend {
-        Some(backend_cfg) => {
-
-            backend_cfg
-        }
+        Some(backend_cfg) => backend_cfg,
         None => {
             MemBackendConfig {
                 // This is safe to unwrap() because we ensure above that one of the two:
@@ -111,7 +108,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
             }
         }
     };
- 
+
     // Write-protection is only supported for `Uffd`-backed snapshots.
     // Attempting to enable this with `File` backing should result in an error
     match &mem_backend.backend_type {
@@ -269,7 +266,7 @@ mod tests {
             track_dirty_pages: true,
             resume_vm: false,
             network_overrides: vec![],
-            enable_write_protection: false
+            enable_write_protection: false,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
         assert!(
