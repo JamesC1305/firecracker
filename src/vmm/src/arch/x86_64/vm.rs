@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use kvm_bindings::{
     KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
@@ -127,7 +127,7 @@ impl ArchVm {
     /// - [`kvm_ioctls::VmFd::set_irqchip`] errors.
     /// - [`kvm_ioctls::VmFd::set_irqchip`] errors.
     /// - [`kvm_ioctls::VmFd::set_irqchip`] errors.
-    pub fn restore_state(&mut self, state: &VmState) -> Result<(), ArchVmError> {
+    pub fn restore_state(&self, state: &VmState) -> Result<(), ArchVmError> {
         self.fd()
             .set_pit2(&state.pitstate)
             .map_err(ArchVmError::SetPit2)?;
@@ -143,7 +143,7 @@ impl ArchVm {
         self.fd()
             .set_irqchip(&state.ioapic)
             .map_err(ArchVmError::SetIrqChipIoAPIC)?;
-        self.common.resource_allocator = Mutex::new(state.resource_allocator.clone());
+        *self.common.resource_allocator.lock().unwrap() = state.resource_allocator.clone();
         Ok(())
     }
 
