@@ -8,7 +8,7 @@ use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
 
 use super::builder::build_and_boot_microvm;
-use super::persist::{create_snapshot, restore_from_snapshot};
+use super::persist::{create_snapshot, reset_to_snapshot, restore_from_snapshot};
 use super::resources::VmResources;
 use super::{Vmm, VmmError};
 use crate::EventManager;
@@ -16,7 +16,7 @@ use crate::builder::StartMicrovmError;
 use crate::cpu_config::templates::{CustomCpuTemplate, GuestConfigError};
 use crate::logger::{LoggerConfig, info, warn, *};
 use crate::mmds::data_store::{self, Mmds};
-use crate::persist::{CreateSnapshotError, RestoreFromSnapshotError, VmInfo};
+use crate::persist::{CreateSnapshotError, ResetSnapshotError, RestoreFromSnapshotError, VmInfo};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
 use crate::vmm_config::balloon::{
@@ -170,6 +170,8 @@ pub enum VmmActionError {
     OperationNotSupportedPostBoot,
     /// The requested operation is not supported before starting the microVM.
     OperationNotSupportedPreBoot,
+    /// Reset snapshot error: {0}
+    ResetSnapshot(#[from] ResetSnapshotError),
     /// Start microvm error: {0}
     StartMicrovm(#[from] StartMicrovmError),
     /// Vsock config error: {0}
@@ -588,6 +590,7 @@ impl<'a> PrebootApiController<'a> {
             // If restore fails, we consider the process is too dirty to recover.
             self.fatal_error = Some(BuildMicrovmFromRequestsError::Restore);
         })?;
+
         // Resume VM
         if load_params.resume_vm {
             vmm.lock()
@@ -850,6 +853,11 @@ impl RuntimeApiController {
         &mut self,
         snapshot_reset_cfg: ResetSnapshotParams,
     ) -> Result<VmmData, VmmActionError> {
+        let mut locked_vmm = self.vmm.lock().expect("Poisoned lock");
+
+        reset_to_snapshot(&mut locked_vmm, snapshot_reset_cfg)
+            .map_err(VmmActionError::ResetSnapshot)?;
+
         Ok(VmmData::Empty)
     }
 }

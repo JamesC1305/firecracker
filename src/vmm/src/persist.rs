@@ -5,11 +5,11 @@
 
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::mem::forget;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use semver::Version;
@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use userfaultfd::{FeatureFlags, RegisterMode, Uffd, UffdBuilder};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
+use crate::arch::ArchVmError;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::vcpu::get_manufacturer_id_from_host;
 use crate::builder::{self, BuildMicrovmFromSnapshotError};
@@ -35,7 +36,7 @@ use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::snapshot::{
-    Checkpoint, CreateSnapshotParams, LoadSnapshotParams, MemBackendType,
+    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, ResetSnapshotParams,
 };
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory;
@@ -604,6 +605,125 @@ fn send_uffd_handshake(
     // between the mappings message and the connection shutdown. If the latter arrives at the UFFD
     // handler first, the handler never sees the mappings.
     forget(socket);
+
+    Ok(())
+}
+
+/// Message struct sent over UFFD socket.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResetSnapshotMessage {
+    new_mem_file_path: Option<PathBuf>,
+}
+
+/// Errors related to resetting to a snapshot.
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum ResetSnapshotError {
+    /// Failed to connect to UDS Unix stream: {0}
+    Connect(std::io::Error),
+    /// Error occurred with serialization/deserialization: {0}
+    SerdeJson(#[from] serde_json::Error),
+    /// Resetting is not enabled on this VM.
+    ResettingNotEnabled,
+    /// Failed to remove dirty page: {0}
+    RemoveDirtyPages(std::io::Error),
+    /// Failed to restore VM state: {0}
+    RestoreState(ArchVmError),
+    /// Failed to load new snapshot state from file: {0}
+    LoadNewState(SnapshotStateFromFileError),
+}
+
+/// Reset the VMM back to a snapshotted state
+pub fn reset_to_snapshot(
+    vmm: &mut Vmm,
+    reset_params: ResetSnapshotParams,
+) -> Result<(), ResetSnapshotError> {
+
+    let (checkpointed_state, new_mem_file) = {
+        if let Some(snapshot_files) = reset_params.new_snapshot {
+            (
+                &vmm.checkpoint.as_ref().unwrap().microvm_state,
+                // &snapshot_state_from_file(&snapshot_files.snapshot_path).map_err(ResetSnapshotError::LoadNewState)?,
+                Some(snapshot_files.mem_file_path),
+            )
+        } else if let Some(checkpoint) = vmm.checkpoint.as_ref() {
+            (&checkpoint.microvm_state, None)
+        } else {
+            return Err(ResetSnapshotError::ResettingNotEnabled);
+        }
+    };
+
+    let reset_message = ResetSnapshotMessage { new_mem_file_path: new_mem_file };
+
+    let mut uffd_stream =
+        UnixStream::connect(reset_params.reset_socket_path).map_err(ResetSnapshotError::Connect)?;
+
+    {
+        let writer = BufWriter::new(&uffd_stream);
+        serde_json::to_writer(writer, &reset_message).map_err(ResetSnapshotError::SerdeJson)?;
+        uffd_stream.flush().unwrap();
+    }
+
+    let dirty_pfns: Vec<u64> = {
+        let reader = BufReader::new(&uffd_stream);
+        serde_json::from_reader(reader).map_err(ResetSnapshotError::SerdeJson)?
+    };
+
+    if !dirty_pfns.is_empty() {
+
+        let page_size = checkpointed_state.vm_info.huge_pages.page_size();
+
+        let mut start_pfn = dirty_pfns[0];
+        let mut prev_pfn = start_pfn;
+        let mut madv_size = page_size;
+
+        // If cfg contains new snapshot, load state from snapshot file
+        for &pfn in &dirty_pfns[1..] {
+
+            if pfn == prev_pfn + 1 {
+                madv_size += page_size;
+            }
+
+            else {
+                let dirty_page_address = start_pfn * (page_size as u64);
+                if madv_size > 4096 {
+                    info!("Coalesced pages: {:x}-{:x}", dirty_page_address, dirty_page_address + madv_size as u64);
+                }
+                // SAFETY: TBD
+                let ret =
+                    unsafe { libc::madvise(dirty_page_address as *mut _, madv_size, libc::MADV_DONTNEED) };
+
+                if ret != 0 {
+                    return Err(ResetSnapshotError::RemoveDirtyPages(
+                        std::io::Error::last_os_error(),
+                    ));
+                }
+
+                start_pfn = pfn;
+                madv_size = page_size;
+            }
+            prev_pfn = pfn;
+
+        }
+
+        if madv_size > 0 {
+            let dirty_page_address = start_pfn * (page_size as u64);
+            // SAFETY: TBD
+            let ret =
+                unsafe { libc::madvise(dirty_page_address as *mut _, madv_size, libc::MADV_DONTNEED) };
+
+            if ret != 0 {
+                return Err(ResetSnapshotError::RemoveDirtyPages(
+                    std::io::Error::last_os_error(),
+                ));
+            }
+        }
+    }
+
+
+
+    vmm.vm
+        .restore_state(&checkpointed_state.vm_state)
+        .map_err(ResetSnapshotError::RestoreState)?;
 
     Ok(())
 }
