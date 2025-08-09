@@ -434,13 +434,24 @@ pub fn build_microvm_from_snapshot(
     vm_resources: &mut VmResources,
     enable_resetting: bool,
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
+    // If we're utilising snapshot resetting, we need to enable `KVM_CAP_SYNC_MMU` capability to
+    // ensure that changes to the host memory backing the guest are reflected in the guest.
+    let kvm_cap_modifiers = match enable_resetting {
+        true => {
+            let mut modifiers = microvm_state.kvm_state.kvm_cap_modifiers.clone();
+            modifiers.push(KvmCapability::Add(kvm_bindings::KVM_CAP_SYNC_MMU));
+            modifiers
+        }
+        false => microvm_state.kvm_state.kvm_cap_modifiers.clone(),
+    };
+
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
     let (mut vmm, mut vcpus) = create_vmm_and_vcpus(
         instance_info,
         event_manager,
         vm_resources.machine_config.vcpu_count,
-        microvm_state.kvm_state.kvm_cap_modifiers.clone(),
+        kvm_cap_modifiers,
     )
     .map_err(StartMicrovmError::Internal)?;
 
