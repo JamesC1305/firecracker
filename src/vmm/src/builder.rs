@@ -21,7 +21,9 @@ use crate::Vcpu;
 use crate::arch::{ConfigurationError, configure_system_for_boot, load_kernel};
 #[cfg(target_arch = "aarch64")]
 use crate::construct_kvm_mpidrs;
-use crate::cpu_config::templates::{GetCpuTemplate, GetCpuTemplateError, GuestConfigError};
+use crate::cpu_config::templates::{
+    GetCpuTemplate, GetCpuTemplateError, GuestConfigError, KvmCapability,
+};
 #[cfg(target_arch = "x86_64")]
 use crate::device_manager;
 use crate::device_manager::pci_mngr::PciManagerError;
@@ -444,11 +446,17 @@ pub fn build_microvm_from_snapshot(
     vm_resources: &mut VmResources,
     enable_resetting: bool,
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
+    // If we're utilising snapshot resetting, we need to enable `KVM_CAP_SYNC_MMU` capability to
+    // ensure that changes to the host memory backing the guest are reflected in the guest.
+    let mut kvm_cap_modifiers = microvm_state.kvm_state.kvm_cap_modifiers.clone();
+    if enable_resetting {
+        kvm_cap_modifiers.push(KvmCapability::Add(kvm_bindings::KVM_CAP_SYNC_MMU));
+    }
+
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
 
-    let kvm = Kvm::new(microvm_state.kvm_state.kvm_cap_modifiers.clone())
-        .map_err(StartMicrovmError::Kvm)?;
+    let kvm = Kvm::new(kvm_cap_modifiers).map_err(StartMicrovmError::Kvm)?;
     // Set up Kvm Vm and register memory regions.
     // Build custom CPU config if a custom template is provided.
     let mut vm = Vm::new(&kvm).map_err(StartMicrovmError::Vm)?;
