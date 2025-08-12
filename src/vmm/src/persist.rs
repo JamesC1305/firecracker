@@ -118,10 +118,14 @@ pub struct GuestRegionUffdMapping {
 /// Errors related to saving and restoring Microvm state.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum MicrovmStateError {
+    /// The number of Vcpu states provided does not match the number of Vcpus present in the VMM.
+    IncorrectVcpuStateCount,
     /// Operation not allowed: {0}
     NotAllowed(String),
     /// Cannot restore devices: {0}
     RestoreDevices(DevicePersistError),
+    /// Cannot restore Vcpu state: {0}
+    RestoreVcpuState(vstate::vcpu::VcpuError),
     /// Cannot save Vcpu state: {0}
     SaveVcpuState(vstate::vcpu::VcpuError),
     /// Cannot save Vm state: {0}
@@ -643,7 +647,9 @@ pub enum ResetSnapshotError {
     /// Failed to remove dirty page: {0}
     RemoveDirtyPages(std::io::Error),
     /// Failed to restore VM state: {0}
-    RestoreState(ArchVmError),
+    RestoreVmState(ArchVmError),
+    /// Failed to restore Vcpu states: {0}
+    RestoreVcpuState(MicrovmStateError),
     /// Failed to load new snapshot state from file: {0}
     LoadNewState(SnapshotStateFromFileError),
 }
@@ -662,19 +668,19 @@ pub fn reset_to_snapshot(
     vmm: &mut Vmm,
     reset_params: ResetSnapshotParams,
 ) -> Result<(), ResetSnapshotError> {
-    let checkpoint = vmm
-        .checkpoint
-        .as_mut()
-        .ok_or(ResetSnapshotError::ResettingNotEnabled)?;
-
     let (checkpointed_state, new_mem_file) = match reset_params.new_snapshot {
         Some(snapshot_files) => (
-            &snapshot_state_from_file(&snapshot_files.snapshot_path)
+            snapshot_state_from_file(&snapshot_files.snapshot_path)
                 .map_err(ResetSnapshotError::LoadNewState)?,
             Some(snapshot_files.mem_file_path),
         ),
-        None => (&checkpoint.microvm_state, None),
+        None => {
+            return Err(ResetSnapshotError::ResettingNotEnabled)?;
+        }
     };
+
+    vmm.restore_vcpu_states(checkpointed_state.vcpu_states)
+        .map_err(ResetSnapshotError::RestoreVcpuState)?;
 
     let stream = UnixStream::connect(reset_params.reset_socket_path)
         .map_err(ResetSnapshotError::SocketConnect)?;
@@ -716,7 +722,7 @@ pub fn reset_to_snapshot(
 
     vmm.vm
         .restore_state(&checkpointed_state.vm_state)
-        .map_err(ResetSnapshotError::RestoreState)?;
+        .map_err(ResetSnapshotError::RestoreVmState)?;
 
     Ok(())
 }

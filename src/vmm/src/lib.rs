@@ -558,6 +558,35 @@ impl Vmm {
         Ok(vcpu_states)
     }
 
+    fn restore_vcpu_states(&self, states: Vec<VcpuState>) -> Result<(), MicrovmStateError> {
+        if states.len() != self.vcpus_handles.len() {
+            return Err(MicrovmStateError::IncorrectVcpuStateCount);
+        }
+        for (handle, state) in self.vcpus_handles.iter().zip(states) {
+            handle
+                .send_event(VcpuEvent::RestoreState(Box::new(state)))
+                .map_err(MicrovmStateError::SignalVcpu)?;
+        }
+
+        let vcpu_responses = self
+            .vcpus_handles
+            .iter()
+            // `Iterator::collect` can transform a `Vec<Result>` into a `Result<Vec>`.
+            .map(|handle| handle.response_receiver().recv_timeout(RECV_TIMEOUT_SEC))
+            .collect::<Result<Vec<VcpuResponse>, RecvTimeoutError>>()
+            .map_err(|_| MicrovmStateError::UnexpectedVcpuResponse)?;
+
+        vcpu_responses
+            .into_iter()
+            .try_for_each(|response| match response {
+                VcpuResponse::RestoredState => Ok(()),
+                VcpuResponse::Error(err) => Err(MicrovmStateError::SaveVcpuState(err)),
+                VcpuResponse::NotAllowed(reason) => Err(MicrovmStateError::NotAllowed(reason)),
+                _ => Err(MicrovmStateError::UnexpectedVcpuResponse),
+            })?;
+
+        Ok(())
+    }
     /// Dumps CPU configuration.
     pub fn dump_cpu_config(&mut self) -> Result<Vec<CpuConfiguration>, DumpCpuConfigError> {
         for handle in self.vcpus_handles.iter() {
