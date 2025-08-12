@@ -632,8 +632,10 @@ pub enum SnapshotMessage {
 /// Errors related to resetting to a snapshot.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ResetSnapshotError {
-    /// Failed to connect to UDS Unix stream: {0}
-    Connect(std::io::Error),
+    /// Failed to connect to Unix stream: {0}
+    SocketConnect(std::io::Error),
+    /// Failed to shutdown Unix stream: {0}
+    SocketShutdown(std::io::Error),
     /// Error occurred with serialization/deserialization: {0}
     SerdeJson(#[from] serde_json::Error),
     /// Resetting is not enabled on this VM.
@@ -646,84 +648,63 @@ pub enum ResetSnapshotError {
     LoadNewState(SnapshotStateFromFileError),
 }
 
+/// Used to represent ranges of pages to be removed.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PageRange {
+    /// The PFN at the start of the range.
+    pub start_pfn: u64,
+    /// The number of PFNs in the range.
+    pub len: usize,
+}
+
 /// Reset the VMM back to a snapshotted state
 pub fn reset_to_snapshot(
     vmm: &mut Vmm,
     reset_params: ResetSnapshotParams,
 ) -> Result<(), ResetSnapshotError> {
+    let checkpoint = vmm
+        .checkpoint
+        .as_mut()
+        .ok_or(ResetSnapshotError::ResettingNotEnabled)?;
 
-    let (checkpointed_state, new_mem_file) = {
-        if let Some(snapshot_files) = reset_params.new_snapshot {
-            (
-                &vmm.checkpoint.as_ref().unwrap().microvm_state,
-                // &snapshot_state_from_file(&snapshot_files.snapshot_path).map_err(ResetSnapshotError::LoadNewState)?,
-                Some(snapshot_files.mem_file_path),
-            )
-        } else if let Some(checkpoint) = vmm.checkpoint.as_ref() {
-            (&checkpoint.microvm_state, None)
-        } else {
-            return Err(ResetSnapshotError::ResettingNotEnabled);
-        }
+    let (checkpointed_state, new_mem_file) = match reset_params.new_snapshot {
+        Some(snapshot_files) => (
+            &snapshot_state_from_file(&snapshot_files.snapshot_path)
+                .map_err(ResetSnapshotError::LoadNewState)?,
+            Some(snapshot_files.mem_file_path),
+        ),
+        None => (&checkpoint.microvm_state, None),
     };
 
-    let reset_message = ResetSnapshotMessage { new_mem_file_path: new_mem_file };
-
-    let mut uffd_stream =
-        UnixStream::connect(reset_params.reset_socket_path).map_err(ResetSnapshotError::Connect)?;
+    let stream = UnixStream::connect(reset_params.reset_socket_path)
+        .map_err(ResetSnapshotError::SocketConnect)?;
+    let reset_message = SnapshotMessage::ResetSnapshot {
+        new_mem_file_path: new_mem_file,
+    };
 
     {
-        let writer = BufWriter::new(&uffd_stream);
+        let writer = BufWriter::new(&stream);
         serde_json::to_writer(writer, &reset_message).map_err(ResetSnapshotError::SerdeJson)?;
-        uffd_stream.flush().unwrap();
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(ResetSnapshotError::SocketShutdown)?;
     }
 
-    let dirty_pfns: Vec<u64> = {
-        let reader = BufReader::new(&uffd_stream);
+    let page_ranges: Vec<PageRange> = {
+        let reader = BufReader::new(&stream);
         serde_json::from_reader(reader).map_err(ResetSnapshotError::SerdeJson)?
     };
 
-    if !dirty_pfns.is_empty() {
-
+    if !page_ranges.is_empty() {
         let page_size = checkpointed_state.vm_info.huge_pages.page_size();
 
-        let mut start_pfn = dirty_pfns[0];
-        let mut prev_pfn = start_pfn;
-        let mut madv_size = page_size;
+        for range in page_ranges {
+            let start_addr = range.start_pfn * page_size as u64;
+            let size = range.len * page_size;
 
-        // If cfg contains new snapshot, load state from snapshot file
-        for &pfn in &dirty_pfns[1..] {
-
-            if pfn == prev_pfn + 1 {
-                madv_size += page_size;
-            }
-
-            else {
-                let dirty_page_address = start_pfn * (page_size as u64);
-                if madv_size > 4096 {
-                    info!("Coalesced pages: {:x}-{:x}", dirty_page_address, dirty_page_address + madv_size as u64);
-                }
-                // SAFETY: TBD
-                let ret =
-                    unsafe { libc::madvise(dirty_page_address as *mut _, madv_size, libc::MADV_DONTNEED) };
-
-                if ret != 0 {
-                    return Err(ResetSnapshotError::RemoveDirtyPages(
-                        std::io::Error::last_os_error(),
-                    ));
-                }
-
-                start_pfn = pfn;
-                madv_size = page_size;
-            }
-            prev_pfn = pfn;
-
-        }
-
-        if madv_size > 0 {
-            let dirty_page_address = start_pfn * (page_size as u64);
-            // SAFETY: TBD
-            let ret =
-                unsafe { libc::madvise(dirty_page_address as *mut _, madv_size, libc::MADV_DONTNEED) };
+            // SAFETY: start_addr -> start_addr + size is a subset of the VMM's allocated
+            // guest memory.
+            let ret = unsafe { libc::madvise(start_addr as *mut _, size, libc::MADV_DONTNEED) };
 
             if ret != 0 {
                 return Err(ResetSnapshotError::RemoveDirtyPages(
@@ -732,8 +713,6 @@ pub fn reset_to_snapshot(
             }
         }
     }
-
-
 
     vmm.vm
         .restore_state(&checkpointed_state.vm_state)
