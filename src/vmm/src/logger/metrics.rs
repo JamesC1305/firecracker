@@ -597,6 +597,8 @@ pub struct PerformanceMetrics {
     pub load_snapshot: SharedStoreMetric,
     /// Measures the microVM pausing duration, at the API (user) level, in microseconds.
     pub pause_vm: SharedStoreMetric,
+    /// Measures the snapshot reset time, at the API (user) level, in microseconds.
+    pub reset_snapshot: SharedStoreMetric,
     /// Measures the microVM resuming duration, at the API (user) level, in microseconds.
     pub resume_vm: SharedStoreMetric,
     /// Measures the snapshot full create time, at the VMM level, in microseconds.
@@ -607,6 +609,8 @@ pub struct PerformanceMetrics {
     pub vmm_load_snapshot: SharedStoreMetric,
     /// Measures the microVM pausing duration, at the VMM level, in microseconds.
     pub vmm_pause_vm: SharedStoreMetric,
+    /// Measures the snapshot reset duration, at the VMM level, in microseconds.
+    pub vmm_reset_snapshot: SharedStoreMetric,
     /// Measures the microVM resuming duration, at the VMM level, in microseconds.
     pub vmm_resume_vm: SharedStoreMetric,
 }
@@ -618,11 +622,13 @@ impl PerformanceMetrics {
             diff_create_snapshot: SharedStoreMetric::new(),
             load_snapshot: SharedStoreMetric::new(),
             pause_vm: SharedStoreMetric::new(),
+            reset_snapshot: SharedStoreMetric::new(),
             resume_vm: SharedStoreMetric::new(),
             vmm_full_create_snapshot: SharedStoreMetric::new(),
             vmm_diff_create_snapshot: SharedStoreMetric::new(),
             vmm_load_snapshot: SharedStoreMetric::new(),
             vmm_pause_vm: SharedStoreMetric::new(),
+            vmm_reset_snapshot: SharedStoreMetric::new(),
             vmm_resume_vm: SharedStoreMetric::new(),
         }
     }

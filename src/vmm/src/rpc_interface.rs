@@ -853,10 +853,19 @@ impl RuntimeApiController {
         &mut self,
         snapshot_reset_cfg: ResetSnapshotParams,
     ) -> Result<VmmData, VmmActionError> {
+        let reset_start_us = get_time_us(ClockType::Monotonic);
         let mut locked_vmm = self.vmm.lock().expect("Poisoned lock");
 
         reset_to_snapshot(&mut locked_vmm, snapshot_reset_cfg)
             .map_err(VmmActionError::ResetSnapshot)?;
+
+        debug!(
+            "'reset snapshot' VMM action took {} us.",
+            update_metric_with_elapsed_time(
+                &METRICS.latencies_us.vmm_reset_snapshot,
+                reset_start_us
+            )
+        );
 
         Ok(VmmData::Empty)
     }
