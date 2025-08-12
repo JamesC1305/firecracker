@@ -589,13 +589,16 @@ fn send_uffd_handshake(
     backend_mappings: &[GuestRegionUffdMapping],
     uffd: &impl AsRawFd,
 ) -> Result<(), GuestMemoryFromUffdError> {
-    // This is safe to unwrap() because we control the contents of the vector
+    // This is safe to unwrap() because we control the contents of the message
     // (i.e GuestRegionUffdMapping entries).
-    let backend_mappings = serde_json::to_string(backend_mappings).unwrap();
+    let message = SnapshotMessage::LoadSnapshot {
+        guest_mappings: Vec::from(backend_mappings),
+    };
+    let message = serde_json::to_string(&message).unwrap();
 
     let socket = UnixStream::connect(mem_uds_path)?;
     socket.send_with_fd(
-        backend_mappings.as_bytes(),
+        message.as_bytes(),
         // In the happy case we can close the fd since the other process has it open and is
         // using it to serve us pages.
         //
@@ -639,8 +642,19 @@ fn send_uffd_handshake(
 
 /// Message struct sent over UFFD socket.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ResetSnapshotMessage {
-    new_mem_file_path: Option<PathBuf>,
+pub enum SnapshotMessage {
+    /// A request to load the handler's snapshot.
+    LoadSnapshot {
+        /// A description of the VMMs memory layout used by the UFFD handler to resolve page
+        /// faults.
+        guest_mappings: Vec<GuestRegionUffdMapping>,
+    },
+    /// A request to reset back to a snapshot.
+    ResetSnapshot {
+        /// If `new_mem_file_path` is `None`, we restore back to the current snapshot.
+        /// If `Some(path)` is provided, we reset to the new snapshot.
+        new_mem_file_path: Option<PathBuf>,
+    },
 }
 
 /// Errors related to resetting to a snapshot.
