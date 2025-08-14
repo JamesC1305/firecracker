@@ -120,41 +120,22 @@ pub struct MemBackendConfig {
     pub backend_type: MemBackendType,
 }
 
-/// Stores the configuration for resetting to a snapshot that is provided by the user.
+/// Stores the configuration for resetting to a snapshot.
 #[derive(Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ResetSnapshotConfig {
+pub struct ResetSnapshotParams {
     /// Path to the backend used to handle reset messages.
     pub reset_socket_path: PathBuf,
-    /// Path to a new snapshot file to reset to.
-    pub snapshot_path: Option<PathBuf>,
-    /// Path to a new mem_file to reset to.
-    pub mem_file_path: Option<PathBuf>,
-}
-
-/// Stores snapshot file paths.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotFiles {
     /// Path to the new snapshot file to reset to.
     pub snapshot_path: PathBuf,
     /// Path to the new mem_file to reset to.
     pub mem_file_path: PathBuf,
 }
 
-/// Stores the configuration for resetting to a snapshot.
-#[derive(Debug, PartialEq, Eq, Deserialize)]
-pub struct ResetSnapshotParams {
-    /// Path to the backend used to handle reset messages.
-    pub reset_socket_path: PathBuf,
-    /// Snapshot files to reset to.
-    pub new_snapshot: Option<SnapshotFiles>,
-}
-
 /// Stores the snapshot state in memory for later use.
 #[derive(Debug)]
 pub struct Checkpoint {
     /// Microvm state at the time of snapshot load.
-    pub microvm_state: MicrovmState,
+    pub current_snapshot_path: PathBuf,
 }
 
 /// The microVM state options.

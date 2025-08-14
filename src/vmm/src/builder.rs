@@ -444,12 +444,12 @@ pub fn build_microvm_from_snapshot(
     uffd: Option<Uffd>,
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
-    enable_resetting: bool,
+    checkpoint: Option<Checkpoint>,
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
     // If we're utilising snapshot resetting, we need to enable `KVM_CAP_SYNC_MMU` capability to
     // ensure that changes to the host memory backing the guest are reflected in the guest.
     let mut kvm_cap_modifiers = microvm_state.kvm_state.kvm_cap_modifiers.clone();
-    if enable_resetting {
+    if checkpoint.is_some() {
         kvm_cap_modifiers.push(KvmCapability::Add(kvm_bindings::KVM_CAP_SYNC_MMU));
     }
 
@@ -533,7 +533,7 @@ pub fn build_microvm_from_snapshot(
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
         device_manager,
-        checkpoint: None,
+        checkpoint,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -544,10 +544,6 @@ pub fn build_microvm_from_snapshot(
             .ok_or(BuildMicrovmFromSnapshotError::MissingVcpuSeccompFilters)?
             .clone(),
     )?;
-
-    if enable_resetting {
-        vmm.checkpoint = Some(Checkpoint { microvm_state });
-    }
 
     let vmm = Arc::new(Mutex::new(vmm));
     event_manager.add_subscriber(vmm.clone());
