@@ -38,7 +38,7 @@ impl From<&Restriction> for io_uring_restriction {
                 instance.opcode =
                     u16::try_from(io_uring_register_restriction_op::IORING_RESTRICTION_SQE_OP)
                         .unwrap();
-                instance.__bindgen_anon_1.sqe_op = *opcode as u8;
+                instance.__bindgen_anon_1.sqe_op = (*opcode).into();
             }
             RequireFixedFds => {
                 instance.opcode = u16::try_from(
