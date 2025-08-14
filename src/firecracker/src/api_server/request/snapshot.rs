@@ -6,7 +6,7 @@ use vmm::logger::{IncMetric, METRICS};
 use vmm::rpc_interface::VmmAction;
 use vmm::vmm_config::snapshot::{
     CreateSnapshotParams, LoadSnapshotConfig, LoadSnapshotParams, MemBackendConfig, MemBackendType,
-    ResetSnapshotConfig, ResetSnapshotParams, SnapshotFiles, Vm, VmState,
+    ResetSnapshotParams, Vm, VmState,
 };
 
 use super::super::parsed_request::{ParsedRequest, RequestError};
@@ -25,9 +25,6 @@ pub const TOO_MANY_FIELDS: &str =
 
 pub const CONFLICTING_FIELDS: &str =
     "conflicting fields: `enable_write_protection` can only be used with `MemBackend::Uffd`";
-
-pub const MISSING_RESET_FIELDS: &str = "missing fields: both `mem_file_path` and `snapshot_path` \
-                                        are required if resetting to a different snapshot";
 
 pub(crate) fn parse_put_snapshot(
     body: &Body,
@@ -143,31 +140,10 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
 }
 
 fn parse_put_snapshot_reset(body: &Body) -> Result<ParsedRequest, RequestError> {
-    let reset_config = serde_json::from_slice::<ResetSnapshotConfig>(body.raw())?;
-
-    // Create the reset config from the parameters. `snapshot_path` and `mem_file_path` must either
-    // both be present, or both be absent. One without the other is an error condition.
-    let reset_config = match (reset_config.snapshot_path, reset_config.mem_file_path) {
-        (Some(snapshot_path), Some(mem_file_path)) => ResetSnapshotParams {
-            reset_socket_path: reset_config.reset_socket_path,
-            new_snapshot: Some(SnapshotFiles {
-                snapshot_path,
-                mem_file_path,
-            }),
-        },
-        (None, None) => ResetSnapshotParams {
-            reset_socket_path: reset_config.reset_socket_path,
-            new_snapshot: None,
-        },
-        _ => {
-            return Err(RequestError::SerdeJson(serde_json::Error::custom(
-                MISSING_RESET_FIELDS,
-            )));
-        }
-    };
+    let reset_params = serde_json::from_slice::<ResetSnapshotParams>(body.raw())?;
 
     Ok(ParsedRequest::new_sync(VmmAction::ResetSnapshot(
-        reset_config,
+        reset_params,
     )))
 }
 
@@ -553,15 +529,14 @@ mod tests {
         );
 
         let body = r#"{
+            "reset_socket_path": "sock",
             "snapshot_path": "foo",
             "mem_file_path": "bar"
         }"#;
         let expected_config = ResetSnapshotParams {
-            reset_socket_path: PathBuf::new(),
-            new_snapshot: Some(SnapshotFiles {
-                snapshot_path: "foo".into(),
-                mem_file_path: "bar".into(),
-            }),
+            reset_socket_path: "sock".into(),
+            snapshot_path: "foo".into(),
+            mem_file_path: "bar".into(),
         };
         let parsed_request = parse_put_snapshot(&Body::new(body), Some("reset")).unwrap();
         assert_eq!(
@@ -569,38 +544,8 @@ mod tests {
             VmmAction::ResetSnapshot(expected_config)
         );
 
-        let body = "{}";
-        let expected_config = ResetSnapshotParams {
-            reset_socket_path: PathBuf::new(),
-            new_snapshot: None,
-        };
-        let parsed_request = parse_put_snapshot(&Body::new(body), Some("reset")).unwrap();
-        assert_eq!(
-            vmm_action_from_request(parsed_request),
-            VmmAction::ResetSnapshot(expected_config)
-        );
-
-        let body = r#"{
-            "snapshot_path": "foo"
-        }"#;
-        assert_eq!(
-            parse_put_snapshot(&Body::new(body), Some("reset"))
-                .err()
-                .unwrap()
-                .to_string(),
-            RequestError::SerdeJson(serde_json::Error::custom(MISSING_RESET_FIELDS)).to_string()
-        );
-
-        let body = r#"{
-            "mem_file_path": "bar"
-        }"#;
-        assert_eq!(
-            parse_put_snapshot(&Body::new(body), Some("reset"))
-                .err()
-                .unwrap()
-                .to_string(),
-            RequestError::SerdeJson(serde_json::Error::custom(MISSING_RESET_FIELDS)).to_string()
-        );
+        let body = r#"{}"#;
+        parse_put_snapshot(&Body::new(body), Some("reset")).unwrap_err();
 
         parse_put_snapshot(&Body::new(body), Some("invalid")).unwrap_err();
         parse_put_snapshot(&Body::new(body), None).unwrap_err();

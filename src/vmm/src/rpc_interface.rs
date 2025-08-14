@@ -1176,7 +1176,8 @@ mod tests {
         check_unsupported(preboot_request(VmmAction::ResetSnapshot(
             ResetSnapshotParams {
                 reset_socket_path: PathBuf::new(),
-                new_snapshot: None,
+                snapshot_path: PathBuf::new(),
+                mem_file_path: PathBuf::new(),
             },
         )));
         #[cfg(target_arch = "x86_64")]

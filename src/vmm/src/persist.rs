@@ -36,7 +36,7 @@ use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::snapshot::{
-    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, ResetSnapshotParams,
+    Checkpoint, CreateSnapshotParams, LoadSnapshotParams, MemBackendType, ResetSnapshotParams,
 };
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory;
@@ -357,6 +357,13 @@ pub fn restore_from_snapshot(
     }
     let track_dirty_pages = params.track_dirty_pages;
 
+    let checkpoint = match params.enable_write_protection {
+        true => Some(Checkpoint {
+            current_snapshot_path: params.snapshot_path.clone(),
+        }),
+        false => None,
+    };
+
     let vcpu_count = microvm_state
         .vcpu_states
         .len()
@@ -414,7 +421,7 @@ pub fn restore_from_snapshot(
         uffd,
         seccomp_filters,
         vm_resources,
-        params.enable_write_protection,
+        checkpoint,
     )
     .map_err(RestoreFromSnapshotError::Build)
 }
@@ -666,24 +673,31 @@ pub struct PageRange {
 /// Reset the VMM back to a snapshotted state
 pub fn reset_to_snapshot(
     vmm: &mut Vmm,
-    reset_params: ResetSnapshotParams,
+    params: ResetSnapshotParams,
 ) -> Result<(), ResetSnapshotError> {
-    let (checkpointed_state, new_mem_file) = match reset_params.new_snapshot {
-        Some(snapshot_files) => (
-            snapshot_state_from_file(&snapshot_files.snapshot_path)
-                .map_err(ResetSnapshotError::LoadNewState)?,
-            Some(snapshot_files.mem_file_path),
-        ),
-        None => {
-            return Err(ResetSnapshotError::ResettingNotEnabled)?;
+    let checkpoint = vmm
+        .checkpoint
+        .as_mut()
+        .ok_or(ResetSnapshotError::ResettingNotEnabled)?;
+
+    let microvm_state = snapshot_state_from_file(&params.snapshot_path)
+        .map_err(ResetSnapshotError::LoadNewState)?;
+
+    // TODO: This is a really weak comparison to make. MicrovmState does not implement `PartialEq`,
+    // so we cannot simply compare the states. This is part of a wider problem though, about moving
+    // the VCPU states. If we can somehow pass them by reference to the thread, or implement
+    // `Copy`, all of this would be unnecessary.
+    let new_mem_file = {
+        if *checkpoint.current_snapshot_path.as_path() == *params.snapshot_path.as_path() {
+            None
+        } else {
+            checkpoint.current_snapshot_path = params.snapshot_path.clone();
+            Some(params.mem_file_path)
         }
     };
 
-    vmm.restore_vcpu_states(checkpointed_state.vcpu_states)
-        .map_err(ResetSnapshotError::RestoreVcpuState)?;
-
-    let stream = UnixStream::connect(reset_params.reset_socket_path)
-        .map_err(ResetSnapshotError::SocketConnect)?;
+    let stream =
+        UnixStream::connect(params.reset_socket_path).map_err(ResetSnapshotError::SocketConnect)?;
     let reset_message = SnapshotMessage::ResetSnapshot {
         new_mem_file_path: new_mem_file,
     };
@@ -702,7 +716,7 @@ pub fn reset_to_snapshot(
     };
 
     if !page_ranges.is_empty() {
-        let page_size = checkpointed_state.vm_info.huge_pages.page_size();
+        let page_size = microvm_state.vm_info.huge_pages.page_size();
 
         for range in page_ranges {
             let start_addr = range.start_pfn * page_size as u64;
@@ -720,8 +734,11 @@ pub fn reset_to_snapshot(
         }
     }
 
+    vmm.restore_vcpu_states(microvm_state.vcpu_states)
+        .map_err(ResetSnapshotError::RestoreVcpuState)?;
+
     vmm.vm
-        .restore_state(&checkpointed_state.vm_state)
+        .restore_state(&microvm_state.vm_state)
         .map_err(ResetSnapshotError::RestoreVmState)?;
 
     Ok(())
