@@ -29,6 +29,8 @@ pub enum OpCode {
     Write = generated::IORING_OP_WRITE as u8,
     /// Fsync operation.
     Fsync = generated::IORING_OP_FSYNC as u8,
+    /// Madvise operation:
+    Madvise(i32) = generated::IORING_OP_MADVISE as u8,
 }
 
 // Useful for outputting errors.
@@ -38,6 +40,18 @@ impl From<OpCode> for &'static str {
             OpCode::Read => "read",
             OpCode::Write => "write",
             OpCode::Fsync => "fsync",
+            OpCode::Madvise(_) => "madvise",
+        }
+    }
+}
+
+impl From<OpCode> for u8 {
+    fn from(opcode: OpCode) -> Self {
+        match opcode {
+            OpCode::Read => generated::IORING_OP_READ as u8,
+            OpCode::Write => generated::IORING_OP_WRITE as u8,
+            OpCode::Fsync => generated::IORING_OP_FSYNC as u8,
+            OpCode::Madvise(_) => generated::IORING_OP_MADVISE as u8,
         }
     }
 }
@@ -45,7 +59,7 @@ impl From<OpCode> for &'static str {
 /// Operation type for populating the submission queue, parametrised with the `user_data` type `T`.
 /// The `user_data` is used for identifying the operation once completed.
 pub struct Operation<T> {
-    fd: FixedFd,
+    fd: Option<FixedFd>,
     pub(crate) opcode: OpCode,
     pub(crate) addr: Option<usize>,
     pub(crate) len: Option<u32>,
@@ -77,7 +91,7 @@ impl<T: Debug> Operation<T> {
     /// Construct a read operation.
     pub fn read(fd: FixedFd, addr: usize, len: u32, offset: u64, user_data: T) -> Self {
         Self {
-            fd,
+            fd: Some(fd),
             opcode: OpCode::Read,
             addr: Some(addr),
             len: Some(len),
@@ -90,7 +104,7 @@ impl<T: Debug> Operation<T> {
     /// Construct a write operation.
     pub fn write(fd: FixedFd, addr: usize, len: u32, offset: u64, user_data: T) -> Self {
         Self {
-            fd,
+            fd: Some(fd),
             opcode: OpCode::Write,
             addr: Some(addr),
             len: Some(len),
@@ -103,7 +117,7 @@ impl<T: Debug> Operation<T> {
     /// Construct a fsync operation.
     pub fn fsync(fd: FixedFd, user_data: T) -> Self {
         Self {
-            fd,
+            fd: Some(fd),
             opcode: OpCode::Fsync,
             addr: None,
             len: None,
@@ -113,7 +127,20 @@ impl<T: Debug> Operation<T> {
         }
     }
 
-    pub(crate) fn fd(&self) -> FixedFd {
+    /// Construct an madvise operation.
+    pub fn madvise(addr: usize, len: u32, madvise_behaviour: i32, user_data: T) -> Self {
+        Self {
+            fd: None,
+            opcode: OpCode::Madvise(madvise_behaviour),
+            addr: Some(addr),
+            len: Some(len),
+            flags: 0,
+            offset: None,
+            user_data,
+        }
+    }
+
+    pub(crate) fn fd(&self) -> Option<FixedFd> {
         self.fd
     }
 
@@ -130,10 +157,19 @@ impl<T: Debug> Operation<T> {
         // Safe because all-zero value is valid. The sqe is made up of integers and raw pointers.
         let mut inner: io_uring_sqe = unsafe { std::mem::zeroed() };
 
-        inner.opcode = self.opcode as u8;
-        inner.fd = i32::try_from(self.fd).unwrap();
-        // Simplifying assumption that we only used pre-registered FDs.
-        inner.flags = self.flags | (1 << IOSQE_FIXED_FILE_BIT);
+        inner.opcode = self.opcode.into();
+
+        match self.fd {
+            Some(fd) => {
+                inner.fd = i32::try_from(fd).unwrap();
+                // Simplifying assumption that we only used pre-registered FDs.
+                // (if an fd is supplied).
+                inner.flags = self.flags | (1 << IOSQE_FIXED_FILE_BIT);
+            }
+            None => {
+                inner.fd = -1;
+            }
+        }
 
         if let Some(addr) = self.addr {
             inner.__bindgen_anon_2.addr = addr as u64;
@@ -145,6 +181,10 @@ impl<T: Debug> Operation<T> {
 
         if let Some(offset) = self.offset {
             inner.__bindgen_anon_1.off = offset;
+        }
+
+        if let OpCode::Madvise(behaviour) = self.opcode {
+            inner.__bindgen_anon_3.fadvise_advice = behaviour.try_into().unwrap();
         }
         inner.user_data = slab.insert(self.user_data) as u64;
 

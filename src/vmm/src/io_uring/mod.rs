@@ -166,8 +166,10 @@ impl<T: Debug> IoUring<T> {
         // validate that we actually did register fds
         let fd = op.fd();
         match self.registered_fds_count {
-            0 => Err((IoUringError::NoRegisteredFds, op.user_data)),
-            len if fd >= len => Err((IoUringError::InvalidFixedFd(fd), op.user_data)),
+            0 if fd.is_some() => Err((IoUringError::NoRegisteredFds, op.user_data)),
+            len if fd.is_some() && fd.unwrap() >= len => {
+                Err((IoUringError::InvalidFixedFd(fd.unwrap()), op.user_data))
+            }
             _ => {
                 if self.num_ops >= self.cqueue.count() {
                     return Err((IoUringError::FullCQueue, op.user_data));
@@ -367,7 +369,7 @@ impl<T: Debug> IoUring<T> {
             .collect();
 
         for opcode in REQUIRED_OPS.iter() {
-            if !supported_opcodes.contains(&(*opcode as u8)) {
+            if !supported_opcodes.contains(&((*opcode).into())) {
                 return Err(IoUringError::UnsupportedOperation((*opcode).into()));
             }
         }

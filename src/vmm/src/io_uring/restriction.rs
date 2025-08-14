@@ -34,7 +34,7 @@ impl From<&Restriction> for generated::io_uring_restriction {
         match restriction {
             AllowOpCode(opcode) => {
                 instance.opcode = u16::try_from(generated::IORING_RESTRICTION_SQE_OP).unwrap();
-                instance.__bindgen_anon_1.sqe_op = *opcode as u8;
+                instance.__bindgen_anon_1.sqe_op = (*opcode).into();
             }
             RequireFixedFds => {
                 instance.opcode =
