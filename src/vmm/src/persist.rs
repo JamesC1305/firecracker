@@ -506,11 +506,12 @@ fn guest_memory_from_uffd(
     // e.g. it doesn't actively change the behavior of UFFD, only passively. Without balloon
     // devices we never call madvise anyway, so no need to put this into a conditional.
     //
-    // If write-protection is enabled, we must additionally require `PAGEFAULT_FLAG_WP` to apply
-    // write-protection to guest memory regions and receive write-protected faults
+    // If write-protection is enabled, we must require `PAGEFAULT_FLAG_WP` to
+    // receive write-protected faults. We don't need to respond to REMOVE events,
+    // as these will be handled by faulting the snapshot pages back in.
     let (features, register_mode) = match enable_write_protection {
         true => (
-            FeatureFlags::EVENT_REMOVE | FeatureFlags::PAGEFAULT_FLAG_WP,
+            FeatureFlags::PAGEFAULT_FLAG_WP,
             RegisterMode::MISSING | RegisterMode::WRITE_PROTECT,
         ),
         false => (FeatureFlags::EVENT_REMOVE, RegisterMode::MISSING),
