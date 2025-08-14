@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub use semver::Version;
 use serde::{Deserialize, Serialize};
 
-use crate::persist::MicrovmState;
+use crate::io_uring::IoUring;
 
 /// The snapshot type options that are available when
 /// creating a new snapshot.
@@ -136,6 +136,8 @@ pub struct ResetSnapshotParams {
 pub struct Checkpoint {
     /// Microvm state at the time of snapshot load.
     pub current_snapshot_path: PathBuf,
+    /// IoUring used for submitting batches of madvise calls during reset op.
+    pub madvise_ring: IoUring<u64>,
 }
 
 /// The microVM state options.

@@ -51,6 +51,7 @@ use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 #[cfg(feature = "gdb")]
 use crate::gdb;
 use crate::initrd::{InitrdConfig, InitrdError};
+use crate::io_uring::IoUringError;
 use crate::logger::{debug, error};
 use crate::persist::{MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
@@ -385,6 +386,8 @@ pub fn build_and_boot_microvm(
 pub enum BuildMicrovmFromSnapshotError {
     /// Failed to create microVM and vCPUs: {0}
     CreateMicrovmAndVcpus(#[from] StartMicrovmError),
+    /// Failed to create IoUring for VM resetting: {0}
+    CreateResetIoUring(#[from] IoUringError),
     /// Could not access KVM: {0}
     KvmAccess(#[from] vmm_sys_util::errno::Error),
     /// Error configuring the TSC, frequency not present in the given snapshot.

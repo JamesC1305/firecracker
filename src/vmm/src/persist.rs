@@ -26,7 +26,12 @@ use crate::cpu_config::templates::StaticCpuTemplate;
 use crate::cpu_config::x86_64::cpuid::CpuidTrait;
 #[cfg(target_arch = "x86_64")]
 use crate::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
-use crate::device_manager::persist::{ACPIDeviceManagerState, DevicePersistError, DeviceStates};
+use crate::device_manager::persist::{
+    ACPIDeviceManagerState, DevicePersistError, DeviceStates,
+};
+use crate::io_uring::IoUring;
+use crate::io_uring::operation::{OpCode, Operation};
+use crate::io_uring::restriction::Restriction;
 use crate::logger::{info, warn};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
@@ -358,9 +363,24 @@ pub fn restore_from_snapshot(
     let track_dirty_pages = params.track_dirty_pages;
 
     let checkpoint = match params.enable_write_protection {
-        true => Some(Checkpoint {
-            current_snapshot_path: params.snapshot_path.clone(),
-        }),
+        true => {
+            // Arbitrary 4096 ring slots
+            let ring_size = 1 << 12;
+
+            let io_uring = IoUring::<u64>::new(
+                ring_size,
+                vec![],
+                // Madvise value is irrelevant. All madvise behaviour will be allowed.
+                vec![Restriction::AllowOpCode(OpCode::Madvise(0))],
+                None,
+            )
+            .map_err(BuildMicrovmFromSnapshotError::CreateResetIoUring)?;
+
+            Some(Checkpoint {
+                current_snapshot_path: params.snapshot_path.clone(),
+                madvise_ring: io_uring,
+            })
+        }
         false => None,
     };
 
@@ -717,20 +737,46 @@ pub fn reset_to_snapshot(
     };
 
     if !page_ranges.is_empty() {
+        let io_uring = &mut checkpoint.madvise_ring;
+
         let page_size = microvm_state.vm_info.huge_pages.page_size();
 
         for range in page_ranges {
-            let start_addr = range.start_pfn * page_size as u64;
-            let size = range.len * page_size;
+            let mut start_addr = range.start_pfn * page_size as u64;
+            let mut size = range.len * page_size;
 
-            // SAFETY: start_addr -> start_addr + size is a subset of the VMM's allocated
-            // guest memory.
-            let ret = unsafe { libc::madvise(start_addr as *mut _, size, libc::MADV_DONTNEED) };
+            // io_uring SQEs use u32 for `len` field. Therefore, if we have a range greater than 
+            // u32::MAX, we must chunk it.
+            while size > u32::MAX as usize {
+                io_uring.push(Operation::madvise(
+                    u64_to_usize(start_addr),
+                    u32::MAX,
+                    libc::MADV_DONTNEED,
+                    start_addr,
+                )).unwrap();
+                start_addr += u32::MAX as u64;
+                size -= u32::MAX as usize;
+            }
 
-            if ret != 0 {
-                return Err(ResetSnapshotError::RemoveDirtyPages(
-                    std::io::Error::last_os_error(),
-                ));
+            io_uring
+                .push(Operation::madvise(
+                    u64_to_usize(start_addr),
+                    u32::try_from(size).unwrap(),
+                    libc::MADV_DONTNEED,
+                    start_addr,
+                ))
+                .unwrap();
+        }
+
+        let submitted = io_uring.submit_and_wait_all().unwrap();
+        let mut done = 0;
+        while done < submitted {
+            match io_uring.pop() {
+                Ok(Some(_)) => {
+                    done += 1;
+                }
+                Ok(None) => (),
+                Err(_) => panic!("Error removing from io_uring"), // How to handle this gracefully?
             }
         }
     }
