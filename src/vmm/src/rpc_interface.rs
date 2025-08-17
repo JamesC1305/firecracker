@@ -1177,7 +1177,8 @@ mod tests {
             ResetSnapshotParams {
                 reset_socket_path: PathBuf::new(),
                 snapshot_path: PathBuf::new(),
-                mem_file_path: PathBuf::new(),
+                mem_file_path: None,
+                diff_file_path: None,
             },
         )));
         #[cfg(target_arch = "x86_64")]

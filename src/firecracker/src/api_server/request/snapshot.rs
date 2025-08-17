@@ -531,12 +531,14 @@ mod tests {
         let body = r#"{
             "reset_socket_path": "sock",
             "snapshot_path": "foo",
-            "mem_file_path": "bar"
+            "mem_file_path": "bar",
+            "diff_file_path": "diff"
         }"#;
         let expected_config = ResetSnapshotParams {
             reset_socket_path: "sock".into(),
             snapshot_path: "foo".into(),
-            mem_file_path: "bar".into(),
+            mem_file_path: Some("bar".into()),
+            diff_file_path: Some("diff".into())
         };
         let parsed_request = parse_put_snapshot(&Body::new(body), Some("reset")).unwrap();
         assert_eq!(

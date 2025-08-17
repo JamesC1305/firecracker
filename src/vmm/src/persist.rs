@@ -11,6 +11,7 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -644,6 +645,14 @@ fn send_uffd_handshake(
     Ok(())
 }
 
+/// New file paths to be sent over to the UFFD handler to open during a reset.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResetSnapshotFiles {
+    /// The path of a new memory file to open.
+    new_mem_file_path: PathBuf,
+    /// The path of the diff between the current snapshot's memory and the new snapshot's memory.
+    diff_file_path: PathBuf,
+}
 /// Message struct sent over UFFD socket.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum SnapshotMessage {
@@ -655,9 +664,8 @@ pub enum SnapshotMessage {
     },
     /// A request to reset back to a snapshot.
     ResetSnapshot {
-        /// If `new_mem_file_path` is `None`, we restore back to the current snapshot.
-        /// If `Some(path)` is provided, we reset to the new snapshot.
-        new_mem_file_path: Option<PathBuf>,
+        /// New files for the handler to load.
+        new_snapshot: Option<ResetSnapshotFiles>,
     },
 }
 
@@ -682,13 +690,13 @@ pub enum ResetSnapshotError {
     LoadNewState(SnapshotStateFromFileError),
 }
 
-/// Used to represent ranges of pages to be removed.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PageRange {
-    /// The PFN at the start of the range.
-    pub start_pfn: u64,
-    /// The number of PFNs in the range.
-    pub len: usize,
+/// Represents page ranges to be remove for resetting 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtualAddressRange {
+    /// The PFN that the range starts at.
+    start_pfn: u64,
+    // Number of PFNs included in the range.
+    len: usize,
 }
 
 /// Reset the VMM back to a snapshotted state
@@ -708,21 +716,25 @@ pub fn reset_to_snapshot(
     // so we cannot simply compare the states. This is part of a wider problem though, about moving
     // the VCPU states. If we can somehow pass them by reference to the thread, or implement
     // `Copy`, all of this would be unnecessary.
-    let new_mem_file = {
+    let new_snapshot_files = {
         if *checkpoint.current_snapshot_path.as_path() == *params.snapshot_path.as_path() {
             None
         } else {
             checkpoint.current_snapshot_path = params.snapshot_path.clone();
-            Some(params.mem_file_path)
+            Some(ResetSnapshotFiles {
+                new_mem_file_path: params.mem_file_path.unwrap(),
+                diff_file_path: params.diff_file_path.unwrap(),
+            })
         }
     };
 
     let stream =
         UnixStream::connect(params.reset_socket_path).map_err(ResetSnapshotError::SocketConnect)?;
     let reset_message = SnapshotMessage::ResetSnapshot {
-        new_mem_file_path: new_mem_file,
+        new_snapshot: new_snapshot_files
     };
 
+    let start_time = Instant::now();
     {
         let writer = BufWriter::new(&stream);
         serde_json::to_writer(writer, &reset_message).map_err(ResetSnapshotError::SerdeJson)?;
@@ -731,10 +743,11 @@ pub fn reset_to_snapshot(
             .map_err(ResetSnapshotError::SocketShutdown)?;
     }
 
-    let page_ranges: Vec<PageRange> = {
+    let page_ranges: Vec<VirtualAddressRange> = {
         let reader = BufReader::new(&stream);
         serde_json::from_reader(reader).map_err(ResetSnapshotError::SerdeJson)?
     };
+    info!("Time spent in handler: {:?}", start_time.elapsed());
 
     if !page_ranges.is_empty() {
         let io_uring = &mut checkpoint.madvise_ring;
