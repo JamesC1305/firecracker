@@ -128,8 +128,9 @@ pub struct ResetSnapshotParams {
     /// Path to the new snapshot file to reset to.
     pub snapshot_path: PathBuf,
     /// Path to the new mem_file to reset to.
-    pub mem_file_path: Option<PathBuf>,
-    pub diff_file_path: Option<PathBuf>,
+    pub mem_file_path: PathBuf,
+    /// Path to the diff between the current snapshot and the new snapshot.
+    pub diff_file_path: PathBuf,
 }
 
 /// Stores the snapshot state in memory for later use.
