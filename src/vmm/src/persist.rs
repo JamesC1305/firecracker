@@ -665,13 +665,17 @@ pub enum SnapshotMessage {
     /// A request to reset back to a snapshot.
     ResetSnapshot {
         /// New files for the handler to load.
-        new_snapshot: Option<ResetSnapshotFiles>,
+        new_snapshot: ResetSnapshotFiles,
     },
 }
 
 /// Errors related to resetting to a snapshot.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ResetSnapshotError {
+    /// Failed to canonicalize path: {0}
+    Canonicalize(std::io::Error),
+    /// One or more of the supplied paths were invalid.
+    InvalidPath,
     /// Failed to connect to Unix stream: {0}
     SocketConnect(std::io::Error),
     /// Failed to shutdown Unix stream: {0}
@@ -704,34 +708,30 @@ pub fn reset_to_snapshot(
     vmm: &mut Vmm,
     params: ResetSnapshotParams,
 ) -> Result<(), ResetSnapshotError> {
-    let checkpoint = vmm
-        .checkpoint
-        .as_mut()
-        .ok_or(ResetSnapshotError::ResettingNotEnabled)?;
 
     let microvm_state = snapshot_state_from_file(&params.snapshot_path)
         .map_err(ResetSnapshotError::LoadNewState)?;
 
-    // TODO: This is a really weak comparison to make. MicrovmState does not implement `PartialEq`,
-    // so we cannot simply compare the states. This is part of a wider problem though, about moving
-    // the VCPU states. If we can somehow pass them by reference to the thread, or implement
-    // `Copy`, all of this would be unnecessary.
-    let new_snapshot_files = {
-        if *checkpoint.current_snapshot_path.as_path() == *params.snapshot_path.as_path() {
-            None
-        } else {
-            checkpoint.current_snapshot_path = params.snapshot_path.clone();
-            Some(ResetSnapshotFiles {
-                new_mem_file_path: params.mem_file_path.unwrap(),
-                diff_file_path: params.diff_file_path.unwrap(),
-            })
-        }
+
+    // Canonicalize mem and diff paths before sending to handler.
+    let new_mem_path = match params.mem_file_path.try_exists() {
+        Ok(true) => std::fs::canonicalize(params.mem_file_path).map_err(ResetSnapshotError::Canonicalize)?,
+        _ => return Err(ResetSnapshotError::InvalidPath),
+    };
+    let diff_path = match params.diff_file_path.try_exists() {
+        Ok(true) => std::fs::canonicalize(params.diff_file_path).map_err(ResetSnapshotError::Canonicalize)?,
+        _ => return Err(ResetSnapshotError::InvalidPath),
+    };
+
+    let snapshot_files = ResetSnapshotFiles {
+        new_mem_file_path: new_mem_path,
+        diff_file_path: diff_path,
     };
 
     let stream =
         UnixStream::connect(params.reset_socket_path).map_err(ResetSnapshotError::SocketConnect)?;
     let reset_message = SnapshotMessage::ResetSnapshot {
-        new_snapshot: new_snapshot_files
+        new_snapshot: snapshot_files
     };
 
     let start_time = Instant::now();
@@ -743,11 +743,23 @@ pub fn reset_to_snapshot(
             .map_err(ResetSnapshotError::SocketShutdown)?;
     }
 
+    vmm.restore_vcpu_states(microvm_state.vcpu_states)
+        .map_err(ResetSnapshotError::RestoreVcpuState)?;
+
+    vmm.vm
+        .restore_state(&microvm_state.vm_state)
+        .map_err(ResetSnapshotError::RestoreVmState)?;
+
     let page_ranges: Vec<VirtualAddressRange> = {
         let reader = BufReader::new(&stream);
         serde_json::from_reader(reader).map_err(ResetSnapshotError::SerdeJson)?
     };
     info!("Time spent in handler: {:?}", start_time.elapsed());
+
+    let checkpoint = vmm
+        .checkpoint
+        .as_mut()
+        .ok_or(ResetSnapshotError::ResettingNotEnabled)?;
 
     if !page_ranges.is_empty() {
         let io_uring = &mut checkpoint.madvise_ring;
@@ -794,12 +806,7 @@ pub fn reset_to_snapshot(
         }
     }
 
-    vmm.restore_vcpu_states(microvm_state.vcpu_states)
-        .map_err(ResetSnapshotError::RestoreVcpuState)?;
 
-    vmm.vm
-        .restore_state(&microvm_state.vm_state)
-        .map_err(ResetSnapshotError::RestoreVmState)?;
 
     Ok(())
 }
