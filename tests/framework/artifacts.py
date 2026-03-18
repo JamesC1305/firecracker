@@ -50,3 +50,10 @@ def kernel_params(glob="vmlinux-*", select=kernels, artifact_dir=ARTIFACT_DIR) -
     return [
         pytest.param(kernel, id=kernel.name) for kernel in select(glob, artifact_dir)
     ] or [pytest.param(None, id="no-kernel-found")]
+
+
+def disk_params(glob, select=disks):
+    """Return disk artifacts as pytest params"""
+    return [pytest.param(disk, id=disk.stem) for disk in select(glob)] or [
+        pytest.param(None, id="no-disk-found")
+    ]
