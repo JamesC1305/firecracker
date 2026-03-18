@@ -31,7 +31,7 @@ def test_serial_after_snapshot(uvm_plain, microvm_factory):
     microvm.start()
 
     # looking for the # prompt at the end
-    serial.rx("ubuntu-fc-uvm:~#")
+    serial.rx(microvm.distro.shell_prompt)
 
     # Create snapshot.
     snapshot = microvm.snapshot_full()
@@ -49,7 +49,7 @@ def test_serial_after_snapshot(uvm_plain, microvm_factory):
     # the login content.
     serial.tx("")
     # looking for the # prompt at the end
-    serial.rx("ubuntu-fc-uvm:~#")
+    serial.rx(vm.distro.shell_prompt)
     serial.tx("pwd")
     res = serial.rx("#")
     assert "/root" in res
@@ -72,9 +72,11 @@ def test_serial_console_login(uvm_plain_any):
 
     microvm.start()
 
+    time.sleep(2)
+
     serial = Serial(microvm)
     serial.open()
-    serial.rx("ubuntu-fc-uvm:")
+    serial.rx(microvm.distro.hostname)
     serial.tx("id")
     serial.rx("uid=0(root) gid=0(root) groups=0(root)")
 
