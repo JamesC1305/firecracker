@@ -23,6 +23,16 @@ and this project adheres to
 
 ### Fixed
 
+- [#5762](https://github.com/firecracker-microvm/firecracker/pull/5762): Cap
+  virtio-rng per-request entropy to 64 KiB. Previously, a guest could construct
+  a descriptor chain that caused Firecracker to allocate more host memory than
+  the guest actually provided, potentially leading to excessive host memory
+  consumption.
+- [#5760](https://github.com/firecracker-microvm/firecracker/pull/5760): Fixed
+  HID (Hardware ID) of VMGenID device so that it aligns with the upstream Linux
+  kernel. This caused the driver not to be bound correctly to the device prior
+  to Linux kernel 6.10.
+
 ## [1.15.0]
 
 ### Added
