@@ -17,8 +17,7 @@ from framework.ab_test import git_clone
 from framework.microvm import MicroVMFactory
 from framework.properties import global_props
 
-# Pinned due to issues introduced in https://github.com/speed47/spectre-meltdown-checker/pull/527
-CHECKER_URL = "https://raw.githubusercontent.com/speed47/spectre-meltdown-checker/3a822fdcf291ebb8bfbcb77aa216ac342c6b2f12/spectre-meltdown-checker.sh"
+CHECKER_URL = "https://raw.githubusercontent.com/speed47/spectre-meltdown-checker/master/spectre-meltdown-checker.sh"
 CHECKER_FILENAME = "spectre-meltdown-checker.sh"
 REMOTE_CHECKER_PATH = f"/tmp/{CHECKER_FILENAME}"
 REMOTE_CHECKER_COMMAND = f"sh {REMOTE_CHECKER_PATH} --no-intel-db --batch json"
