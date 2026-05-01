@@ -93,11 +93,12 @@ impl PciDevices {
 
         debug!(
             "Inserting MMIO BAR region: {:#x}:{:#x}",
-            virtio_device_locked.bar_address, CAPABILITY_BAR_SIZE
+            virtio_device_locked.config_bar_addr(),
+            CAPABILITY_BAR_SIZE
         );
         vm.common.mmio_bus.insert(
             virtio_device.clone(),
-            virtio_device_locked.bar_address,
+            virtio_device_locked.config_bar_addr(),
             CAPABILITY_BAR_SIZE,
         )?;
 
@@ -576,7 +577,7 @@ impl<'a> Persist<'a> for PciDevices {
             let device = Arc::new(Mutex::new(Pmem::restore(
                 PmemConstructorArgs {
                     mem,
-                    vm: constructor_args.vm.as_ref(),
+                    vm: constructor_args.vm.clone(),
                 },
                 &pmem_state.device_state,
             )?));
@@ -584,7 +585,8 @@ impl<'a> Persist<'a> for PciDevices {
             constructor_args
                 .vm_resources
                 .pmem
-                .add_device(device.clone());
+                .configs
+                .push(pmem_state.device_state.config.clone());
 
             pci_devices.restore_pci_device(
                 constructor_args.vm,
