@@ -13,11 +13,14 @@ import pytest
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 from framework import utils
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
 from framework.utils import generate_mmds_get_request, generate_mmds_session_token
 from framework.utils_cpu_templates import SUPPORTED_CPU_TEMPLATES
 
 # Directory with metadata JSON files
 DIR = Path("./data")
+
+pytestmark = pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 
 
 def _configure_vm_from_json(test_microvm, vm_config_file):
@@ -111,11 +114,11 @@ def _get_optional_fields_from_file(vm_config_file):
 
 
 @pytest.mark.parametrize("vm_config_file", ["framework/vm_config.json"])
-def test_config_start_with_api(uvm_plain, vm_config_file):
+def test_config_start_with_api(uvm, vm_config_file):
     """
     Test if a microvm configured from file boots successfully.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     vm_config = _configure_vm_from_json(test_microvm, vm_config_file)
     test_microvm.spawn(serial_out_path=None)
 
@@ -127,11 +130,11 @@ def test_config_start_with_api(uvm_plain, vm_config_file):
 
 
 @pytest.mark.parametrize("vm_config_file", ["framework/vm_config.json"])
-def test_config_start_no_api(uvm_plain, vm_config_file):
+def test_config_start_no_api(uvm, vm_config_file):
     """
     Test microvm start when API server thread is disabled.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     _configure_vm_from_json(test_microvm, vm_config_file)
     test_microvm.jailer.extra_args.update({"no-api": None})
     test_microvm.spawn(serial_out_path=None)
@@ -156,11 +159,11 @@ def test_config_start_no_api(uvm_plain, vm_config_file):
 
 
 @pytest.mark.parametrize("vm_config_file", ["framework/vm_config_network.json"])
-def test_config_start_no_api_exit(uvm_plain, vm_config_file):
+def test_config_start_no_api_exit(uvm, vm_config_file):
     """
     Test microvm exit when API server is disabled.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     _configure_vm_from_json(test_microvm, vm_config_file)
     _configure_network_interface(test_microvm)
     test_microvm.jailer.extra_args.update({"no-api": None})
@@ -182,11 +185,11 @@ def test_config_start_no_api_exit(uvm_plain, vm_config_file):
         "framework/vm_config_missing_mem_size_mib.json",
     ],
 )
-def test_config_bad_machine_config(uvm_plain, vm_config_file):
+def test_config_bad_machine_config(uvm, vm_config_file):
     """
     Test microvm start when the `machine_config` is invalid.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     _configure_vm_from_json(test_microvm, vm_config_file)
     test_microvm.jailer.extra_args.update({"no-api": None})
     test_microvm.spawn(serial_out_path=None)
@@ -202,11 +205,11 @@ def test_config_bad_machine_config(uvm_plain, vm_config_file):
         ("framework/vm_config_smt_true.json", False, True),
     ],
 )
-def test_config_machine_config_params(uvm_plain, test_config):
+def test_config_machine_config_params(uvm, test_config):
     """
     Test microvm start with optional `machine_config` parameters.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
 
     # Test configuration determines if the file is a valid config or not
     # based on the CPU
@@ -239,11 +242,11 @@ def test_config_machine_config_params(uvm_plain, test_config):
 
 
 @pytest.mark.parametrize("vm_config_file", ["framework/vm_config.json"])
-def test_config_start_with_limit(uvm_plain, vm_config_file):
+def test_config_start_with_limit(uvm, vm_config_file):
     """
     Negative test for customised request payload limit.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
 
     _configure_vm_from_json(test_microvm, vm_config_file)
     test_microvm.jailer.extra_args.update({"http-api-max-payload-size": "250"})
@@ -270,11 +273,11 @@ def test_config_start_with_limit(uvm_plain, vm_config_file):
 
 
 @pytest.mark.parametrize("vm_config_file", ["framework/vm_config_with_mmdsv2.json"])
-def test_config_with_default_limit(uvm_plain, vm_config_file):
+def test_config_with_default_limit(uvm, vm_config_file):
     """
     Test for request payload limit.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
 
     _configure_vm_from_json(test_microvm, vm_config_file)
     _configure_network_interface(test_microvm)
@@ -304,11 +307,11 @@ def test_config_with_default_limit(uvm_plain, vm_config_file):
     assert stdout.encode("utf-8") == response_err.encode("utf-8")
 
 
-def test_start_with_metadata(uvm_plain):
+def test_start_with_metadata(uvm):
     """
     Test if metadata from file is available via MMDS.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     metadata_file = DIR / "metadata.json"
     _add_metadata_file(test_microvm, metadata_file)
 
@@ -324,11 +327,11 @@ def test_start_with_metadata(uvm_plain):
         assert response.json() == json.load(json_file)
 
 
-def test_start_with_metadata_limit(uvm_plain):
+def test_start_with_metadata_limit(uvm):
     """
     Test that the metadata size limit is enforced when populating from a file.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.jailer.extra_args.update({"mmds-size-limit": "30"})
     metadata_file = DIR / "metadata.json"
     _add_metadata_file(test_microvm, metadata_file)
@@ -342,11 +345,11 @@ def test_start_with_metadata_limit(uvm_plain):
     test_microvm.mark_killed()
 
 
-def test_start_with_metadata_default_limit(uvm_plain):
+def test_start_with_metadata_default_limit(uvm):
     """
     Test that the metadata size limit defaults to the api payload limit.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.jailer.extra_args.update({"http-api-max-payload-size": "30"})
 
     metadata_file = DIR / "metadata.json"
@@ -362,11 +365,11 @@ def test_start_with_metadata_default_limit(uvm_plain):
     test_microvm.mark_killed()
 
 
-def test_start_with_missing_metadata(uvm_plain):
+def test_start_with_missing_metadata(uvm):
     """
     Test if a microvm is configured with a missing metadata file.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     metadata_file = "../resources/tests/metadata_nonexisting.json"
 
     vm_metadata_path = os.path.join(test_microvm.path, os.path.basename(metadata_file))
@@ -385,11 +388,11 @@ def test_start_with_missing_metadata(uvm_plain):
         test_microvm.mark_killed()
 
 
-def test_start_with_invalid_metadata(uvm_plain):
+def test_start_with_invalid_metadata(uvm):
     """
     Test if a microvm is configured with a invalid metadata file.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     metadata_file = DIR / "metadata_invalid.json"
     vm_metadata_path = os.path.join(test_microvm.path, os.path.basename(metadata_file))
     shutil.copy(metadata_file, vm_metadata_path)
@@ -410,11 +413,11 @@ def test_start_with_invalid_metadata(uvm_plain):
     "vm_config_file",
     ["framework/vm_config_with_mmdsv1.json", "framework/vm_config_with_mmdsv2.json"],
 )
-def test_config_start_and_mmds_with_api(uvm_plain, vm_config_file):
+def test_config_start_and_mmds_with_api(uvm, vm_config_file):
     """
     Test MMDS behavior when the microvm is configured from file.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     _configure_vm_from_json(test_microvm, vm_config_file)
     _configure_network_interface(test_microvm)
 
@@ -469,14 +472,14 @@ def test_config_start_and_mmds_with_api(uvm_plain, vm_config_file):
     ["framework/vm_config_with_mmdsv1.json", "framework/vm_config_with_mmdsv2.json"],
 )
 @pytest.mark.parametrize("metadata_file", [DIR / "metadata.json"])
-def test_with_config_and_metadata_no_api(uvm_plain, vm_config_file, metadata_file):
+def test_with_config_and_metadata_no_api(uvm, vm_config_file, metadata_file):
     """
     Test microvm start when config/mmds and API server thread is disabled.
 
     Ensures the metadata is stored successfully inside the MMDS and
     is available to reach from the guest's side.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     _configure_vm_from_json(test_microvm, vm_config_file)
     _add_metadata_file(test_microvm, metadata_file)
     _configure_network_interface(test_microvm)

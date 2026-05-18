@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 import host_tools.cargo_build
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
 from framework.microvm import MicroVMFactory
 
 
@@ -19,13 +20,14 @@ from framework.microvm import MicroVMFactory
     platform.machine() != "x86_64",
     reason="GDB requires a vmlinux but we ship a uImage for ARM in our CI",
 )
-def test_gdb_connects(guest_kernel_linux_6_1, rootfs):
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_gdb_connects(guest_kernel, rootfs):
     """Checks that GDB works in a FC VM"""
 
     bin_dir = host_tools.cargo_build.build_gdb()
 
     vmfcty = MicroVMFactory(bin_dir)
-    kernel_dbg = guest_kernel_linux_6_1.parent / "debug" / guest_kernel_linux_6_1.name
+    kernel_dbg = guest_kernel.parent / "debug" / guest_kernel.name
     uvm = vmfcty.build(kernel_dbg, rootfs)
     uvm.spawn(validate_api=False)
     uvm.add_net_iface()

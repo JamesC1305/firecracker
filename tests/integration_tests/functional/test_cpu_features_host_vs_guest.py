@@ -211,10 +211,10 @@ INTEL_ICELAKE_HOST_ONLY_FEATS_6_18 = INTEL_ICELAKE_HOST_ONLY_FEATS_6_1 - {
 } | {"la57"}
 
 
-def test_host_vs_guest_cpu_features(uvm_plain_any):
+def test_host_vs_guest_cpu_features(uvm):
     """Check CPU features host vs guest"""
 
-    vm = uvm_plain_any
+    vm = uvm
     vm.spawn()
     vm.basic_config()
     vm.add_net_iface()
@@ -462,7 +462,7 @@ def test_host_vs_guest_cpu_features(uvm_plain_any):
             # https://github.com/torvalds/linux/commit/adeec61a4723fd3e39da68db4cc4d924e6d7f641
             #
             # While Amazon Linux kernels (v5.10 and v6.1) backported the above commit, our test
-            # ubuntu kernel (v6.8) and our guest kernels (v5.10 and v6.1) don't pick it.
+            # ubuntu guest_kernel (v6.8) and our guest kernels (v5.10 and v6.1) don't pick it.
             host_has_ssbs = global_props.host_os not in {
                 "amzn2",
                 "amzn2023",

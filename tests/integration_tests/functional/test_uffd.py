@@ -8,14 +8,17 @@ import re
 import pytest
 import requests
 
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
 from framework.utils import Timeout, check_output
+
+pytestmark = pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 
 
 @pytest.fixture(scope="function", name="snapshot")
-def snapshot_fxt(microvm_factory, guest_kernel_linux_5_10, rootfs):
+def snapshot_fxt(microvm_factory, guest_kernel, rootfs):
     """Create a snapshot of a microVM."""
 
-    basevm = microvm_factory.build(guest_kernel_linux_5_10, rootfs)
+    basevm = microvm_factory.build(guest_kernel, rootfs)
     basevm.spawn()
     basevm.basic_config(vcpu_count=2, mem_size_mib=256)
     basevm.add_net_iface()
@@ -34,11 +37,11 @@ def snapshot_fxt(microvm_factory, guest_kernel_linux_5_10, rootfs):
     yield snapshot
 
 
-def test_bad_socket_path(uvm_plain, snapshot):
+def test_bad_socket_path(uvm, snapshot):
     """
     Test error scenario when socket path does not exist.
     """
-    vm = uvm_plain
+    vm = uvm
     vm.spawn()
     jailed_vmstate = vm.create_jailed_resource(snapshot.vmstate)
 
@@ -56,11 +59,11 @@ def test_bad_socket_path(uvm_plain, snapshot):
     vm.mark_killed()
 
 
-def test_unbinded_socket(uvm_plain, snapshot):
+def test_unbinded_socket(uvm, snapshot):
     """
     Test error scenario when PF handler has not yet called bind on socket.
     """
-    vm = uvm_plain
+    vm = uvm
     vm.spawn()
 
     jailed_vmstate = vm.create_jailed_resource(snapshot.vmstate)
@@ -82,11 +85,11 @@ def test_unbinded_socket(uvm_plain, snapshot):
     vm.mark_killed()
 
 
-def test_valid_handler(uvm_plain, snapshot):
+def test_valid_handler(uvm, snapshot):
     """
     Test valid uffd handler scenario.
     """
-    vm = uvm_plain
+    vm = uvm
     vm.memory_monitor = None
     vm.spawn()
     vm.restore_from_snapshot(snapshot, resume=True, uffd_handler_name="on_demand")
@@ -104,18 +107,18 @@ def test_valid_handler(uvm_plain, snapshot):
     vm.ssh.check_output("true")
 
 
-def test_malicious_handler(uvm_plain, snapshot):
+def test_malicious_handler(uvm, snapshot):
     """
     Test malicious uffd handler scenario.
 
     The page fault handler panics when receiving a page fault,
     so no events are handled and snapshot memory regions cannot be
     loaded into memory. In this case, Firecracker is designed to freeze,
-    instead of silently switching to having the kernel handle page
+    instead of silently switching to having the guest_kernel handle page
     faults, so that it becomes obvious that something went wrong.
     """
 
-    vm = uvm_plain
+    vm = uvm
     vm.memory_monitor = None
     vm.spawn()
 

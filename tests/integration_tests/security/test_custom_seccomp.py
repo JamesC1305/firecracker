@@ -7,6 +7,9 @@ import time
 from pathlib import Path
 
 from framework import utils
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
+
+pytestmark = pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 
 
 def install_filter(microvm, bpf_path):
@@ -15,7 +18,7 @@ def install_filter(microvm, bpf_path):
     microvm.jailer.extra_args.update({"seccomp-filter": bpf_path.name})
 
 
-def test_allow_all(uvm_plain, seccompiler):
+def test_allow_all(uvm, seccompiler):
     """Test --seccomp-filter, allowing all syscalls."""
     seccomp_filter = {
         thread: {"default_action": "allow", "filter_action": "trap", "filter": []}
@@ -23,7 +26,7 @@ def test_allow_all(uvm_plain, seccompiler):
     }
 
     bpf_path = seccompiler.compile(seccomp_filter)
-    test_microvm = uvm_plain
+    test_microvm = uvm
     install_filter(test_microvm, bpf_path)
     test_microvm.spawn()
     test_microvm.basic_config()
@@ -31,7 +34,7 @@ def test_allow_all(uvm_plain, seccompiler):
     utils.assert_seccomp_level(test_microvm.firecracker_pid, "2")
 
 
-def test_working_filter(uvm_plain, seccompiler):
+def test_working_filter(uvm, seccompiler):
     """Test --seccomp-filter, rejecting some dangerous syscalls."""
 
     seccomp_filter = {
@@ -44,7 +47,7 @@ def test_working_filter(uvm_plain, seccompiler):
     }
 
     bpf_path = seccompiler.compile(seccomp_filter)
-    test_microvm = uvm_plain
+    test_microvm = uvm
     install_filter(test_microvm, bpf_path)
     test_microvm.spawn()
     test_microvm.basic_config()
@@ -54,7 +57,7 @@ def test_working_filter(uvm_plain, seccompiler):
     utils.assert_seccomp_level(test_microvm.firecracker_pid, "2")
 
 
-def test_failing_filter(uvm_plain, seccompiler):
+def test_failing_filter(uvm, seccompiler):
     """Test --seccomp-filter, denying some needed syscalls."""
 
     seccomp_filter = {
@@ -68,7 +71,7 @@ def test_failing_filter(uvm_plain, seccompiler):
     }
 
     bpf_path = seccompiler.compile(seccomp_filter)
-    test_microvm = uvm_plain
+    test_microvm = uvm
     install_filter(test_microvm, bpf_path)
     test_microvm.spawn()
     test_microvm.basic_config(vcpu_count=1)
@@ -103,9 +106,9 @@ def test_failing_filter(uvm_plain, seccompiler):
     test_microvm.mark_killed()
 
 
-def test_invalid_bpf(uvm_plain):
+def test_invalid_bpf(uvm):
     """Test that FC does not start, given an invalid binary filter."""
-    test_microvm = uvm_plain
+    test_microvm = uvm
 
     # Configure VM from JSON. Otherwise, the test will error because
     # the process will be killed before configuring the API socket.

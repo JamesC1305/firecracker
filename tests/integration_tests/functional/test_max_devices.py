@@ -29,11 +29,11 @@ def max_devices(uvm):
             raise ValueError("Unknown platform")
 
 
-def test_attach_maximum_devices(uvm_plain_any):
+def test_attach_maximum_devices(uvm):
     """
     Test attaching maximum number of devices to the microVM.
     """
-    test_microvm = uvm_plain_any
+    test_microvm = uvm
     test_microvm.memory_monitor = None
     test_microvm.spawn()
 
@@ -53,11 +53,11 @@ def test_attach_maximum_devices(uvm_plain_any):
         test_microvm.ssh_iface(i).check_output("sync")
 
 
-def test_attach_too_many_devices(uvm_plain):
+def test_attach_too_many_devices(uvm):
     """
     Test attaching to a microVM more devices than available IRQs.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.memory_monitor = None
     test_microvm.spawn()
 

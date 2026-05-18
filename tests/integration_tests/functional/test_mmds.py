@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
 from framework.utils import (
     configure_mmds,
     generate_mmds_get_request,
@@ -28,14 +29,16 @@ DEFAULT_IPV4 = "169.254.169.254"
 # MMDS versions supported.
 MMDS_VERSIONS = ["V2", "V1"]
 
+pytestmark = pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
 @pytest.mark.parametrize("imds_compat", [True, False])
-def test_mmds_token(uvm_plain, version, imds_compat):
+def test_mmds_token(uvm, version, imds_compat):
     """
     Test MMDS with no token / invalid token / valid token.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.spawn()
 
     test_microvm.add_net_iface()
@@ -93,11 +96,11 @@ def test_mmds_token(uvm_plain, version, imds_compat):
 
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
-def test_custom_ipv4(uvm_plain, version):
+def test_custom_ipv4(uvm, version):
     """
     Test the API for MMDS custom ipv4 support.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.spawn()
 
     data_store = {
@@ -182,13 +185,13 @@ def test_custom_ipv4(uvm_plain, version):
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
 @pytest.mark.parametrize("imds_compat", [None, False, True])
 @pytest.mark.parametrize("app_json", [False, True])
-def test_mmds_response(uvm_plain, version, imds_compat, app_json):
+def test_mmds_response(uvm, version, imds_compat, app_json):
     """
     Test MMDS responses to various datastore requests.
     """
     expected_json = not imds_compat and app_json
 
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.spawn()
 
     test_microvm.add_net_iface()
@@ -281,11 +284,11 @@ def test_mmds_response(uvm_plain, version, imds_compat, app_json):
 
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
-def test_larger_than_mss_payloads(uvm_plain, version):
+def test_larger_than_mss_payloads(uvm, version):
     """
     Test MMDS content for payloads larger than MSS.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.spawn()
 
     # Attach network device.
@@ -349,11 +352,11 @@ def test_larger_than_mss_payloads(uvm_plain, version):
 
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
-def test_mmds_dummy(uvm_plain, version):
+def test_mmds_dummy(uvm, version):
     """
     Test the API and guest facing features of the microVM MetaData Service.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.spawn()
 
     # Attach network device.
@@ -394,11 +397,11 @@ def test_mmds_dummy(uvm_plain, version):
 
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
-def test_guest_mmds_hang(uvm_plain, version):
+def test_guest_mmds_hang(uvm, version):
     """
     Test the MMDS json endpoint when Content-Length larger than actual length.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.spawn()
 
     # Attach network device.
@@ -447,11 +450,11 @@ def test_guest_mmds_hang(uvm_plain, version):
 
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
-def test_mmds_limit_scenario(uvm_plain, version):
+def test_mmds_limit_scenario(uvm, version):
     """
     Test the MMDS json endpoint when data store size reaches the limit.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     # Set a large enough limit for the API so that requests actually reach the
     # MMDS server.
     test_microvm.jailer.extra_args.update(
@@ -516,14 +519,14 @@ def test_mmds_limit_scenario(uvm_plain, version):
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
 @pytest.mark.parametrize("imds_compat", [None, False, True])
-def test_mmds_snapshot(uvm_nano, microvm_factory, version, imds_compat):
+def test_mmds_snapshot(uvm_configured, microvm_factory, version, imds_compat):
     """
     Test MMDS behavior by restoring a snapshot on current FC versions.
 
     Ensures that the version is persisted or initialised with the default if
     the firecracker version does not support it.
     """
-    basevm = uvm_nano
+    basevm = uvm_configured
     basevm.add_net_iface()
     ipv4_address = "169.254.169.250"
 
@@ -613,11 +616,11 @@ def test_mmds_snapshot(uvm_nano, microvm_factory, version, imds_compat):
     run_guest_cmd(ssh_connection, cmd, expected_response, use_json=not imds_compat)
 
 
-def test_mmds_v2_negative(uvm_plain):
+def test_mmds_v2_negative(uvm):
     """
     Test invalid MMDS GET/PUT requests when using V2.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.spawn()
 
     # Attach network device.
@@ -717,11 +720,11 @@ def test_mmds_v2_negative(uvm_plain):
     )
 
 
-def test_deprecated_mmds_config(uvm_plain):
+def test_deprecated_mmds_config(uvm):
     """
     Test deprecated Mmds configs.
     """
-    test_microvm = uvm_plain
+    test_microvm = uvm
     test_microvm.spawn()
     test_microvm.basic_config()
     # Attach network device.
@@ -788,11 +791,11 @@ def _configure_with_aws_credentials(microvm, version, imds_compat):
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
 @pytest.mark.parametrize("imds_compat", [None, False, True])
 @pytest.mark.parametrize("sdk", ["py", "go"])
-def test_aws_credential_provider(uvm_plain, version, imds_compat, sdk):
+def test_aws_credential_provider(uvm, version, imds_compat, sdk):
     """
     Test AWS SDK's credential provider works on MMDS
     """
-    ssh_connection = _configure_with_aws_credentials(uvm_plain, version, imds_compat)
+    ssh_connection = _configure_with_aws_credentials(uvm, version, imds_compat)
 
     match sdk:
         case "py":
@@ -823,9 +826,7 @@ EOF
 
 @pytest.mark.parametrize("version", MMDS_VERSIONS)
 @pytest.mark.parametrize("imds_compat", [None, False, True])
-def test_go_sdk_credential_provider_with_custom_endpoint(
-    uvm_plain, version, imds_compat
-):
+def test_go_sdk_credential_provider_with_custom_endpoint(uvm, version, imds_compat):
     """
     Test AWS SDK's credential provider with custom endpoint.
 
@@ -835,7 +836,7 @@ def test_go_sdk_credential_provider_with_custom_endpoint(
     (i.e. wrapped with doublequotes) with "Content-Type: application/json" but
     AWS SDK for Go expects only the inner JSON object.
     """
-    ssh_connection = _configure_with_aws_credentials(uvm_plain, version, imds_compat)
+    ssh_connection = _configure_with_aws_credentials(uvm, version, imds_compat)
 
     cmd = "/usr/local/bin/go_sdk_cred_provider_with_custom_endpoint"
     ret, stdout, stderr = ssh_connection.run(cmd)

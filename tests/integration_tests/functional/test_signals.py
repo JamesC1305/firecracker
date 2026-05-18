@@ -10,6 +10,8 @@ from time import sleep
 
 import pytest
 
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel, pin_rootfs_mode
+
 signum_str = {
     SIGBUS: "sigbus",
     SIGSEGV: "sigsegv",
@@ -21,15 +23,17 @@ signum_str = {
     SIGSYS: "sigsys",
 }
 
+pytestmark = pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+
 
 @pytest.mark.parametrize(
     "signum", [SIGBUS, SIGSEGV, SIGXFSZ, SIGXCPU, SIGPIPE, SIGHUP, SIGILL, SIGSYS]
 )
-def test_generic_signal_handler(uvm_plain, signum):
+def test_generic_signal_handler(uvm, signum):
     """
     Test signal handling for all handled signals.
     """
-    microvm = uvm_plain
+    microvm = uvm
     microvm.spawn()
 
     # We don't need to monitor the memory for this test.
@@ -63,11 +67,12 @@ def test_generic_signal_handler(uvm_plain, signum):
         assert metric_line["signals"][signum_str[signum]] == 1
 
 
-def test_sigxfsz_handler(uvm_plain_rw):
+@pin_rootfs_mode("rw")
+def test_sigxfsz_handler(uvm):
     """
     Test intercepting and handling SIGXFSZ.
     """
-    microvm = uvm_plain_rw
+    microvm = uvm
     microvm.spawn()
 
     # We don't need to monitor the memory for this test.
@@ -100,11 +105,11 @@ def test_sigxfsz_handler(uvm_plain_rw):
     assert metric_line["signals"]["sigxfsz"] == 1
 
 
-def test_handled_signals(uvm_plain):
+def test_handled_signals(uvm):
     """
     Test that handled signals don't kill the microVM.
     """
-    microvm = uvm_plain
+    microvm = uvm
     microvm.spawn()
 
     # We don't need to monitor the memory for this test.
