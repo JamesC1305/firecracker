@@ -1,0 +1,1430 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Alexander Graf <graf@amazon.com>
+Date: Tue, 27 Jan 2026 10:22:18 +0100
+Subject: [PATCH] virtio-pci: Add Device Memory Buffer (DMB) support
+
+Backport of DMB support for the kernel, including the zero-copy vsock
+path. All device DMA is redirected into the DMB shared memory region.
+
+When the DMB feature flag is present, the driver installs custom virtio
+map ops (vdev->map) that bounce all data DMA through the DMB shared
+memory BAR region, and creates the virtqueues with
+vring_create_virtqueue_map() so the ring itself lives there too. All DMA
+addresses become offsets into that region.
+
+The DMB region is carved into PAGE_SIZE slots managed by a lockless
+bitmap allocator: allocation claims a run of slots with test_and_set_bit
+from a per-CPU rolling hint (relaxed bitmap scan first, atomic claim
+second), and free clears the bits. A per-slot dmb_orig[] array parks the
+CPU virtual address of each slot so unmap and sync resolve the original
+buffer (including sub-slot offsets) in O(1) without any mapping list or
+per-mapping allocation. Slot 0 is reserved so a valid handle is never
+aliased with DMA_MAPPING_ERROR.
+
+The map/unmap/sync ops validate the host-controlled (map_handle, size)
+pair via vp_dmb_range_ok() before any bounce copy or dmb_orig[] index. The
+DMB is shared with an untrusted host that writes the virtio used-ring, so
+the handle and length reaching the sync/unmap ops are adversarial. The
+validator fires WARN_ON_ONCE and bails before touching memory when the
+size is zero, when map_handle + size wraps or leaves the region, when the
+first slot is out of range, or when the touched slot run is not a single
+contiguous mapping.
+
+CONFIG_VIRTIO_DMB_ZEROCOPY additionally lets virtio-vsock allocate its
+I/O buffers straight from the DMB and submit them with the premapped
+virtqueue APIs, skipping the bounce copy entirely. Zero-copy allocations
+come from the same bitmap as the bounce path, so the two can never
+overlap. A reserved bounce floor caps how many RX slots may be pinned by
+zero-copy buffers at once, so the RX path can always fall back to a
+bounced refill instead of deadlocking when the guest holds every slot.
+This depends on the premapped add API introduced upstream in v6.13, so it
+is 6.18-only; the 5.10 and 6.1 backports carry the bounce path alone.
+
+Signed-off-by: Alexander Graf <graf@amazon.com>
+Signed-off-by: Mushahid Hussain <hmushi@amazon.co.uk>
+Signed-off-by: Marius Knaust <mknaust@amazon.com>
+---
+diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
+index 6db5235..3a081c9 100644
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@ -85,6 +85,20 @@ config VIRTIO_PCI_LEGACY
+ 
+ 	  If unsure, say Y.
+ 
++config VIRTIO_DMB_ZEROCOPY
++	bool "Zero-copy I/O for virtio DMB devices"
++	depends on VIRTIO_PCI
++	help
++	  When a virtio-pci device exposes a Device Memory Buffer (DMB),
++	  transports such as virtio-vsock can allocate I/O buffers directly
++	  from the shared region and use the premapped virtqueue APIs to
++	  bypass the DMA mapping bounce-buffer copy entirely.
++
++	  This adds a small hook in skb_free_head() to return DMB-allocated
++	  SKB buffers to the gen_pool.
++
++	  If unsure, say N.
++
+ config VIRTIO_VDPA
+ 	tristate "vDPA driver for virtio devices"
+ 	depends on VDPA
+diff --git a/drivers/virtio/virtio_pci_common.h b/drivers/virtio/virtio_pci_common.h
+index 8cd01de..fc71c15 100644
+--- a/drivers/virtio/virtio_pci_common.h
++++ b/drivers/virtio/virtio_pci_common.h
+@@ -30,6 +30,7 @@
+ #include <linux/highmem.h>
+ #include <linux/spinlock.h>
+ #include <linux/mutex.h>
++#include <linux/genalloc.h>
+ 
+ struct virtio_pci_vq_info {
+ 	/* the actual virtqueue */
+@@ -98,6 +99,17 @@ struct virtio_pci_device {
+ 	/* Whether we have vector per vq */
+ 	bool per_vq_vectors;
+ 
++	/* Device Memory Buffer (DMB) — lockless bitmap allocator.
++	 * PAGE_SIZE slots, test_and_set_bit alloc, clear_bit free.
++	 * dmb_orig[slot] parks the CPU VA of that slot for O(1) unmap/sync
++	 * (populated per-slot so sub-slot sync offsets resolve correctly). */
++	void __iomem *dmb_mem;
++	unsigned long dmb_size;
++	unsigned int dmb_nslots;
++	unsigned long *dmb_bitmap;
++	unsigned int __percpu *dmb_hint;
++	void **dmb_orig;
++
+ 	struct virtqueue *(*setup_vq)(struct virtio_pci_device *vp_dev,
+ 				      struct virtio_pci_vq_info *info,
+ 				      unsigned int idx,
+diff --git a/drivers/virtio/virtio_pci_modern.c b/drivers/virtio/virtio_pci_modern.c
+index dd0e65f..9f52e36 100644
+--- a/drivers/virtio/virtio_pci_modern.c
++++ b/drivers/virtio/virtio_pci_modern.c
+@@ -15,6 +15,8 @@
+  */
+ 
+ #include <linux/delay.h>
++#include <linux/bitmap.h>
++#include <linux/percpu.h>
+ #include <linux/virtio_pci_admin.h>
+ #define VIRTIO_PCI_NO_LEGACY
+ #define VIRTIO_RING_NO_LEGACY
+@@ -378,6 +380,9 @@ static void vp_transport_features(struct virtio_device *vdev, u64 features)
+ 
+ 	if (features & BIT_ULL(VIRTIO_F_ADMIN_VQ))
+ 		__virtio_set_bit(vdev, VIRTIO_F_ADMIN_VQ);
++
++	if (features & BIT_ULL(VIRTIO_F_DMB))
++		__virtio_set_bit(vdev, VIRTIO_F_DMB);
+ }
+ 
+ static int __vp_check_common_size_one_feature(struct virtio_device *vdev, u32 fbit,
+@@ -416,6 +421,347 @@ static int vp_check_common_size(struct virtio_device *vdev)
+ 	return 0;
+ }
+ 
++/* ── Lockless single-bitmap DMB allocator ──────────────────────────── */
++
++#define VP_DMB_ALLOC_RETRIES 3
++
++static long vp_dmb_bitmap_alloc(struct virtio_pci_device *vp_dev, unsigned int nslots)
++{
++	unsigned int n = vp_dev->dmb_nslots;
++	/*
++	 * The hint is a best-effort starting point for the scan; a stale or
++	 * cross-CPU value only changes where the search begins and is harmless
++	 * for correctness. Use raw_cpu_ptr() so a preemption/migration between
++	 * the read here and the write-back below does not trip the
++	 * CONFIG_DEBUG_PREEMPT check.
++	 */
++	unsigned int *hintp = raw_cpu_ptr(vp_dev->dmb_hint);
++	unsigned int start, pass, k, taken;
++	unsigned long idx;
++
++	if (!nslots || nslots > n)
++		return -1;
++
++	start = *hintp;
++	if (start > n - nslots)
++		start = 0;
++
++	for (pass = 0; pass < VP_DMB_ALLOC_RETRIES; pass++) {
++		while (start + nslots <= n) {
++			/*
++			 * Search for a free run with plain (non-atomic) word
++			 * loads. This keeps the scan off the LOCK path so it
++			 * does not force exclusive ownership of bitmap
++			 * cachelines on every probe; only the claim below is
++			 * atomic.
++			 */
++			idx = bitmap_find_next_zero_area(vp_dev->dmb_bitmap, n,
++							 start, nslots, 0);
++			if (idx > n - nslots)
++				break;
++			/* Atomically claim the run; another CPU may have taken
++			 * a slot since the scan, so roll back and retry just
++			 * past the contended slot on collision. */
++			for (k = 0; k < nslots; k++) {
++				if (test_and_set_bit(idx + k, vp_dev->dmb_bitmap))
++					break;
++			}
++			if (k == nslots) {
++				*hintp = idx + nslots;
++				return (long)idx;
++			}
++			taken = idx + k;
++			while (k > 0) {
++				k--;
++				clear_bit(idx + k, vp_dev->dmb_bitmap);
++			}
++			start = taken + 1;
++		}
++		start = 0;
++	}
++	return -1;
++}
++
++static void vp_dmb_bitmap_free(struct virtio_pci_device *vp_dev,
++			       unsigned int slot, unsigned int nslots)
++{
++	unsigned int i;
++
++	for (i = 0; i < nslots; i++)
++		clear_bit(slot + i, vp_dev->dmb_bitmap);
++}
++
++static void *vp_dmb_alloc(union virtio_map map, size_t size,
++			  dma_addr_t *dma_handle, gfp_t gfp)
++{
++	struct pci_dev *pci_dev = to_pci_dev(map.dma_dev);
++	struct virtio_pci_device *vp_dev = pci_get_drvdata(pci_dev);
++	unsigned int nslots;
++	long slot;
++
++	if (!vp_dev || !vp_dev->dmb_bitmap)
++		return NULL;
++
++	nslots = DIV_ROUND_UP(size, PAGE_SIZE);
++	slot = vp_dmb_bitmap_alloc(vp_dev, nslots);
++	if (slot < 0)
++		return NULL;
++
++	*dma_handle = (dma_addr_t)slot << PAGE_SHIFT;
++	return (void *)((ulong)vp_dev->dmb_mem + (*dma_handle));
++}
++
++static void vp_dmb_free(union virtio_map map, size_t size, void *vaddr,
++			dma_addr_t dma_handle, ulong attrs)
++{
++	struct pci_dev *pci_dev = to_pci_dev(map.dma_dev);
++	struct virtio_pci_device *vp_dev = pci_get_drvdata(pci_dev);
++	unsigned int slot, nslots;
++
++	if (!vp_dev || !vp_dev->dmb_bitmap || !vaddr)
++		return;
++
++	slot = (unsigned int)(dma_handle >> PAGE_SHIFT);
++	nslots = DIV_ROUND_UP(size, PAGE_SIZE);
++	vp_dmb_bitmap_free(vp_dev, slot, nslots);
++}
++
++/*
++ * Validate a host-controlled (map_handle, size) pair before any DMB bounce
++ * copy or dmb_orig[] index. The DMB is shared with an untrusted host that
++ * writes the virtio used-ring, so the map_handle/size arriving at the
++ * sync/unmap ops are adversarial (e.g. the RX path forwards the used-ring
++ * `len` straight into sync_single_for_cpu, before check_mergeable_len runs).
++ * On success returns true and fills *slotp / *withinp / *cpu_vap; on any
++ * violation it fires a one-shot WARN *before* touching memory and returns
++ * false so the caller bails out without performing the copy.
++ */
++static bool vp_dmb_range_ok(struct virtio_pci_device *vp_dev,
++			    dma_addr_t map_handle, size_t size,
++			    unsigned int *slotp, ulong *withinp,
++			    char **cpu_vap)
++{
++	unsigned int slot = (unsigned int)(map_handle >> PAGE_SHIFT);
++	ulong within = (ulong)map_handle & (PAGE_SIZE - 1);
++	u64 end = (u64)map_handle + size;
++	unsigned int run, i;
++	char *base;
++
++	/*
++	 * Size sanity and dmb_mem-side bounds: the ops memcpy to/from
++	 * (dmb_mem + map_handle) for `size` bytes, so [map_handle, end) must be
++	 * non-empty, must not wrap, and must stay inside the mapped region.
++	 */
++	if (WARN_ON_ONCE(size == 0))
++		return false;
++	if (WARN_ON_ONCE(end <= (u64)map_handle || end > vp_dev->dmb_size))
++		return false;
++
++	/* dmb_orig[] index guard for the first slot. */
++	if (WARN_ON_ONCE(slot >= vp_dev->dmb_nslots))
++		return false;
++
++	/*
++	 * A legitimate multi-page mapping (max_mapping_size advertises up to
++	 * 1 MiB) has within + size > PAGE_SIZE and spans several CONTIGUOUS
++	 * slots of the SAME map_page() call. Bound the slot run so every
++	 * dmb_orig[] index below stays in range.
++	 */
++	run = (unsigned int)DIV_ROUND_UP(within + size, PAGE_SIZE);
++	if (WARN_ON_ONCE(run > vp_dev->dmb_nslots - slot))
++		return false;
++
++	base = vp_dev->dmb_orig[slot];
++	if (WARN_ON_ONCE(!base))
++		return false;
++
++	/*
++	 * Prove the whole run belongs to one mapping. dmb_orig records per-slot
++	 * CONTIGUOUS CPU VAs (dmb_orig[slot + i] == base + i * PAGE_SIZE) only
++	 * within a single map_page() call. A non-NULL-only check is
++	 * insufficient: two independent single-mapping runs can be
++	 * bitmap-adjacent with unrelated VAs, so a crafted within+size could
++	 * linearly walk out of one buffer into another's. Requiring VA
++	 * contiguity guarantees the linear copy of
++	 * [base + within, base + within + size) stays inside one buffer of at
++	 * least `run` pages.
++	 */
++	for (i = 1; i < run; i++) {
++		if (WARN_ON_ONCE(vp_dev->dmb_orig[slot + i] !=
++				 base + ((size_t)i << PAGE_SHIFT)))
++			return false;
++	}
++
++	*slotp = slot;
++	*withinp = within;
++	*cpu_vap = base;
++	return true;
++}
++
++static dma_addr_t vp_dmb_map_page(union virtio_map map, struct page *page,
++				  ulong offset, size_t size,
++				  enum dma_data_direction dir, ulong attrs)
++{
++	struct pci_dev *pci_dev = to_pci_dev(map.dma_dev);
++	struct virtio_pci_device *vp_dev = pci_get_drvdata(pci_dev);
++	unsigned int nslots = DIV_ROUND_UP(size, PAGE_SIZE);
++	char *cpu_va = (char *)page_address(page) + offset;
++	long s;
++	dma_addr_t handle;
++	unsigned int i;
++
++	if (!vp_dev || !vp_dev->dmb_bitmap)
++		return DMA_MAPPING_ERROR;
++
++	s = vp_dmb_bitmap_alloc(vp_dev, nslots);
++	if (s < 0)
++		return DMA_MAPPING_ERROR;
++
++	handle = (dma_addr_t)s << PAGE_SHIFT;
++
++	/*
++	 * Symmetric defensive bound: the allocator already guarantees
++	 * s + nslots <= dmb_nslots, but assert the dmb_mem-side copy target
++	 * [handle, handle + size) stays inside the region before we touch it,
++	 * and roll the reservation back if it somehow does not.
++	 */
++	if (WARN_ON_ONCE((u64)handle + size > vp_dev->dmb_size)) {
++		vp_dmb_bitmap_free(vp_dev, (unsigned int)s, nslots);
++		return DMA_MAPPING_ERROR;
++	}
++
++	/* Record the CPU VA per slot so unmap/sync resolve sub-slot
++	 * offsets in O(1) without a mapping list. */
++	for (i = 0; i < nslots; i++)
++		vp_dev->dmb_orig[s + i] = cpu_va + ((size_t)i << PAGE_SHIFT);
++
++	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
++	    (dir == DMA_TO_DEVICE || dir == DMA_BIDIRECTIONAL))
++		memcpy((char *)vp_dev->dmb_mem + handle, cpu_va, size);
++
++	return handle;
++}
++
++static void vp_dmb_unmap_page(union virtio_map map, dma_addr_t map_handle,
++			      size_t size, enum dma_data_direction dir,
++			      ulong attrs)
++{
++	struct pci_dev *pci_dev = to_pci_dev(map.dma_dev);
++	struct virtio_pci_device *vp_dev = pci_get_drvdata(pci_dev);
++	unsigned int slot, nslots, i;
++	ulong within;
++	char *cpu_va;
++
++	if (!vp_dev || !vp_dev->dmb_orig)
++		return;
++
++	if (!vp_dmb_range_ok(vp_dev, map_handle, size, &slot, &within, &cpu_va))
++		return;
++
++	/*
++	 * Invariant: unmap handles are page-aligned. map_page() returns
++	 * handle = slot << PAGE_SHIFT, and the RX unmap path passes dma->addr
++	 * with DMA_ATTR_SKIP_CPU_SYNC, so `within` is always 0 here. The
++	 * back-copy below writes to cpu_va (the slot base, not cpu_va + within)
++	 * and the cleanup clears DIV_ROUND_UP(size, PAGE_SIZE) slots (not the
++	 * range_ok `run`), both of which are correct only when within == 0.
++	 * Fail closed if a future caller ever passes a sub-page-aligned handle
++	 * rather than silently back-copying to the wrong offset or leaking a
++	 * stale slot.
++	 */
++	if (WARN_ON_ONCE(within))
++		return;
++
++	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
++	    (dir == DMA_FROM_DEVICE || dir == DMA_BIDIRECTIONAL))
++		memcpy(cpu_va, (char *)vp_dev->dmb_mem + map_handle, size);
++
++	/*
++	 * Clear the per-slot CPU VA before releasing the bitmap slots: this
++	 * keeps the range_ok !base check a live double-unmap guard and prevents
++	 * a subsequent unmap/sync from resolving a stale (possibly reused)
++	 * buffer.
++	 */
++	nslots = DIV_ROUND_UP(size, PAGE_SIZE);
++	for (i = 0; i < nslots; i++)
++		vp_dev->dmb_orig[slot + i] = NULL;
++	vp_dmb_bitmap_free(vp_dev, slot, nslots);
++}
++
++static void vp_dmb_sync_single_for_cpu(union virtio_map map, dma_addr_t map_handle,
++					size_t size, enum dma_data_direction dir)
++{
++	struct pci_dev *pci_dev = to_pci_dev(map.dma_dev);
++	struct virtio_pci_device *vp_dev = pci_get_drvdata(pci_dev);
++	unsigned int slot;
++	ulong within;
++	char *cpu_va;
++
++	if (!vp_dev || !vp_dev->dmb_orig)
++		return;
++
++	if (dir != DMA_FROM_DEVICE && dir != DMA_BIDIRECTIONAL)
++		return;
++
++	if (!vp_dmb_range_ok(vp_dev, map_handle, size, &slot, &within, &cpu_va))
++		return;
++
++	memcpy(cpu_va + within, (char *)vp_dev->dmb_mem + map_handle, size);
++}
++
++static void vp_dmb_sync_single_for_device(union virtio_map map, dma_addr_t map_handle,
++					   size_t size, enum dma_data_direction dir)
++{
++	struct pci_dev *pci_dev = to_pci_dev(map.dma_dev);
++	struct virtio_pci_device *vp_dev = pci_get_drvdata(pci_dev);
++	unsigned int slot;
++	ulong within;
++	char *cpu_va;
++
++	if (!vp_dev || !vp_dev->dmb_orig)
++		return;
++
++	if (dir != DMA_TO_DEVICE && dir != DMA_BIDIRECTIONAL)
++		return;
++
++	if (!vp_dmb_range_ok(vp_dev, map_handle, size, &slot, &within, &cpu_va))
++		return;
++
++	memcpy((char *)vp_dev->dmb_mem + map_handle, cpu_va + within, size);
++}
++
++static bool vp_dmb_need_sync(union virtio_map map, dma_addr_t map_handle)
++{
++	return true;
++}
++
++static int vp_dmb_mapping_error(union virtio_map map, dma_addr_t map_handle)
++{
++	return map_handle == DMA_MAPPING_ERROR;
++}
++
++static size_t vp_dmb_max_mapping_size(union virtio_map map)
++{
++	struct pci_dev *pci_dev = to_pci_dev(map.dma_dev);
++	struct virtio_pci_device *vp_dev = pci_get_drvdata(pci_dev);
++
++	if (vp_dev && vp_dev->dmb_bitmap)
++		return min_t(size_t, vp_dev->dmb_size / 8, 1024 * 1024);
++	return 1024 * 1024;
++}
++
++static const struct virtio_map_ops vp_dmb_map_ops = {
++	.map_page = vp_dmb_map_page,
++	.unmap_page = vp_dmb_unmap_page,
++	.sync_single_for_cpu = vp_dmb_sync_single_for_cpu,
++	.sync_single_for_device = vp_dmb_sync_single_for_device,
++	.alloc = vp_dmb_alloc,
++	.free = vp_dmb_free,
++	.need_sync = vp_dmb_need_sync,
++	.mapping_error = vp_dmb_mapping_error,
++	.max_mapping_size = vp_dmb_max_mapping_size,
++};
++
+ /* virtio config->finalize_features() implementation */
+ static int vp_finalize_features(struct virtio_device *vdev)
+ {
+@@ -430,13 +776,69 @@ static int vp_finalize_features(struct virtio_device *vdev)
+ 
+ 	if (!__virtio_test_bit(vdev, VIRTIO_F_VERSION_1)) {
+ 		dev_err(&vdev->dev, "virtio: device uses modern interface "
+-			"but does not have VIRTIO_F_VERSION_1\n");
++			"but does not have VIRTIO_F_VERSION_1 (features=0x%llx)\n",
++			vdev->features);
+ 		return -EINVAL;
+ 	}
+ 
+ 	if (vp_check_common_size(vdev))
+ 		return -EINVAL;
+ 
++	/* Initialize Device Memory Buffer if advertised by host */
++	if (__virtio_test_bit(vdev, VIRTIO_F_DMB)) {
++		struct virtio_shm_region region;
++
++		if (!virtio_get_shm_region(vdev, &region, VIRTIO_SHMEM_ID_DMB)) {
++			dev_warn(&vdev->dev, "Failed to find DMB region");
++			return -EINVAL;
++		}
++
++		vp_dev->dmb_mem = devm_memremap(&vdev->dev, region.addr, region.len, MEMREMAP_WB | MEMREMAP_DEC);
++		if (IS_ERR_OR_NULL(vp_dev->dmb_mem)) {
++			dev_warn(&vdev->dev, "Failed to map DMB region");
++			vp_dev->dmb_mem = NULL;
++			return -EINVAL;
++		}
++		vp_dev->dmb_size = region.len;
++		vp_dev->dmb_nslots = (unsigned int)(region.len >> PAGE_SHIFT);
++		if (vp_dev->dmb_nslots < 2) {
++			dev_warn(&vdev->dev, "DMB region too small (%lu bytes)",
++				 (unsigned long)region.len);
++			vp_dev->dmb_mem = NULL;
++			return -EINVAL;
++		}
++		vp_dev->dmb_bitmap = devm_bitmap_zalloc(&vdev->dev, vp_dev->dmb_nslots, GFP_KERNEL);
++		vp_dev->dmb_hint = devm_alloc_percpu(&vdev->dev, unsigned int);
++		vp_dev->dmb_orig = devm_kcalloc(&vdev->dev, vp_dev->dmb_nslots, sizeof(*vp_dev->dmb_orig), GFP_KERNEL);
++
++		if (!vp_dev->dmb_bitmap || !vp_dev->dmb_hint || !vp_dev->dmb_orig) {
++			/*
++			 * VIRTIO_F_DMB was negotiated, so a partial allocation
++			 * is fatal: leaving dmb_bitmap non-NULL with an
++			 * uninitialised vmap.dma_dev would later NULL-deref in
++			 * vring_create_virtqueue_map(). Fail hard.
++			 */
++			dev_warn(&vdev->dev, "Failed to allocate DMB bitmap structures");
++			vp_dev->dmb_bitmap = NULL;
++			vp_dev->dmb_mem = NULL;
++			return -ENOMEM;
++		}
++
++		{
++			int cpu;
++			unsigned int stride = max(1U, vp_dev->dmb_nslots / max(1U, num_online_cpus()));
++
++			for_each_online_cpu(cpu)
++				*per_cpu_ptr(vp_dev->dmb_hint, cpu) = (cpu * stride) % vp_dev->dmb_nslots;
++			set_bit(0, vp_dev->dmb_bitmap); /* reserve slot 0 so handle!=0 */
++			vdev->map = &vp_dmb_map_ops;
++			vdev->vmap.dma_dev = &vp_dev->pci_dev->dev;
++
++			dev_info(&vdev->dev, "Enabled %lu-byte Virtio DMB (lockless bitmap, %u slots) for %s",
++				 vp_dev->dmb_size, vp_dev->dmb_nslots, dev_name(&vp_dev->pci_dev->dev));
++		}
++	}
++
+ 	vp_modern_set_extended_features(&vp_dev->mdev, vdev->features_array);
+ 
+ 	return 0;
+@@ -692,6 +1094,7 @@ static struct virtqueue *setup_vq(struct virtio_pci_device *vp_dev,
+ {
+ 
+ 	struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
++	union virtio_map map = {.dma_dev = vp_dev->vdev.dev.parent};
+ 	bool (*notify)(struct virtqueue *vq);
+ 	struct virtqueue *vq;
+ 	bool is_avq;
+@@ -715,10 +1118,11 @@ static struct virtqueue *setup_vq(struct virtio_pci_device *vp_dev,
+ 	info->msix_vector = msix_vec;
+ 
+ 	/* create the vring */
+-	vq = vring_create_virtqueue(index, num,
+-				    SMP_CACHE_BYTES, &vp_dev->vdev,
+-				    true, true, ctx,
+-				    notify, callback, name);
++	if (vp_dev->dmb_bitmap)
++		map = vp_dev->vdev.vmap;
++
++	vq = vring_create_virtqueue_map(index, num, SMP_CACHE_BYTES, &vp_dev->vdev,
++					true, true, ctx, notify, callback, name, map);
+ 	if (!vq)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -1297,5 +1701,102 @@ void virtio_pci_modern_remove(struct virtio_pci_device *vp_dev)
+ {
+ 	struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
+ 
++	/* DMB bitmap/hint/orig/len are devm-managed; freed on unbind. */
+ 	vp_modern_remove(mdev);
+ }
++
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++/*
++ * Zero-copy DMB helpers. These allocate from the SAME lockless bitmap that
++ * backs the bounce path, so zero-copy and bounced buffers never overlap in
++ * the DMB region. Buffers allocated here are used in place (premapped); no
++ * dmb_orig bounce bookkeeping is involved.
++ */
++static struct virtio_pci_device *vp_dmb_dev(struct virtio_device *vdev)
++{
++	if (!vdev || !vdev->map || !dev_is_pci(vdev->dev.parent))
++		return NULL;
++	return to_vp_device(vdev);
++}
++
++bool virtio_has_dmb(struct virtio_device *vdev)
++{
++	struct virtio_pci_device *vp_dev = vp_dmb_dev(vdev);
++
++	return vp_dev && vp_dev->dmb_bitmap;
++}
++EXPORT_SYMBOL_GPL(virtio_has_dmb);
++
++void *virtio_dmb_alloc(struct virtio_device *vdev, size_t size)
++{
++	struct virtio_pci_device *vp_dev = vp_dmb_dev(vdev);
++	long slot;
++
++	if (!vp_dev || !vp_dev->dmb_bitmap)
++		return NULL;
++	slot = vp_dmb_bitmap_alloc(vp_dev, DIV_ROUND_UP(size, PAGE_SIZE));
++	if (slot < 0)
++		return NULL;
++	return (void *)((ulong)vp_dev->dmb_mem + ((ulong)slot << PAGE_SHIFT));
++}
++EXPORT_SYMBOL_GPL(virtio_dmb_alloc);
++
++void virtio_dmb_free(struct virtio_device *vdev, void *vaddr, size_t size)
++{
++	struct virtio_pci_device *vp_dev = vp_dmb_dev(vdev);
++	unsigned int slot;
++
++	if (!vp_dev || !vp_dev->dmb_bitmap || !vaddr)
++		return;
++	/*
++	 * Defense-in-depth: vaddr must fall inside the DMB region before we
++	 * derive a slot index from it. Mirror the bound in
++	 * virtio_dmb_virt_to_dma() so an out-of-region vaddr cannot compute a
++	 * bogus slot and free unrelated bitmap bits. Guest-only path, so this
++	 * is hardening rather than a boundary-crossing check.
++	 */
++	if (WARN_ON_ONCE((ulong)vaddr < (ulong)vp_dev->dmb_mem ||
++			 (ulong)vaddr >= (ulong)vp_dev->dmb_mem + vp_dev->dmb_size))
++		return;
++	slot = (unsigned int)(((ulong)vaddr - (ulong)vp_dev->dmb_mem) >> PAGE_SHIFT);
++	vp_dmb_bitmap_free(vp_dev, slot, DIV_ROUND_UP(size, PAGE_SIZE));
++}
++EXPORT_SYMBOL_GPL(virtio_dmb_free);
++
++size_t virtio_dmb_size(struct virtio_device *vdev)
++{
++	struct virtio_pci_device *vp_dev = vp_dmb_dev(vdev);
++
++	return (vp_dev && vp_dev->dmb_bitmap) ? vp_dev->dmb_size : 0;
++}
++EXPORT_SYMBOL_GPL(virtio_dmb_size);
++
++size_t virtio_dmb_avail(struct virtio_device *vdev)
++{
++	struct virtio_pci_device *vp_dev = vp_dmb_dev(vdev);
++	unsigned int used;
++
++	if (!vp_dev || !vp_dev->dmb_bitmap)
++		return 0;
++	used = bitmap_weight(vp_dev->dmb_bitmap, vp_dev->dmb_nslots);
++	return (size_t)(vp_dev->dmb_nslots - used) << PAGE_SHIFT;
++}
++EXPORT_SYMBOL_GPL(virtio_dmb_avail);
++
++/**
++ * virtio_dmb_virt_to_dma - Convert a DMB virtual address to its DMA handle
++ * @vdev: the virtio device owning the DMB
++ * @vaddr: virtual address within the DMB region
++ */
++dma_addr_t virtio_dmb_virt_to_dma(struct virtio_device *vdev, void *vaddr)
++{
++	struct virtio_pci_device *vp_dev = to_vp_device(vdev);
++
++	if (WARN_ON_ONCE((ulong)vaddr < (ulong)vp_dev->dmb_mem ||
++			 (ulong)vaddr >= (ulong)vp_dev->dmb_mem + vp_dev->dmb_size))
++		return DMA_MAPPING_ERROR;
++
++	return (dma_addr_t)((ulong)vaddr - (ulong)vp_dev->dmb_mem);
++}
++EXPORT_SYMBOL_GPL(virtio_dmb_virt_to_dma);
++#endif
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index def9cca..c9e33fe 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -882,6 +882,32 @@ enum skb_tstamp_type {
+  *	@extensions: allocated extensions, valid if active_extensions is nonzero
+  */
+ 
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++/*
++ * Stored in skb->cb[] for DMB-allocated SKBs. Allows skb_free_head()
++ * to return the buffer to its gen_pool without transport-layer dependencies.
++ *
++ * Placed at the end of cb[48] to avoid overlap with protocol-specific cb
++ * usage (e.g. virtio_vsock_skb_cb uses bytes 0-7). Safe because DMB SKBs
++ * stay within the vsock transport layer (unreadable=1) and never traverse
++ * generic protocol handlers that use cb[] beyond byte 8.
++ *
++ * No function pointers — gen_pool_free() is called directly from
++ * skb_free_head() to avoid creating a code-execution primitive in cb[].
++ */
++struct virtio_device;
++struct dmb_skb_free_cb {
++	struct virtio_device *vdev;
++	void *data;
++	size_t size;
++	void *safe_hdr;	/* kernel-heap copy of vsock hdr (untrusted DMB) */
++};
++static_assert(sizeof(struct dmb_skb_free_cb) <= 48);
++
++#define DMB_SKB_FREE_CB(skb) \
++	((struct dmb_skb_free_cb *)((skb)->cb + 48 - sizeof(struct dmb_skb_free_cb)))
++#endif /* CONFIG_VIRTIO_DMB_ZEROCOPY */
++
+ struct sk_buff {
+ 	union {
+ 		struct {
+@@ -1030,6 +1056,9 @@ struct sk_buff {
+ 	__u8			csum_not_inet:1;
+ #endif
+ 	__u8			unreadable:1;
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++	__u8			dmb_head:1;
++#endif
+ #if defined(CONFIG_NET_SCHED) || defined(CONFIG_NET_XGRESS)
+ 	__u16			tc_index;	/* traffic control index */
+ #endif
+diff --git a/include/linux/virtio.h b/include/linux/virtio.h
+index 132a474..f1635c7 100644
+--- a/include/linux/virtio.h
++++ b/include/linux/virtio.h
+@@ -209,6 +209,41 @@ int virtio_device_reset_done(struct virtio_device *dev);
+ 
+ size_t virtio_max_dma_size(const struct virtio_device *vdev);
+ 
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++bool virtio_has_dmb(struct virtio_device *vdev);
++void *virtio_dmb_alloc(struct virtio_device *vdev, size_t size);
++void virtio_dmb_free(struct virtio_device *vdev, void *vaddr, size_t size);
++size_t virtio_dmb_size(struct virtio_device *vdev);
++size_t virtio_dmb_avail(struct virtio_device *vdev);
++dma_addr_t virtio_dmb_virt_to_dma(struct virtio_device *vdev, void *vaddr);
++#else
++static inline bool virtio_has_dmb(struct virtio_device *vdev)
++{
++	return false;
++}
++static inline void *virtio_dmb_alloc(struct virtio_device *vdev, size_t size)
++{
++	return NULL;
++}
++static inline void virtio_dmb_free(struct virtio_device *vdev, void *vaddr,
++				   size_t size)
++{
++}
++static inline size_t virtio_dmb_size(struct virtio_device *vdev)
++{
++	return 0;
++}
++static inline size_t virtio_dmb_avail(struct virtio_device *vdev)
++{
++	return 0;
++}
++static inline dma_addr_t virtio_dmb_virt_to_dma(struct virtio_device *vdev,
++						void *vaddr)
++{
++	return DMA_MAPPING_ERROR;
++}
++#endif
++
+ #define virtio_device_for_each_vq(vdev, vq) \
+ 	list_for_each_entry(vq, &(vdev)->vqs, list)
+ 
+diff --git a/include/linux/virtio_vsock.h b/include/linux/virtio_vsock.h
+index 0c67543..d1dfd4f 100644
+--- a/include/linux/virtio_vsock.h
++++ b/include/linux/virtio_vsock.h
+@@ -19,6 +19,14 @@ struct virtio_vsock_skb_cb {
+ 
+ static inline struct virtio_vsock_hdr *virtio_vsock_hdr(struct sk_buff *skb)
+ {
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++	if (skb->dmb_head) {
++		struct dmb_skb_free_cb *cb = DMB_SKB_FREE_CB(skb);
++
++		if (cb->safe_hdr)
++			return (struct virtio_vsock_hdr *)cb->safe_hdr;
++	}
++#endif
+ 	return (struct virtio_vsock_hdr *)skb->head;
+ }
+ 
+@@ -195,6 +203,11 @@ struct virtio_transport {
+ 	 * default.
+ 	 */
+ 	bool (*can_msgzerocopy)(int bufs_num);
++
++	/* Optional: allocate an SKB from transport-managed memory (e.g.
++	 * DMB pool). Returns NULL to fall back to standard allocation.
++	 */
++	struct sk_buff *(*alloc_skb)(size_t size, gfp_t gfp);
+ };
+ 
+ ssize_t
+diff --git a/include/uapi/linux/virtio_config.h b/include/uapi/linux/virtio_config.h
+index 2445f36..def6898 100644
+--- a/include/uapi/linux/virtio_config.h
++++ b/include/uapi/linux/virtio_config.h
+@@ -52,7 +52,7 @@
+  * rest are per-device feature bits.
+  */
+ #define VIRTIO_TRANSPORT_F_START	28
+-#define VIRTIO_TRANSPORT_F_END		42
++#define VIRTIO_TRANSPORT_F_END		43
+ 
+ #ifndef VIRTIO_CONFIG_NO_LEGACY
+ /* Do we get callbacks when the ring is completely used, even if we've
+@@ -114,10 +114,18 @@
+  * This feature indicates that the driver can reset a queue individually.
+  */
+ #define VIRTIO_F_RING_RESET		40
+-
+ /*
+  * This feature indicates that the device support administration virtqueues.
+  */
+ #define VIRTIO_F_ADMIN_VQ		41
+ 
++/*
++ * When Device Memory Buffer (DMB) is active, all virtio memory addresses are
++ * offsets into a shared memory region that belongs to the device.
++ */
++#define VIRTIO_F_DMB			42
++
++/* Device Memory Buffer (DMB) shared memory region */
++#define VIRTIO_SHMEM_ID_DMB		2
++
+ #endif /* _UAPI_LINUX_VIRTIO_CONFIG_H */
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 43dca2c..7554f6a 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -89,6 +89,9 @@
+ #include <linux/user_namespace.h>
+ #include <linux/indirect_call_wrapper.h>
+ #include <linux/textsearch.h>
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++#include <linux/virtio.h>
++#endif
+ 
+ #include "dev.h"
+ #include "devmem.h"
+@@ -1049,6 +1052,15 @@ static void skb_free_head(struct sk_buff *skb)
+ {
+ 	unsigned char *head = skb->head;
+ 
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++	if (skb->dmb_head) {
++		struct dmb_skb_free_cb *cb = DMB_SKB_FREE_CB(skb);
++
++		kfree(cb->safe_hdr);
++		virtio_dmb_free(cb->vdev, cb->data, cb->size);
++		return;
++	}
++#endif
+ 	if (skb->head_frag) {
+ 		if (skb_pp_recycle(skb, head))
+ 			return;
+@@ -1063,6 +1075,22 @@ static void skb_release_data(struct sk_buff *skb, enum skb_drop_reason reason)
+ 	struct skb_shared_info *shinfo = skb_shinfo(skb);
+ 	int i;
+ 
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++	/*
++	 * DMB-backed SKBs have skb_shared_info in untrusted shared memory.
++	 * We must not read shinfo->dataref (skb_data_unref) or any frag
++	 * metadata: the host could manipulate dataref to cause double-free
++	 * or leak, and could plant arbitrary page pointers in frags.
++	 * DMB SKBs are never cloned (unreadable=1, linear), so unconditional
++	 * free is correct.
++	 */
++	if (skb->dmb_head) {
++		WARN_ON_ONCE(skb_cloned(skb));
++		skb_free_head(skb);
++		goto exit;
++	}
++#endif
++
+ 	if (!skb_data_unref(skb, shinfo))
+ 		goto exit;
+ 
+diff --git a/net/vmw_vsock/virtio_transport.c b/net/vmw_vsock/virtio_transport.c
+index 8c86702..b3dda43 100644
+--- a/net/vmw_vsock/virtio_transport.c
++++ b/net/vmw_vsock/virtio_transport.c
+@@ -13,6 +13,9 @@
+ #include <linux/module.h>
+ #include <linux/list.h>
+ #include <linux/atomic.h>
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++#include <linux/genalloc.h>
++#endif
+ #include <linux/virtio.h>
+ #include <linux/virtio_ids.h>
+ #include <linux/virtio_config.h>
+@@ -26,9 +29,42 @@ static struct virtio_vsock __rcu *the_virtio_vsock;
+ static DEFINE_MUTEX(the_virtio_vsock_mutex); /* protects the_virtio_vsock */
+ static struct virtio_transport virtio_transport; /* forward declaration */
+ 
++static int rx_buf_size = -1;
++module_param(rx_buf_size, int, 0444);
++MODULE_PARM_DESC(rx_buf_size,
++	"Size of RX buffers posted to the virtqueue. Larger values reduce "
++	"per-packet descriptor overhead for bulk transfers at the cost of "
++	"memory. Range: 128 to 65536. Default: ~4K (VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE).");
++
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++static int dmb_rx_zc_pct = 50;
++module_param(dmb_rx_zc_pct, int, 0444);
++MODULE_PARM_DESC(dmb_rx_zc_pct,
++	"Percentage of DMB pool dedicated to zero-copy RX buffers. "
++	"Remaining pool is available for TX zero-copy. Range: 0-100. Default: 50.");
++
++/*
++ * Heap-backed (bounced) RX buffers kept posted on the DMB zero-copy RX
++ * virtqueue as a liveness floor.  One is sufficient: it is harvested and
++ * re-posted within the same rx_work pass, so the RX vq never drains to
++ * empty even when a slow reader has pinned every zero-copy slot.
++ */
++#define VIRTIO_VSOCK_RX_BOUNCE_FLOOR 1
++#endif
++
+ struct virtio_vsock {
+ 	struct virtio_device *vdev;
+ 	struct virtqueue *vqs[VSOCK_VQ_MAX];
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++	bool dmb_active;
++	size_t dmb_slot_size;		/* aligned buffer size for budget */
++	size_t tx_pool_min;		/* min pool avail kept for TX */
++	size_t rx_pool_min;		/* min pool avail kept for RX */
++	int rx_zc_max;			/* max RX ZC buffers in VQ */
++	int rx_zc_posted;		/* ZC buffers currently in VQ */
++	size_t rx_bounce_reserve;	/* pool bytes kept free for the floor */
++	int rx_bounce_posted;		/* bounced (heap) RX buffers in VQ */
++#endif
+ 
+ 	/* Virtqueue processing is deferred to a workqueue */
+ 	struct work_struct tx_work;
+@@ -101,6 +137,51 @@ static int virtio_transport_send_skb(struct sk_buff *skb, struct virtqueue *vq,
+ 	int ret, in_sg = 0, out_sg = 0;
+ 	struct scatterlist **sgs;
+ 
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++	/*
++	 * DMB-allocated SKBs use premapped submission: the buffer is already
++	 * in shared memory, so we set sg_dma_address directly and bypass the
++	 * DMA mapping layer entirely.  Non-DMB SKBs (fallback) use the
++	 * standard path which bounces through vp_dmb_map_page.
++	 */
++	if (skb->dmb_head) {
++		struct scatterlist dmb_sgs[2];
++		void *hdr = virtio_vsock_hdr(skb);
++		int num_sg = 0;
++
++		if (skb->len > 0) {
++			sg_init_table(dmb_sgs, 2);
++			sg_set_buf(&dmb_sgs[0], hdr,
++				   sizeof(struct virtio_vsock_hdr));
++			sg_dma_address(&dmb_sgs[0]) =
++				virtio_dmb_virt_to_dma(vsock->vdev, hdr);
++			sg_dma_len(&dmb_sgs[0]) =
++				sizeof(struct virtio_vsock_hdr);
++			sg_set_buf(&dmb_sgs[1], skb->data, skb->len);
++			sg_dma_address(&dmb_sgs[1]) =
++				virtio_dmb_virt_to_dma(vsock->vdev,
++						       skb->data);
++			sg_dma_len(&dmb_sgs[1]) = skb->len;
++			num_sg = 2;
++		} else {
++			sg_init_one(&dmb_sgs[0], hdr,
++				    sizeof(struct virtio_vsock_hdr));
++			sg_dma_address(&dmb_sgs[0]) =
++				virtio_dmb_virt_to_dma(vsock->vdev, hdr);
++			sg_dma_len(&dmb_sgs[0]) =
++				sizeof(struct virtio_vsock_hdr);
++			num_sg = 1;
++		}
++
++		ret = virtqueue_add_outbuf_premapped(vq, dmb_sgs, num_sg,
++						     skb, gfp);
++		if (ret < 0)
++			return ret;
++		virtio_transport_deliver_tap_pkt(skb);
++		return 0;
++	}
++#endif
++
+ 	sgs = vsock->out_sgs;
+ 	sg_init_one(sgs[out_sg], virtio_vsock_hdr(skb),
+ 		    sizeof(*virtio_vsock_hdr(skb)));
+@@ -305,37 +386,161 @@ out_rcu:
+ 	return ret;
+ }
+ 
+-static void virtio_vsock_rx_fill(struct virtio_vsock *vsock)
++static void virtio_vsock_rx_fill(struct virtio_vsock *vsock);
++
++static int virtio_vsock_rx_buf_len(void)
++{
++	return (rx_buf_size > 0)
++		? clamp_t(int, rx_buf_size, 128, VIRTIO_VSOCK_MAX_PKT_BUF_SIZE)
++		: VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE;
++}
++
++static int virtio_vsock_rx_post_one(struct virtio_vsock *vsock,
++				    struct virtqueue *vq, int total_len)
+ {
+-	int total_len = VIRTIO_VSOCK_DEFAULT_RX_BUF_SIZE;
+ 	struct scatterlist pkt, *p;
+-	struct virtqueue *vq;
+ 	struct sk_buff *skb;
+ 	int ret;
+ 
+-	vq = vsock->vqs[VSOCK_VQ_RX];
++	skb = virtio_vsock_alloc_linear_skb(total_len, GFP_KERNEL);
++	if (!skb)
++		return -ENOMEM;
+ 
+-	do {
+-		skb = virtio_vsock_alloc_linear_skb(total_len, GFP_KERNEL);
+-		if (!skb)
++	memset(skb->head, 0, VIRTIO_VSOCK_SKB_HEADROOM);
++	sg_init_one(&pkt, virtio_vsock_hdr(skb), total_len);
++	p = &pkt;
++	ret = virtqueue_add_sgs(vq, &p, 0, 1, skb, GFP_KERNEL);
++	if (ret < 0) {
++		kfree_skb(skb);
++		return ret;
++	}
++
++	vsock->rx_buf_nr++;
++	return 0;
++}
++
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++static void virtio_vsock_rx_fill_dmb(struct virtio_vsock *vsock)
++{
++	struct virtqueue *vq = vsock->vqs[VSOCK_VQ_RX];
++	int total_len = virtio_vsock_rx_buf_len();
++	size_t slot_size = vsock->dmb_slot_size;
++	int ret;
++
++	while (vq->num_free && vsock->rx_zc_posted < vsock->rx_zc_max) {
++		struct scatterlist sg;
++		struct sk_buff *skb;
++		dma_addr_t dma;
++		void *buf;
++
++		if (virtio_dmb_avail(vsock->vdev) <=
++		    vsock->tx_pool_min + vsock->rx_bounce_reserve)
+ 			break;
+ 
+-		memset(skb->head, 0, VIRTIO_VSOCK_SKB_HEADROOM);
+-		sg_init_one(&pkt, virtio_vsock_hdr(skb), total_len);
+-		p = &pkt;
+-		ret = virtqueue_add_sgs(vq, &p, 0, 1, skb, GFP_KERNEL);
++		buf = virtio_dmb_alloc(vsock->vdev, slot_size);
++		if (!buf)
++			break;
++
++		skb = __build_skb(buf, slot_size);
++		if (!skb) {
++			virtio_dmb_free(vsock->vdev, buf, slot_size);
++			break;
++		}
++
++		skb->dmb_head = 1;
++		skb->unreadable = 1;
++		BUILD_BUG_ON(sizeof(struct dmb_skb_free_cb) +
++			     sizeof(struct virtio_vsock_skb_cb) > 48);
++		DMB_SKB_FREE_CB(skb)->vdev = vsock->vdev;
++		DMB_SKB_FREE_CB(skb)->data = buf;
++		DMB_SKB_FREE_CB(skb)->size = slot_size;
++		DMB_SKB_FREE_CB(skb)->safe_hdr = NULL;
++
++		skb_reserve(skb, VIRTIO_VSOCK_SKB_HEADROOM);
++
++		dma = virtio_dmb_virt_to_dma(vsock->vdev, buf);
++		sg_init_one(&sg, buf, total_len);
++		sg_dma_address(&sg) = dma;
++		sg_dma_len(&sg) = total_len;
++
++		ret = virtqueue_add_inbuf_premapped(vq, &sg, 1, skb,
++						    NULL, GFP_KERNEL);
+ 		if (ret < 0) {
+ 			kfree_skb(skb);
+ 			break;
+ 		}
+ 
++		vsock->rx_zc_posted++;
+ 		vsock->rx_buf_nr++;
++	}
++
++	if (vsock->rx_buf_nr > vsock->rx_buf_max_nr)
++		vsock->rx_buf_max_nr = vsock->rx_buf_nr;
++	virtqueue_kick(vq);
++}
++
++/* Replenish heap-backed bounce floor (see VIRTIO_VSOCK_RX_BOUNCE_FLOOR). */
++static void virtio_vsock_rx_fill_bounce(struct virtio_vsock *vsock)
++{
++	struct virtqueue *vq = vsock->vqs[VSOCK_VQ_RX];
++	int total_len = virtio_vsock_rx_buf_len();
++	bool added = false;
++
++	while (vq->num_free &&
++	       vsock->rx_bounce_posted < VIRTIO_VSOCK_RX_BOUNCE_FLOOR) {
++		if (virtio_vsock_rx_post_one(vsock, vq, total_len) < 0)
++			break;
++
++		vsock->rx_bounce_posted++;
++		added = true;
++
++		if (vsock->rx_zc_posted >= vsock->rx_zc_max)
++			dev_dbg(&vsock->vdev->dev,
++				"all %d ZC RX slots pinned, bounce floor active\n",
++				vsock->rx_zc_max);
++	}
++
++	if (added) {
++		if (vsock->rx_buf_nr > vsock->rx_buf_max_nr)
++			vsock->rx_buf_max_nr = vsock->rx_buf_nr;
++		virtqueue_kick(vq);
++	}
++}
++#else
++static inline void virtio_vsock_rx_fill_dmb(struct virtio_vsock *vsock) {}
++static inline void virtio_vsock_rx_fill_bounce(struct virtio_vsock *vsock) {}
++#endif /* CONFIG_VIRTIO_DMB_ZEROCOPY */
++
++static void virtio_vsock_rx_fill(struct virtio_vsock *vsock)
++{
++	struct virtqueue *vq = vsock->vqs[VSOCK_VQ_RX];
++	int total_len = virtio_vsock_rx_buf_len();
++
++	do {
++		if (virtio_vsock_rx_post_one(vsock, vq, total_len) < 0)
++			break;
+ 	} while (vq->num_free);
+ 	if (vsock->rx_buf_nr > vsock->rx_buf_max_nr)
+ 		vsock->rx_buf_max_nr = vsock->rx_buf_nr;
+ 	virtqueue_kick(vq);
+ }
+ 
++static void virtio_vsock_rx_refill(struct virtio_vsock *vsock, bool force)
++{
++	bool below_watermark = vsock->rx_buf_nr < vsock->rx_buf_max_nr / 2;
++
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++	if (vsock->dmb_active && vsock->rx_zc_max > 0) {
++		virtio_vsock_rx_fill_bounce(vsock);
++		if (force || below_watermark)
++			virtio_vsock_rx_fill_dmb(vsock);
++		return;
++	}
++#endif
++	if (force || below_watermark)
++		virtio_vsock_rx_fill(vsock);
++}
++
+ static void virtio_transport_tx_work(struct work_struct *work)
+ {
+ 	struct virtio_vsock *vsock =
+@@ -538,6 +743,63 @@ static bool virtio_transport_msgzerocopy_allow(void)
+ 
+ static bool virtio_transport_seqpacket_allow(u32 remote_cid);
+ 
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++static struct sk_buff *virtio_vsock_dmb_alloc_skb(size_t size, gfp_t gfp)
++{
++	struct virtio_vsock *vsock;
++	struct virtio_device *vdev;
++	struct sk_buff *skb;
++	size_t alloc_size;
++	void *buf;
++
++	rcu_read_lock();
++	vsock = rcu_dereference(the_virtio_vsock);
++	if (!vsock || !vsock->dmb_active) {
++		rcu_read_unlock();
++		return NULL;
++	}
++	/*
++	 * Pin the virtio_device while still under RCU: vsock may be freed by
++	 * the removal path once we drop the read lock, so every DMB access
++	 * (including the skb free-cb stored after rcu_read_unlock) must use
++	 * this local instead of vsock->vdev.
++	 */
++	vdev = vsock->vdev;
++
++	alloc_size = SKB_DATA_ALIGN(size) +
++		     SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++	alloc_size = ALIGN(alloc_size, SMP_CACHE_BYTES);
++
++	if (virtio_dmb_avail(vdev) < alloc_size + vsock->rx_pool_min) {
++		rcu_read_unlock();
++		return NULL;
++	}
++
++	buf = virtio_dmb_alloc(vdev, alloc_size);
++	if (!buf) {
++		rcu_read_unlock();
++		return NULL;
++	}
++
++	skb = __build_skb(buf, alloc_size);
++	if (!skb) {
++		virtio_dmb_free(vdev, buf, alloc_size);
++		rcu_read_unlock();
++		return NULL;
++	}
++	rcu_read_unlock();
++
++	skb->dmb_head = 1;
++	DMB_SKB_FREE_CB(skb)->vdev = vdev;
++	DMB_SKB_FREE_CB(skb)->data = buf;
++	DMB_SKB_FREE_CB(skb)->size = alloc_size;
++	DMB_SKB_FREE_CB(skb)->safe_hdr = NULL;
++
++	skb_reserve(skb, VIRTIO_VSOCK_SKB_HEADROOM);
++	return skb;
++}
++#endif
++
+ static struct virtio_transport virtio_transport = {
+ 	.transport = {
+ 		.module                   = THIS_MODULE,
+@@ -591,6 +853,9 @@ static struct virtio_transport virtio_transport = {
+ 
+ 	.send_pkt = virtio_transport_send_pkt,
+ 	.can_msgzerocopy = virtio_transport_can_msgzerocopy,
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++	.alloc_skb = virtio_vsock_dmb_alloc_skb,
++#endif
+ };
+ 
+ static bool virtio_transport_seqpacket_allow(u32 remote_cid)
+@@ -637,10 +902,19 @@ static void virtio_transport_rx_work(struct work_struct *work)
+ 			}
+ 
+ 			skb = virtqueue_get_buf(vq, &len);
+-			if (!skb)
++			if (!skb) {
+ 				break;
+-
++			}
+ 			vsock->rx_buf_nr--;
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++			/* Track ZC/bounce counters only when DMB fill is active. */
++			if (vsock->dmb_active && vsock->rx_zc_max > 0) {
++				if (skb->dmb_head)
++					vsock->rx_zc_posted--;
++				else
++					vsock->rx_bounce_posted--;
++			}
++#endif
+ 
+ 			/* Drop short/long packets */
+ 			if (unlikely(len < sizeof(*hdr) ||
+@@ -650,12 +924,41 @@ static void virtio_transport_rx_work(struct work_struct *work)
+ 			}
+ 
+ 			hdr = virtio_vsock_hdr(skb);
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++			/*
++			 * DMB-backed buffers reside in shared memory
++			 * writable by the untrusted host.  Allocate a
++			 * kernel-heap copy of the header so all downstream
++			 * consumers (via virtio_vsock_hdr()) read from
++			 * memory the host cannot mutate.
++			 */
++			if (skb->dmb_head) {
++				struct virtio_vsock_hdr *safe;
++
++				safe = kmalloc(sizeof(*safe), GFP_KERNEL);
++				if (unlikely(!safe)) {
++					kfree_skb(skb);
++					continue;
++				}
++				memcpy(safe, hdr, sizeof(*safe));
++				DMB_SKB_FREE_CB(skb)->safe_hdr = safe;
++
++				payload_len = le32_to_cpu(safe->len);
++				if (unlikely(payload_len > len - sizeof(*hdr))) {
++					kfree_skb(skb);
++					continue;
++				}
++				goto dmb_hdr_done;
++			}
++#endif
+ 			payload_len = le32_to_cpu(hdr->len);
+ 			if (unlikely(payload_len > len - sizeof(*hdr))) {
+ 				kfree_skb(skb);
+ 				continue;
+ 			}
+-
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++dmb_hdr_done:
++#endif
+ 			if (payload_len)
+ 				virtio_vsock_skb_put(skb, payload_len);
+ 
+@@ -665,8 +968,7 @@ static void virtio_transport_rx_work(struct work_struct *work)
+ 	} while (!virtqueue_enable_cb(vq));
+ 
+ out:
+-	if (vsock->rx_buf_nr < vsock->rx_buf_max_nr / 2)
+-		virtio_vsock_rx_fill(vsock);
++	virtio_vsock_rx_refill(vsock, false);
+ 	mutex_unlock(&vsock->rx_lock);
+ }
+ 
+@@ -683,13 +985,19 @@ static int virtio_vsock_vqs_init(struct virtio_vsock *vsock)
+ 	mutex_lock(&vsock->rx_lock);
+ 	vsock->rx_buf_nr = 0;
+ 	vsock->rx_buf_max_nr = 0;
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++	vsock->rx_zc_posted = 0;
++	vsock->rx_bounce_posted = 0;
++#endif
+ 	mutex_unlock(&vsock->rx_lock);
+ 
+ 	atomic_set(&vsock->queued_replies, 0);
+ 
+ 	ret = virtio_find_vqs(vdev, VSOCK_VQ_MAX, vsock->vqs, vqs_info, NULL);
+-	if (ret < 0)
++	if (ret < 0) {
++		pr_err("virtio_vsock: virtio_find_vqs failed: %d\n", ret);
+ 		return ret;
++	}
+ 
+ 	virtio_vsock_update_guest_cid(vsock);
+ 
+@@ -705,7 +1013,7 @@ static void virtio_vsock_vqs_start(struct virtio_vsock *vsock)
+ 	mutex_unlock(&vsock->tx_lock);
+ 
+ 	mutex_lock(&vsock->rx_lock);
+-	virtio_vsock_rx_fill(vsock);
++	virtio_vsock_rx_refill(vsock, true);
+ 	vsock->rx_run = true;
+ 	mutex_unlock(&vsock->rx_lock);
+ 
+@@ -795,7 +1103,50 @@ static int virtio_vsock_probe(struct virtio_device *vdev)
+ 	}
+ 
+ 	vsock->vdev = vdev;
++#if IS_ENABLED(CONFIG_VIRTIO_DMB_ZEROCOPY)
++	vsock->dmb_active = virtio_has_dmb(vdev);
++	if (vsock->dmb_active) {
++		int total_len = virtio_vsock_rx_buf_len();
++		size_t slot_size = SKB_DATA_ALIGN(total_len) +
++				   SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++		size_t pool_size = virtio_dmb_size(vdev);
++
++		slot_size = ALIGN(slot_size, SMP_CACHE_BYTES);
++		vsock->dmb_slot_size = slot_size;
++
++		/*
++		 * Partition the pool: ZC RX budget + bounce reserve + TX.
++		 * Shrink rx_zc_max if the pool cannot hold the requested
++		 * ZC budget alongside the bounce reserve.
++		 */
++		vsock->rx_bounce_reserve =
++			VIRTIO_VSOCK_RX_BOUNCE_FLOOR * PAGE_ALIGN(total_len);
++
++		vsock->rx_zc_max = (pool_size / slot_size) *
++				   clamp(dmb_rx_zc_pct, 0, 100) / 100;
++		while (vsock->rx_zc_max > 0 &&
++		       (size_t)vsock->rx_zc_max * slot_size +
++		       vsock->rx_bounce_reserve >= pool_size)
++			vsock->rx_zc_max--;
++
++		if (vsock->rx_zc_max == 0) {
++			vsock->rx_bounce_reserve = 0;
++			dev_warn(&vdev->dev,
++				 "DMB pool too small for zero-copy RX; falling back to heap mode (pool=%zu, slot=%zu)\n",
++				 pool_size, slot_size);
++		}
+ 
++		vsock->rx_pool_min = (size_t)vsock->rx_zc_max * slot_size +
++				     vsock->rx_bounce_reserve;
++		vsock->tx_pool_min = pool_size - vsock->rx_pool_min;
++
++		dev_info(&vdev->dev,
++			 "DMB zero-copy (pool=%zu, slot=%zu, rx_zc_max=%d/%zu, tx_min=%zu, rx_min=%zu, bounce_reserve=%zu)\n",
++			 pool_size, slot_size, vsock->rx_zc_max,
++			 pool_size / slot_size, vsock->tx_pool_min,
++			 vsock->rx_pool_min, vsock->rx_bounce_reserve);
++	}
++#endif
+ 
+ 	mutex_init(&vsock->tx_lock);
+ 	mutex_init(&vsock->rx_lock);
+diff --git a/net/vmw_vsock/virtio_transport_common.c b/net/vmw_vsock/virtio_transport_common.c
+index d93735d..d44bbff 100644
+--- a/net/vmw_vsock/virtio_transport_common.c
++++ b/net/vmw_vsock/virtio_transport_common.c
+@@ -222,7 +222,22 @@ static struct sk_buff *virtio_transport_alloc_skb(struct virtio_vsock_pkt_info *
+ 	if (!zcopy)
+ 		skb_len += payload_len;
+ 
+-	skb = virtio_vsock_alloc_skb(skb_len, GFP_KERNEL);
++	skb = NULL;
++	if (info->vsk && !zcopy) {
++		const struct vsock_transport *vt;
++
++		vt = vsock_core_get_transport(info->vsk);
++		if (vt) {
++			const struct virtio_transport *t_ops;
++
++			t_ops = container_of(vt, struct virtio_transport,
++					     transport);
++			if (t_ops->alloc_skb)
++				skb = t_ops->alloc_skb(skb_len, GFP_KERNEL);
++		}
++	}
++	if (!skb)
++		skb = virtio_vsock_alloc_skb(skb_len, GFP_KERNEL);
+ 	if (!skb)
+ 		return NULL;
+ 
+@@ -1630,7 +1645,6 @@ void virtio_transport_recv_pkt(struct virtio_transport *t,
+ 			goto free_pkt;
+ 		}
+ 	}
+-
+ 	if (virtio_transport_get_type(sk) != le16_to_cpu(hdr->type)) {
+ 		(void)virtio_transport_reset_no_sock(t, skb);
+ 		sock_put(sk);
+-- 
+2.40.1
