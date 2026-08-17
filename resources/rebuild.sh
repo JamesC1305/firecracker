@@ -242,6 +242,7 @@ function build_al_kernels {
     NVME_CONFIG="$PWD/guest_configs/nvme.config"
     EFI_CONFIG="$PWD/guest_configs/efi.config"
     PCIEHP_CONFIG="$PWD/guest_configs/pciehp.config"
+    DMB_CONFIG="$PWD/guest_configs/dmb.config"
 
     if [[ "$KERNEL_VERSION" == @(all|5.10) ]]; then
         build_al_kernel $PWD/guest_configs/microvm-kernel-ci-$ARCH-5.10.config "$CI_CONFIG" "$NVME_CONFIG" "$EFI_CONFIG" "$PCIEHP_CONFIG"
@@ -253,7 +254,7 @@ function build_al_kernels {
         build_al_kernel $PWD/guest_configs/microvm-kernel-ci-$ARCH-6.1.config "$CI_CONFIG" "$NVME_CONFIG" "$EFI_CONFIG" "$PCIEHP_CONFIG"
     fi
     if [[ "$KERNEL_VERSION" == @(all|6.18) ]]; then
-        build_al_kernel $PWD/guest_configs/microvm-kernel-ci-$ARCH-6.18.config "$CI_CONFIG" "$NVME_CONFIG" "$EFI_CONFIG" "$PCIEHP_CONFIG"
+        build_al_kernel $PWD/guest_configs/microvm-kernel-ci-$ARCH-6.18.config "$CI_CONFIG" "$NVME_CONFIG" "$EFI_CONFIG" "$PCIEHP_CONFIG" "$DMB_CONFIG"
     fi
 
     # Build debug kernels
@@ -270,7 +271,7 @@ function build_al_kernels {
         vmlinux_split_debuginfo $OUTPUT_DIR/vmlinux-6.1.*
     fi
     if [[ "$KERNEL_VERSION" == @(all|6.18) ]]; then
-        build_al_kernel "$PWD/guest_configs/microvm-kernel-ci-$ARCH-6.18.config" "$CI_CONFIG" "$NVME_CONFIG" "$EFI_CONFIG" "$PCIEHP_CONFIG" "$FTRACE_CONFIG" "$DEBUG_CONFIG"
+        build_al_kernel "$PWD/guest_configs/microvm-kernel-ci-$ARCH-6.18.config" "$CI_CONFIG" "$NVME_CONFIG" "$EFI_CONFIG" "$PCIEHP_CONFIG" "$DMB_CONFIG" "$FTRACE_CONFIG" "$DEBUG_CONFIG"
         vmlinux_split_debuginfo $OUTPUT_DIR/vmlinux-6.18.*
     fi
 }
