@@ -17,6 +17,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import time
 import uuid
 from collections import namedtuple
@@ -657,6 +658,7 @@ class Microvm:
         metrics_path="fc.ndjson",
         emit_metrics: bool = False,
         validate_api: bool = True,
+        wait_for_api: bool = True,
     ):
         """Start a microVM as a daemon or in a screen session."""
         # pylint: disable=subprocess-run-check
@@ -745,20 +747,18 @@ class Microvm:
         # responsiveness / API availability.
         # If we are using a config file and it has a network device specified,
         # use SSH to wait until guest userspace is available. If we are
-        # using the API, wait until the log message indicating the API server
-        # has finished initializing is printed (if logging is enabled), or
-        # until the API socket file has been created.
-        # If none of these apply, do a last ditch effort to make sure the
-        # Firecracker process itself at least came up by checking
+        # using the API, wait until Firecracker accepts connections on the
+        # API socket. If none of these apply, do a last ditch effort to make
+        # sure the Firecracker process itself at least came up by checking
         # for the startup log message. Otherwise, you're on your own kid.
         if "config-file" in self.jailer.extra_args and self.iface:
             assert not serial_out_path
             self.wait_for_ssh_up()
         elif "no-api" not in self.jailer.extra_args:
-            if self.log_file and log_level in ("Trace", "Debug", "Info"):
-                self.check_log_message("API server started.")
-            else:
+            if wait_for_api:
                 self._wait_for_api_socket()
+            else:
+                assert not serial_out_path
 
             if serial_out_path is not None:
                 self.api.serial.put(serial_out_path=serial_out_path)
@@ -766,14 +766,24 @@ class Microvm:
             assert not serial_out_path
             self.check_log_message("Running Firecracker")
 
-    @retry(wait=wait_fixed(0.2), stop=stop_after_attempt(5), reraise=True)
     def _wait_for_api_socket(self):
-        """Wait until the API socket and chroot folder are available."""
+        """Wait until Firecracker accepts connections on its API socket.
 
-        # We expect the jailer to start within 80 ms. However, we wait for
-        # 1 sec since we are rechecking the existence of the socket 5 times
-        # and leave 0.2 delay between them.
-        os.stat(self.jailer.api_socket_path())
+        The socket file appears as soon as Firecracker calls bind(), but
+        connect() is refused until it also calls listen(). Probing with
+        connect() instead of stat() closes that window, and works no matter
+        whether or at which level Firecracker is logging.
+        """
+        try:
+            for attempt in Retrying(
+                wait=wait_fixed(0.05), stop=stop_after_delay(5), reraise=True
+            ):
+                with attempt:
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                        sock.connect(self.jailer.api_socket_path())
+        except OSError:
+            self._dump_debug_information("API socket did not become ready")
+            raise
 
     @retry(wait=wait_fixed(0.2), stop=stop_after_attempt(5), reraise=True)
     def check_log_message(self, message):
