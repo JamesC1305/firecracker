@@ -14,6 +14,32 @@ DEFAULT_TARGET = f"{platform.machine()}-unknown-linux-musl"
 DEFAULT_TARGET_DIR = f"{DEFAULT_TARGET}/release/"
 
 
+def expand_seccomp_filters(policy):
+    """Return the filters a policy compiles, in the legacy shape, keyed by thread.
+
+    A legacy policy already maps thread categories to filters and is returned as
+    is. A structured policy (a top-level `thread_filters` or `rule_groups` key)
+    is flattened the way seccompiler does it: each thread filter gets the rules
+    of the groups it includes, in order, followed by its own rules, under
+    `filter`.
+    """
+    if "thread_filters" not in policy and "rule_groups" not in policy:
+        return policy
+
+    groups = policy.get("rule_groups", {})
+    expanded = {}
+    for name, thread_filter in policy["thread_filters"].items():
+        rules = [
+            rule for group in thread_filter.get("include", []) for rule in groups[group]
+        ]
+        expanded[name] = {
+            "default_action": thread_filter["default_action"],
+            "filter_action": thread_filter["filter_action"],
+            "filter": rules + thread_filter["rules"],
+        }
+    return expanded
+
+
 def nightly_toolchain() -> str:
     """Receives the name of the installed nightly toolchain"""
     return utils.check_output("rustup toolchain list | grep nightly").stdout.strip()

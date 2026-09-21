@@ -11,7 +11,7 @@ use serde::*;
 use crate::bindings::*;
 
 /// Comparison to perform when matching a condition.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeccompCmpOp {
     Eq,
@@ -160,9 +160,80 @@ pub struct Filter {
     pub filter: Vec<SyscallRule>,
 }
 
-/// Deserializable object that represents the Json filter file.
+/// Legacy policy layout: the file maps thread categories straight to filters.
+///
+/// Unknown keys are ignored, as they always were, so existing files keep compiling.
+pub type LegacyPolicy = BTreeMap<String, Filter>;
+
+/// Structured policy layout: shared rule groups and one filter per thread category.
+///
+/// Every key in this layout is checked; an unknown or misspelled key is a
+/// deserialization error rather than a silently ignored one.
 #[derive(Debug, Deserialize)]
-pub struct BpfJson(pub BTreeMap<String, Filter>);
+#[serde(deny_unknown_fields)]
+pub struct Policy {
+    /// Named rule lists that thread filters include. Never compiled on their own.
+    #[serde(default)]
+    pub rule_groups: BTreeMap<String, Vec<Rule>>,
+    /// The filters to compile, one per thread category.
+    pub thread_filters: BTreeMap<String, ThreadFilter>,
+}
+
+/// A thread category's filter in the structured layout.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThreadFilter {
+    pub default_action: SeccompAction,
+    pub filter_action: SeccompAction,
+    /// Rule groups whose rules precede this filter's own, in the listed order.
+    #[serde(default)]
+    pub include: Vec<String>,
+    pub rules: Vec<Rule>,
+}
+
+/// [`SyscallRule`] for the structured layout, with every key checked.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rule {
+    pub syscall: CString,
+    pub args: Option<Vec<Condition>>,
+    pub comment: Option<String>,
+}
+
+impl From<&Rule> for SyscallRule {
+    fn from(rule: &Rule) -> Self {
+        SyscallRule {
+            syscall: rule.syscall.clone(),
+            args: rule
+                .args
+                .as_ref()
+                .map(|args| args.iter().map(SeccompCondition::from).collect()),
+        }
+    }
+}
+
+/// [`SeccompCondition`] for the structured layout, with every key checked.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Condition {
+    pub index: u8,
+    pub op: SeccompCmpOp,
+    pub val: u64,
+    #[serde(rename = "type")]
+    pub val_len: SeccompCmpArgLen,
+    pub comment: Option<String>,
+}
+
+impl From<&Condition> for SeccompCondition {
+    fn from(condition: &Condition) -> Self {
+        SeccompCondition {
+            index: condition.index,
+            op: condition.op.clone(),
+            val: condition.val,
+            val_len: condition.val_len.clone(),
+        }
+    }
+}
 
 /// Supported target architectures.
 #[derive(Debug)]

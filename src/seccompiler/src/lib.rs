@@ -1,7 +1,7 @@
 // Copyright 2024 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -46,6 +46,82 @@ pub enum CompilationError {
     BitcodeSerialize(bitcode::Error),
     /// Serialized BPF exceeds size limit of {0} bytes
     SizeLimitExceeded(usize),
+    /// Filter {filter} includes unknown rule group {group}
+    MissingRuleGroup { filter: String, group: String },
+    /// Rule group {0} is not included by any filter
+    UnusedRuleGroup(String),
+}
+
+/// A policy file in either accepted layout.
+#[derive(Debug)]
+enum PolicyFile {
+    Legacy(LegacyPolicy),
+    Structured(Policy),
+}
+
+/// Parse a policy file, picking the structured layout when the top level has a
+/// `thread_filters` or `rule_groups` key and the legacy layout otherwise.
+///
+/// The file is parsed twice: once as a plain object to pick the layout, then as that
+/// layout, so that deserialization errors keep their line and column.
+fn parse_policy(content: &str) -> Result<PolicyFile, CompilationError> {
+    let top_level: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(content).map_err(CompilationError::JsonDeserialize)?;
+    let structured = ["thread_filters", "rule_groups"]
+        .iter()
+        .any(|key| top_level.contains_key(*key));
+    let policy = if structured {
+        serde_json::from_str(content).map(PolicyFile::Structured)
+    } else {
+        serde_json::from_str(content).map(PolicyFile::Legacy)
+    };
+    policy.map_err(CompilationError::JsonDeserialize)
+}
+
+/// Resolve a policy into the filters to compile, keyed by thread category.
+///
+/// A legacy policy already has that shape. In a structured policy each thread filter
+/// starts with the rules of the groups it includes, in the listed order, followed by
+/// its own rules. Every included group must exist and every group must be included.
+fn thread_filters(policy: PolicyFile) -> Result<BTreeMap<String, Filter>, CompilationError> {
+    let policy = match policy {
+        PolicyFile::Legacy(filters) => return Ok(filters),
+        PolicyFile::Structured(policy) => policy,
+    };
+
+    let mut included = BTreeSet::new();
+    let mut filters = BTreeMap::new();
+    for (name, thread_filter) in policy.thread_filters {
+        let mut rules = Vec::new();
+        for group in &thread_filter.include {
+            let group_rules = policy.rule_groups.get(group).ok_or_else(|| {
+                CompilationError::MissingRuleGroup {
+                    filter: name.clone(),
+                    group: group.clone(),
+                }
+            })?;
+            rules.extend(group_rules.iter().map(SyscallRule::from));
+            included.insert(group.clone());
+        }
+        rules.extend(thread_filter.rules.iter().map(SyscallRule::from));
+        filters.insert(
+            name,
+            Filter {
+                default_action: thread_filter.default_action,
+                filter_action: thread_filter.filter_action,
+                filter: rules,
+            },
+        );
+    }
+
+    if let Some(unused) = policy
+        .rule_groups
+        .keys()
+        .find(|group| !included.contains(*group))
+    {
+        return Err(CompilationError::UnusedRuleGroup(unused.clone()));
+    }
+    Ok(filters)
 }
 
 pub fn compile_bpf(
@@ -60,13 +136,12 @@ pub fn compile_bpf(
         .map_err(CompilationError::IntputOpen)?
         .read_to_string(&mut file_content)
         .map_err(CompilationError::InputRead)?;
-    let bpf_map_json: BpfJson =
-        serde_json::from_str(&file_content).map_err(CompilationError::JsonDeserialize)?;
+    let filters = thread_filters(parse_policy(&file_content)?)?;
 
     let arch = TargetArch::from_str(arch).map_err(CompilationError::ArchParse)?;
 
     let mut bpf_map: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-    for (name, filter) in bpf_map_json.0.iter() {
+    for (name, filter) in filters {
         let default_action = filter.default_action.to_scmp_type();
         let filter_action = filter.filter_action.to_scmp_type();
 
@@ -87,7 +162,7 @@ pub fn compile_bpf(
             }
         }
 
-        for rule in filter.filter.iter() {
+        for rule in &filter.filter {
             // SAFETY: Safe as all args are correct.
             let syscall = unsafe {
                 let r = seccomp_syscall_resolve_name(rule.syscall.as_ptr());
@@ -158,7 +233,7 @@ pub fn compile_bpf(
             }
         }
 
-        bpf_map.insert(name.clone(), bpf);
+        bpf_map.insert(name, bpf);
     }
 
     if split_output {
@@ -193,4 +268,141 @@ pub fn compile_bpf(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ACTIONS: &str = r#""default_action": "trap", "filter_action": "allow""#;
+
+    fn resolve(content: &str) -> Result<BTreeMap<String, Filter>, CompilationError> {
+        thread_filters(parse_policy(content)?)
+    }
+
+    fn syscalls(filter: &Filter) -> Vec<&str> {
+        filter
+            .filter
+            .iter()
+            .map(|rule| rule.syscall.to_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn legacy_layout_compiles_as_written() {
+        // The legacy layout has always ignored keys it does not know, `comment` included.
+        let filters = resolve(&format!(
+            r#"{{"vmm": {{{ACTIONS}, "filter": [
+                {{"syscall": "read", "comment": "shared"}},
+                {{"syscall": "write", "onyl": ["vmm"]}}
+            ]}}}}"#
+        ))
+        .unwrap();
+
+        assert_eq!(filters.keys().collect::<Vec<_>>(), ["vmm"]);
+        assert_eq!(syscalls(&filters["vmm"]), ["read", "write"]);
+    }
+
+    #[test]
+    fn structured_layout_prepends_included_groups_in_order() {
+        let filters = resolve(&format!(
+            r#"{{
+                "rule_groups": {{
+                    "a": [{{"syscall": "read", "comment": "shared", "args": [
+                        {{"index": 0, "type": "dword", "op": {{"masked_eq": 4}}, "val": 42, "comment": "flag"}}
+                    ]}}],
+                    "b": [{{"syscall": "write"}}]
+                }},
+                "thread_filters": {{
+                    "main": {{{ACTIONS}, "include": ["b", "a"], "rules": [{{"syscall": "close"}}]}},
+                    "other": {{{ACTIONS}, "include": ["a"], "rules": []}}
+                }}
+            }}"#
+        ))
+        .unwrap();
+
+        assert_eq!(syscalls(&filters["main"]), ["write", "read", "close"]);
+        assert_eq!(syscalls(&filters["other"]), ["read"]);
+        let read = &filters["other"].filter[0];
+        let condition = &read.args.as_ref().unwrap()[0];
+        assert_eq!(condition.val, 42);
+        assert!(matches!(condition.op, SeccompCmpOp::MaskedEq(4)));
+    }
+
+    #[test]
+    fn structured_layout_rejects_unknown_keys() {
+        let err = resolve(&format!(
+            r#"{{"thread_filters": {{"main": {{{ACTIONS}, "rules": [
+                {{"syscall": "read", "onyl": ["main"]}}
+            ]}}}}}}"#
+        ))
+        .unwrap_err();
+
+        assert!(matches!(err, CompilationError::JsonDeserialize(_)), "{err}");
+        assert!(err.to_string().contains("unknown field `onyl`"), "{err}");
+    }
+
+    #[test]
+    fn structured_layout_rejects_legacy_categories_beside_it() {
+        let err = resolve(&format!(
+            r#"{{
+                "thread_filters": {{"main": {{{ACTIONS}, "rules": []}}}},
+                "vmm": {{{ACTIONS}, "filter": []}}
+            }}"#
+        ))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown field `vmm`"), "{err}");
+    }
+
+    #[test]
+    fn rule_groups_key_selects_structured_layout() {
+        // Without this, a misspelled `thread_filters` would send the file to the legacy
+        // parser, which reports the rule groups as a filter missing `default_action`.
+        let err = resolve(&format!(
+            r#"{{
+                "rule_groups": {{"common": [{{"syscall": "read"}}]}},
+                "thread_filter": {{"main": {{{ACTIONS}, "include": ["common"], "rules": []}}}}
+            }}"#
+        ))
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("unknown field `thread_filter`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn included_groups_must_exist() {
+        let err = resolve(&format!(
+            r#"{{"thread_filters": {{"main": {{{ACTIONS}, "include": ["missing"], "rules": []}}}}}}"#
+        ))
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                CompilationError::MissingRuleGroup { filter, group }
+                    if filter == "main" && group == "missing"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn every_group_must_be_included() {
+        let err = resolve(&format!(
+            r#"{{
+                "rule_groups": {{"spare": [{{"syscall": "read"}}]}},
+                "thread_filters": {{"main": {{{ACTIONS}, "rules": []}}}}
+            }}"#
+        ))
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, CompilationError::UnusedRuleGroup(group) if group == "spare"),
+            "{err}"
+        );
+    }
 }

@@ -77,14 +77,52 @@ This means that Firecracker has a JSON file for each supported target (currently
 determined by the arch-libc combinations). You can view them in
 `resources/seccomp`.
 
-At the top level, the file requires an object that maps thread categories (vmm,
-api and vcpu) to seccomp filters:
+Seccompiler accepts two layouts. A top-level `thread_filters` or `rule_groups`
+key selects the structured layout, so a legacy file cannot use either name for a
+thread category.
+
+The structured layout separates shared rule groups from thread filters.
+
+```
+{
+    "rule_groups": {
+        "common": [
+            {"syscall": "read"},
+            {"syscall": "write"}
+        ]
+    },
+    "thread_filters": {
+        "vmm": {
+            "default_action": {
+                "errno" : 1
+            },
+            "filter_action": "allow",
+            "include": ["common"],
+            "rules": [...]
+        },
+        "api": {...},
+        "vcpu": {...}
+    }
+}
+```
+
+Every entry under `thread_filters` compiles to one BPF program named after its
+key. `rule_groups` holds named rule lists that are never compiled on their own;
+a filter's optional `include` prepends the listed groups' rules, in order, to
+its own `rules`. Every included group must exist and every group must be
+included by at least one filter. Every key in this layout is checked, so an
+unknown or misspelled key is a compilation error rather than a rule that is
+silently ignored. As in the legacy layout, a name repeated under `rule_groups`
+or `thread_filters` keeps only its last definition.
+
+The legacy layout maps thread categories straight to filters, with the rule list
+under `filter`:
 
 ```
 {
     "vmm": {
        "default_action": {
-            "errno" : -1
+            "errno" : 1
        },
        "filter_action": "allow",
        "filter": [...]
@@ -94,11 +132,14 @@ api and vcpu) to seccomp filters:
 }
 ```
 
-The associated filter is a JSON object containing the `default_action`,
-`filter_action` and `filter`.
+Legacy files compile as they always did, including their tolerance of unknown
+keys. New policies should use the structured layout.
+
+In both layouts a filter is a JSON object containing the `default_action`, the
+`filter_action` and its rule list.
 
 The `default_action` represents the action we have to execute if none of the
-rules in `filter` matches, and `filter_action` is what gets executed if a rule
+rules in the filter matches, and `filter_action` is what gets executed if a rule
 in the filter matches (e.g: `"Allow"` in the case of implementing an allowlist).
 
 An **action** is the JSON representation of the following enum:
@@ -114,9 +155,10 @@ pub enum SeccompAction {
 }
 ```
 
-The `filter` property specifies the set of rules that would trigger a match.
-This is an array containing multiple **or-bound SyscallRule** **objects** (if
-one of them matches, the corresponding action gets triggered).
+The rule list (`rules`, or `filter` in the legacy layout) specifies the set of
+rules that would trigger a match. This is an array containing multiple
+**or-bound SyscallRule** **objects** (if one of them matches, the corresponding
+action gets triggered).
 
 The **SyscallRule** object is used for adding a rule to a syscall. It has an
 optional `args` property that is used to specify a vector of and-bound

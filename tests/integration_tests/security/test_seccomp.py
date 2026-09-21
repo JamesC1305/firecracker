@@ -9,6 +9,7 @@ from pathlib import Path
 
 from framework import utils
 from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
+from host_tools.cargo_build import expand_seccomp_filters
 
 ARCH = platform.machine()
 
@@ -203,7 +204,7 @@ def test_seccomp_rust_panic(bin_seccomp_paths, seccompiler):
 
     fc_filters = Path(f"../resources/seccomp/{ARCH}-unknown-linux-musl.json")
     fc_filters_data = json.loads(fc_filters.read_text(encoding="ascii"))
-    filter_threads = list(fc_filters_data)
+    filter_threads = list(expand_seccomp_filters(fc_filters_data))
 
     bpf_path = seccompiler.compile(fc_filters_data)
 

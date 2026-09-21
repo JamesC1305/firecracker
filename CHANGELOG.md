@@ -10,6 +10,9 @@ and this project adheres to
 
 ### Added
 
+- Seccompiler accepts a structured policy layout with shared `rule_groups` and
+  per-thread `thread_filters`. Legacy flat policies remain supported.
+
 ### Changed
 
 - [#6201](https://github.com/firecracker-microvm/firecracker/pull/6201):
