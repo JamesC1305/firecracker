@@ -303,6 +303,8 @@ pub struct Vmm {
     pub machine_config: MachineConfig,
     boot_source_config: BootSourceConfig,
     shutdown_exit_code: Option<FcExitCode>,
+    /// Load-time snapshot state retained for in-process reset.
+    pub reset_context: Option<persist::ResetContext>,
 
     /// VM object.
     pub vm: Vm,

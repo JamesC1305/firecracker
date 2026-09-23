@@ -101,6 +101,22 @@ pub struct MicrovmState {
     pub device_states: DevicesState,
 }
 
+/// Load-time snapshot state that reset returns the microVM to.
+#[derive(Debug)]
+pub struct ResetContext {
+    /// VM state to reapply without replacing the live allocator.
+    pub vm_state: VmState,
+    /// vCPU states copied to their owning threads on each reset.
+    pub vcpu_states: Vec<VcpuState>,
+    #[cfg(target_arch = "aarch64")]
+    /// Saved vCPU affinities in KVM's GIC register attribute format.
+    pub mpidrs: Vec<u64>,
+    /// Device state to reapply while keeping host resources open.
+    pub device_states: DevicesState,
+    /// Whether snapshot load applied wall-clock time to kvmclock.
+    pub clock_realtime: bool,
+}
+
 /// This describes the mapping between Firecracker base virtual address and
 /// offset in the buffer or file backend for a guest memory region. It is used
 /// to tell an external process/thread where to populate the guest memory data
@@ -495,17 +511,31 @@ pub fn restore_from_snapshot(
         )
         .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
     };
-    builder::build_microvm_from_snapshot(
+    let vmm = builder::build_microvm_from_snapshot(
         instance_info,
         event_manager,
-        microvm_state,
+        &microvm_state,
         guest_memory,
         uffd,
         seccomp_filters,
         vm_resources,
         params.clock_realtime,
     )
-    .map_err(RestoreFromSnapshotError::Build)
+    .map_err(RestoreFromSnapshotError::Build)?;
+
+    // Reset needs the file mapping to refault snapshot pages, and dirty tracking to find
+    // the pages that changed since load.
+    if params.mem_backend.backend_type == MemBackendType::File && track_dirty_pages {
+        vmm.lock().expect("Poisoned lock").reset_context = Some(ResetContext {
+            vm_state: microvm_state.vm_state,
+            #[cfg(target_arch = "aarch64")]
+            mpidrs: crate::construct_kvm_mpidrs(&microvm_state.vcpu_states),
+            vcpu_states: microvm_state.vcpu_states,
+            device_states: microvm_state.device_states,
+            clock_realtime: params.clock_realtime,
+        });
+    }
+    Ok(vmm)
 }
 
 /// Error type for [`snapshot_state_from_file`]
@@ -758,6 +788,81 @@ mod tests {
         insert_vmclock_device(&mut vmm);
 
         vmm
+    }
+
+    /// Loads a Full snapshot of an unbooted microVM that has no virtio devices.
+    fn snapshot_load_fixture(track_dirty_pages: bool) -> (Arc<Mutex<Vmm>>, EventManager) {
+        use crate::builder::build_microvm_for_boot;
+        use crate::seccomp::get_empty_filters;
+        use crate::test_utils::mock_resources::{MockBootSourceConfig, MockVmResources};
+        use crate::vmm_config::balloon::BalloonBuilder;
+        use crate::vmm_config::snapshot::{MemBackendConfig, SnapshotType};
+
+        let boot_source = MockBootSourceConfig::new().with_default_boot_args().into();
+        let mut resources: VmResources =
+            MockVmResources::new().with_boot_source(boot_source).into();
+        // Test builds give the resources a balloon by default, and reset rejects balloons.
+        resources.balloon = BalloonBuilder::new();
+        let mut source_events = EventManager::new().unwrap();
+        let source = build_microvm_for_boot(
+            &InstanceInfo::default(),
+            &resources,
+            &mut source_events,
+            &get_empty_filters(),
+        )
+        .unwrap();
+        let state_file = TempFile::new().unwrap();
+        let memory_file = TempFile::new().unwrap();
+        {
+            let mut source = source.lock().unwrap();
+            let info = VmInfo::from(&*source);
+            create_snapshot(
+                &mut source,
+                &info,
+                &CreateSnapshotParams {
+                    snapshot_type: SnapshotType::Full,
+                    snapshot_path: state_file.as_path().to_path_buf(),
+                    mem_file_path: memory_file.as_path().to_path_buf(),
+                    sync_snapshot_files: false,
+                },
+            )
+            .unwrap();
+            source.stop(crate::FcExitCode::Ok);
+        }
+
+        let mut event_manager = EventManager::new().unwrap();
+        let vmm = restore_from_snapshot(
+            &InstanceInfo::default(),
+            &mut event_manager,
+            &get_empty_filters(),
+            &LoadSnapshotParams {
+                snapshot_path: state_file.as_path().to_path_buf(),
+                mem_backend: MemBackendConfig {
+                    backend_type: MemBackendType::File,
+                    backend_path: memory_file.as_path().to_path_buf(),
+                },
+                track_dirty_pages,
+                resume_vm: false,
+                network_overrides: Vec::new(),
+                vsock_override: None,
+                clock_realtime: false,
+                huge_pages: Default::default(),
+            },
+            &mut VmResources::default(),
+        )
+        .unwrap();
+        (vmm, event_manager)
+    }
+
+    #[test]
+    fn test_snapshot_load_reset_eligibility() {
+        for track_dirty_pages in [false, true] {
+            let (vmm, _events) = snapshot_load_fixture(track_dirty_pages);
+            assert_eq!(
+                vmm.lock().unwrap().reset_context.is_some(),
+                track_dirty_pages
+            );
+        }
     }
 
     #[test]

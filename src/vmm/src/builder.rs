@@ -325,6 +325,7 @@ pub fn build_microvm_for_boot(
         machine_config: vm_resources.machine_config.clone(),
         boot_source_config: vm_resources.boot_source.config.clone(),
         shutdown_exit_code: None,
+        reset_context: None,
         vm,
         device_manager,
     };
@@ -427,7 +428,7 @@ pub enum BuildMicrovmFromSnapshotError {
 pub fn build_microvm_from_snapshot(
     instance_info: &InstanceInfo,
     event_manager: &mut EventManager,
-    microvm_state: MicrovmState,
+    microvm_state: &MicrovmState,
     guest_memory: Vec<GuestRegionMmap>,
     uffd: Option<Uffd>,
     seccomp_filters: &BpfThreadMap,
@@ -487,7 +488,7 @@ pub fn build_microvm_from_snapshot(
     vm.restore_state(&microvm_state.vm_state, clock_realtime)?;
 
     // Restore the boot source config paths.
-    vm_resources.boot_source.config = microvm_state.vm_info.boot_source;
+    vm_resources.boot_source.config = microvm_state.vm_info.boot_source.clone();
 
     vm.set_uffd(uffd);
 
@@ -515,6 +516,7 @@ pub fn build_microvm_from_snapshot(
         machine_config: vm_resources.machine_config.clone(),
         boot_source_config: vm_resources.boot_source.config.clone(),
         shutdown_exit_code: None,
+        reset_context: None,
         vm,
         device_manager,
     };
@@ -853,6 +855,7 @@ pub(crate) mod tests {
             machine_config: MachineConfig::default(),
             boot_source_config: BootSourceConfig::default(),
             shutdown_exit_code: None,
+            reset_context: None,
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
         }
@@ -871,6 +874,7 @@ pub(crate) mod tests {
             machine_config: MachineConfig::default(),
             boot_source_config: BootSourceConfig::default(),
             shutdown_exit_code: None,
+            reset_context: None,
             vm: Vm::Kvm(vm),
             device_manager,
         }
