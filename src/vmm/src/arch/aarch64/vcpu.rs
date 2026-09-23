@@ -94,6 +94,10 @@ pub enum KvmVcpuError {
     Init(kvm_ioctls::Error),
     /// Error applying template: {0}
     ApplyCpuTemplate(VcpuArchError),
+    /// Cannot restore vcpu in place with a different target or feature set.
+    IncompatibleVcpuInit,
+    /// Cannot restore vcpu in place with a different pvtime IPA (current {0:?}, saved {1:?}).
+    IncompatiblePvtimeIpa(Option<u64>, Option<u64>),
     /// Failed to restore the state of the vcpu: {0}
     RestoreState(VcpuArchError),
     /// Failed to save the state of the vcpu: {0}
@@ -270,13 +274,7 @@ impl KvmVcpu {
 
         self.finalize_vcpu()?;
 
-        // KVM_REG_ARM64_SVE_VLS needs to be skipped after vcpu is finalized.
-        // If it is present it is handled in the code above.
-        for reg in state
-            .regs
-            .iter()
-            .filter(|reg| reg.id != KVM_REG_ARM64_SVE_VLS)
-        {
+        for reg in state.registers_after_finalize() {
             self.set_register(reg).map_err(KvmVcpuError::RestoreState)?;
         }
         self.set_mpstate(state.mp_state)
@@ -289,6 +287,31 @@ impl KvmVcpu {
         }
 
         Ok(())
+    }
+
+    /// Restores an initialized vCPU without repeating one-shot setup.
+    ///
+    /// All vCPUs must remain paused until their state and the GIC have been restored.
+    /// The caller must first complete pending userspace I/O without entering the guest.
+    /// The VM must use per-register counter offsets, not KVM_ARM_SET_COUNTER_OFFSET.
+    pub fn restore_state_in_place(&mut self, state: &VcpuState) -> Result<(), KvmVcpuError> {
+        state.validate_in_place_restore(&self.kvi, self.pvtime_ipa)?;
+
+        // kvm_vcpu_set_target() permits INIT to reset an initialized vCPU with unchanged features.
+        // Reuse the original kvi, not save_state()'s POWER_OFF-stripped copy.
+        // kvm_arch_vcpu_ioctl_vcpu_init() also handles stage-2/cache invalidation after KVM_RUN.
+        self.init_vcpu()?;
+
+        // kvm_reset_vcpu() preserves SVE finalization. kvm_arm_vcpu_finalize() and set_sve_vls()
+        // reject attempts to repeat that setup. set_id_reg() and set_imp_id_reg() accept the
+        // unchanged saved ID register values after KVM_RUN.
+        // arch_timer_set_user() restores shared VM counter offsets, so keep the saved register
+        // order and restore the GIC after kvm_timer_vcpu_reset() has cleared the timer IRQ state.
+        for reg in state.registers_after_finalize() {
+            self.set_register(reg).map_err(KvmVcpuError::RestoreState)?;
+        }
+        self.set_mpstate(state.mp_state)
+            .map_err(KvmVcpuError::RestoreState)
     }
 
     /// Dumps CPU configuration.
@@ -523,6 +546,42 @@ pub struct VcpuState {
     pub pvtime_ipa: Option<u64>,
 }
 
+impl VcpuState {
+    fn validate_in_place_restore(
+        &self,
+        kvi: &kvm_vcpu_init,
+        pvtime_ipa: Option<GuestAddress>,
+    ) -> Result<(), KvmVcpuError> {
+        // kvm_arch_vcpu_ioctl_vcpu_init() treats POWER_OFF as an ephemeral MP-state request.
+        // save_state() strips it, but every other feature word and the target must match.
+        if self.kvi.target != kvi.target
+            || (self.kvi.features[0] ^ kvi.features[0]) & !(1 << KVM_ARM_VCPU_POWER_OFF) != 0
+            || self.kvi.features[1..] != kvi.features[1..]
+        {
+            return Err(KvmVcpuError::IncompatibleVcpuInit);
+        }
+
+        // kvm_arm_pvtime_vcpu_init() runs at vCPU creation, not in kvm_reset_vcpu(). The IPA
+        // survives INIT, and kvm_arm_pvtime_set_attr() rejects even an equal second write.
+        // Neither enabling nor disabling pvtime is part of an in-place restore.
+        let pvtime_ipa = pvtime_ipa.map(|ipa| ipa.0);
+        if self.pvtime_ipa != pvtime_ipa {
+            return Err(KvmVcpuError::IncompatiblePvtimeIpa(
+                pvtime_ipa,
+                self.pvtime_ipa,
+            ));
+        }
+        Ok(())
+    }
+
+    fn registers_after_finalize(&self) -> impl Iterator<Item = Aarch64RegisterRef<'_>> {
+        // set_sve_vls() rejects writes after SVE finalization, unlike the SVE data registers.
+        self.regs
+            .iter()
+            .filter(|reg| reg.id != KVM_REG_ARM64_SVE_VLS)
+    }
+}
+
 impl Debug for VcpuState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "kvm_mp_state: {:#x}", self.mp_state.mp_state)?;
@@ -551,7 +610,7 @@ mod tests {
     use std::os::unix::io::AsRawFd;
 
     use kvm_bindings::{KVM_ARM_VCPU_PSCI_0_2, KVM_REG_SIZE_U64};
-    use vm_memory::GuestAddress;
+    use vm_memory::{Bytes, GuestAddress};
 
     use super::*;
     use crate::arch::BootProtocol;
@@ -562,6 +621,17 @@ mod tests {
     use crate::test_utils::arch_mem;
     use crate::vcpu::VcpuConfig;
     use crate::vstate::vm::tests::setup_vm_with_memory;
+
+    // KVM_REG_ARM_TIMER_CNT and KVM_REG_ARM_TIMER_CVAL have swapped architectural encodings.
+    const KVM_REG_ARM_TIMER_CNT: u64 = SYS_CNTV_CVAL_EL0;
+    const KVM_REG_ARM_TIMER_CVAL: u64 = 0x6030_0000_0013_df02;
+    // KVM_REG_ARM64_SVE_ZREG(0, 0).
+    const SVE_Z0: u64 = KVM_REG_ARM64 | KVM_REG_ARM64_SVE as u64 | KVM_REG_SIZE_U2048;
+    const X0: u64 = arm64_core_reg_id!(
+        KVM_REG_SIZE_U64,
+        offset_of!(kvm_regs, regs) + offset_of!(user_pt_regs, regs)
+    );
+    const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 
     fn setup_vcpu(mem_size: usize) -> (KvmVm, KvmVcpu) {
         let (mut vm, mut vcpu) = setup_vcpu_no_init(mem_size);
@@ -575,6 +645,116 @@ mod tests {
         let vcpu = KvmVcpu::new(0, &vm).unwrap();
 
         (vm, vcpu)
+    }
+
+    fn run_vcpu_to_shutdown(vm: &KvmVm, vcpu: &mut KvmVcpu) {
+        // hvc #0 exits to userspace through PSCI SYSTEM_OFF without pending MMIO completion.
+        vm.guest_memory()
+            .write_slice(&0xd400_0002_u32.to_le_bytes(), GuestAddress(0))
+            .unwrap();
+        vcpu.fd.set_one_reg(PC, &0_u64.to_le_bytes()).unwrap();
+        vcpu.fd
+            .set_one_reg(X0, &PSCI_SYSTEM_OFF.to_le_bytes())
+            .unwrap();
+        assert!(matches!(
+            vcpu.fd.run().unwrap(),
+            VcpuExit::SystemEvent(KVM_SYSTEM_EVENT_SHUTDOWN, _)
+        ));
+    }
+
+    #[test]
+    fn test_in_place_restore_register_selection() {
+        let regs = [
+            Aarch64RegisterRef::new(KVM_REG_ARM_TIMER_CNT, &[0x11; 8]),
+            Aarch64RegisterRef::new(KVM_REG_ARM64_SVE_VLS, &[0x22; 64]),
+            Aarch64RegisterRef::new(PC, &[0x33; 8]),
+            Aarch64RegisterRef::new(SVE_Z0, &[0x44; 256]),
+            Aarch64RegisterRef::new(KVM_REG_ARM_PTIMER_CNT, &[0x55; 8]),
+            Aarch64RegisterRef::new(KVM_REG_ARM_TIMER_CVAL, &[0x66; 8]),
+        ];
+        let mut state = VcpuState::default();
+        for reg in regs {
+            state.regs.push(reg);
+        }
+
+        let mut selected = state.registers_after_finalize();
+        for expected in [regs[0], regs[2], regs[3], regs[4], regs[5]] {
+            assert_eq!(selected.next(), Some(expected));
+        }
+        assert_eq!(selected.next(), None);
+    }
+
+    #[test]
+    fn test_in_place_restore_init_compatibility() {
+        let mut kvi = kvm_vcpu_init {
+            target: KVM_ARM_TARGET_GENERIC_V8,
+            ..Default::default()
+        };
+        kvi.features[0] = (1 << KVM_ARM_VCPU_PSCI_0_2) | (1 << KVM_ARM_VCPU_POWER_OFF);
+        let mut state = VcpuState {
+            kvi,
+            ..Default::default()
+        };
+        state.kvi.features[0] &= !(1 << KVM_ARM_VCPU_POWER_OFF);
+        assert_eq!(state.validate_in_place_restore(&kvi, None), Ok(()));
+        assert_eq!(state.validate_in_place_restore(&state.kvi, None), Ok(()));
+
+        state.kvi.target ^= 1;
+        assert_eq!(
+            state.validate_in_place_restore(&kvi, None),
+            Err(KvmVcpuError::IncompatibleVcpuInit)
+        );
+        state.kvi.target = kvi.target;
+        for index in 0..kvi.features.len() {
+            state.kvi.features[index] ^= 1 << KVM_ARM_VCPU_PSCI_0_2;
+            assert_eq!(
+                state.validate_in_place_restore(&kvi, None),
+                Err(KvmVcpuError::IncompatibleVcpuInit),
+                "feature word {index}"
+            );
+            state.kvi.features[index] ^= 1 << KVM_ARM_VCPU_PSCI_0_2;
+        }
+    }
+
+    #[test]
+    fn test_in_place_restore_pvtime_compatibility() {
+        let kvi = kvm_vcpu_init {
+            target: KVM_ARM_TARGET_GENERIC_V8,
+            ..Default::default()
+        };
+        let cases = [
+            (None, None, Ok(())),
+            (Some(0x1000), Some(0x1000), Ok(())),
+            (
+                Some(0x1000),
+                Some(0x2000),
+                Err(KvmVcpuError::IncompatiblePvtimeIpa(
+                    Some(0x1000),
+                    Some(0x2000),
+                )),
+            ),
+            (
+                Some(0x1000),
+                None,
+                Err(KvmVcpuError::IncompatiblePvtimeIpa(Some(0x1000), None)),
+            ),
+            (
+                None,
+                Some(0x1000),
+                Err(KvmVcpuError::IncompatiblePvtimeIpa(None, Some(0x1000))),
+            ),
+        ];
+        for (current_ipa, saved_ipa, expected) in cases {
+            let state = VcpuState {
+                kvi,
+                pvtime_ipa: saved_ipa,
+                ..Default::default()
+            };
+            assert_eq!(
+                state.validate_in_place_restore(&kvi, current_ipa.map(GuestAddress)),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -752,6 +932,180 @@ mod tests {
         assert!(!state.regs.is_empty());
         vcpu.restore_state(&state)
             .expect("Cannot restore state of vcpu");
+    }
+
+    #[test]
+    fn test_vcpu_restore_state_in_place_rejects_incompatible_setup() {
+        let (_vm, mut vcpu) = setup_vcpu(0x1000);
+        vcpu.fd.set_one_reg(PC, &0x1234_u64.to_le_bytes()).unwrap();
+        let mut state = vcpu.save_state().unwrap();
+        state.kvi.target ^= 1;
+        assert_eq!(
+            vcpu.restore_state_in_place(&state),
+            Err(KvmVcpuError::IncompatibleVcpuInit)
+        );
+        let mut pc = [0; 8];
+        vcpu.fd.get_one_reg(PC, &mut pc).unwrap();
+        assert_eq!(u64::from_le_bytes(pc), 0x1234);
+
+        state.kvi = vcpu.kvi;
+        state.pvtime_ipa = Some(0x100);
+        assert_eq!(
+            vcpu.restore_state_in_place(&state),
+            Err(KvmVcpuError::IncompatiblePvtimeIpa(None, Some(0x100)))
+        );
+        vcpu.fd.get_one_reg(PC, &mut pc).unwrap();
+        assert_eq!(u64::from_le_bytes(pc), 0x1234);
+    }
+
+    #[test]
+    fn test_vcpu_restore_state_in_place_after_run() {
+        let (vm, mut vcpu) = setup_vcpu(0x1000);
+        if vm
+            .fd()
+            .check_extension_raw(KVM_CAP_ARM_WRITABLE_IMP_ID_REGS.into())
+            == 1
+        {
+            vcpu.fd
+                .set_one_reg(MIDR_EL1, &0x410f_d0c0_u64.to_le_bytes())
+                .unwrap();
+        }
+        run_vcpu_to_shutdown(&vm, &mut vcpu);
+        vcpu.fd
+            .set_one_reg(KVM_REG_ARM_TIMER_CVAL, &0x1234_5678_u64.to_le_bytes())
+            .unwrap();
+        let mut state = vcpu.save_state().unwrap();
+        state.mp_state.mp_state = KVM_MP_STATE_RUNNABLE;
+        state
+            .regs
+            .iter_mut()
+            .find(|reg| reg.id == PC)
+            .unwrap()
+            .set_value(0_u64);
+        state
+            .regs
+            .iter_mut()
+            .find(|reg| reg.id == X0)
+            .unwrap()
+            .set_value(PSCI_SYSTEM_OFF);
+
+        // A large synthetic counter advance makes the rewind check independent of host timing.
+        const COUNTER_ADVANCE: u64 = 1 << 40;
+        for _ in 0..2 {
+            vcpu.fd.set_one_reg(PC, &0x80_u64.to_le_bytes()).unwrap();
+            vcpu.fd
+                .set_one_reg(KVM_REG_ARM_TIMER_CVAL, &0x8765_4321_u64.to_le_bytes())
+                .unwrap();
+            for reg in state
+                .regs
+                .iter()
+                .filter(|reg| matches!(reg.id, KVM_REG_ARM_TIMER_CNT | KVM_REG_ARM_PTIMER_CNT))
+            {
+                let advanced = reg.value::<u64, 8>().wrapping_add(COUNTER_ADVANCE);
+                vcpu.fd
+                    .set_one_reg(reg.id, &advanced.to_le_bytes())
+                    .unwrap();
+            }
+
+            vcpu.restore_state_in_place(&state).unwrap();
+            assert_eq!(vcpu.get_mpstate().unwrap(), state.mp_state);
+            let mut actual = [0; 256];
+            for reg in state.registers_after_finalize() {
+                let len = vcpu.fd.get_one_reg(reg.id, &mut actual).unwrap();
+                if matches!(reg.id, KVM_REG_ARM_TIMER_CNT | KVM_REG_ARM_PTIMER_CNT) {
+                    let now = u64::from_le_bytes(actual[..8].try_into().unwrap());
+                    assert!(
+                        now.wrapping_sub(reg.value::<u64, 8>()) < COUNTER_ADVANCE / 2,
+                        "counter {:#x} did not rewind",
+                        reg.id
+                    );
+                } else {
+                    assert_eq!(&actual[..len], reg.as_slice(), "register {:#x}", reg.id);
+                }
+            }
+            assert!(matches!(
+                vcpu.fd.run().unwrap(),
+                VcpuExit::SystemEvent(KVM_SYSTEM_EVENT_SHUTDOWN, _)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_vcpu_restore_state_in_place_preserves_secondary_init() {
+        let mut vm = setup_vm_with_memory(0x1000);
+        let mut boot_vcpu = KvmVcpu::new(0, &vm).unwrap();
+        let mut vcpu = KvmVcpu::new(1, &vm).unwrap();
+        boot_vcpu.init(&[]).unwrap();
+        vcpu.init(&[]).unwrap();
+        vm.setup_irqchip(2).unwrap();
+        let mut state = vcpu.save_state().unwrap();
+        state.mp_state.mp_state = KVM_MP_STATE_RUNNABLE;
+
+        for _ in 0..2 {
+            vcpu.restore_state_in_place(&state).unwrap();
+            assert_ne!(vcpu.kvi.features[0] & (1 << KVM_ARM_VCPU_POWER_OFF), 0);
+            assert_eq!(vcpu.get_mpstate().unwrap(), state.mp_state);
+        }
+    }
+
+    #[test]
+    fn test_vcpu_restore_state_in_place_preserves_pvtime() {
+        let (vm, mut vcpu) = setup_vcpu(0x1000);
+        if !vcpu.supports_pvtime() {
+            return;
+        }
+        let ipa = GuestAddress(0x100);
+        vcpu.enable_pvtime(ipa).unwrap();
+        run_vcpu_to_shutdown(&vm, &mut vcpu);
+        let state = vcpu.save_state().unwrap();
+        for _ in 0..2 {
+            vcpu.restore_state_in_place(&state).unwrap();
+        }
+
+        let attr = kvm_device_attr {
+            group: KVM_ARM_VCPU_PVTIME_CTRL,
+            attr: KVM_ARM_VCPU_PVTIME_IPA as u64,
+            addr: &ipa.0 as *const u64 as u64,
+            flags: 0,
+        };
+        assert_eq!(
+            vcpu.fd.set_device_attr(&attr),
+            Err(kvm_ioctls::Error::new(libc::EEXIST))
+        );
+    }
+
+    #[test]
+    fn test_vcpu_restore_state_in_place_preserves_sve() {
+        let (mut vm, mut vcpu) = setup_vcpu_no_init(0x1000);
+        if vm.fd().check_extension_raw(KVM_CAP_ARM_SVE.into()) == 0 {
+            return;
+        }
+        vcpu.init(&[VcpuFeatures {
+            index: 0,
+            bitmap: RegisterValueFilter {
+                filter: 1 << KVM_ARM_VCPU_SVE,
+                value: 1 << KVM_ARM_VCPU_SVE,
+            },
+        }])
+        .unwrap();
+        vm.setup_irqchip(1).unwrap();
+        run_vcpu_to_shutdown(&vm, &mut vcpu);
+        let mut state = vcpu.save_state().unwrap();
+        let mut expected = [0; 256];
+        expected[..16].fill(0x5a);
+        state
+            .regs
+            .iter_mut()
+            .find(|reg| reg.id == SVE_Z0)
+            .unwrap()
+            .set_value(expected);
+
+        for _ in 0..2 {
+            vcpu.restore_state_in_place(&state).unwrap();
+            let mut actual = [0; 256];
+            vcpu.fd.get_one_reg(SVE_Z0, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

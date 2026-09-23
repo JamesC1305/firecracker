@@ -35,6 +35,9 @@ pub const VCPU_RTSIG_OFFSET: i32 = 0;
 /// Maximum time to wait for a vCPU thread to exit when dropping its handle.
 const VCPU_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Maximum KVM_RUN calls used to finish pending userspace I/O before reset.
+const MAX_IO_COMPLETION_RUNS: usize = 16;
+
 /// Errors associated with the wrappers over KVM ioctls.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum VcpuError {
@@ -48,6 +51,12 @@ pub enum VcpuError {
     UnhandledKvmExit(String),
     /// Failed to run action on vcpu: {0}
     VcpuResponse(KvmVcpuError),
+    /// Failed to complete pending userspace I/O: {0}
+    CompletePendingIo(errno::Error),
+    /// Unexpected KVM exit {0} while completing pending userspace I/O.
+    UnexpectedIoCompletionExit(u32),
+    /// Pending userspace I/O did not complete after {0} KVM_RUN calls.
+    IoCompletionLimit(usize),
     /// Cannot spawn a new vCPU thread: {0}
     VcpuSpawn(io::Error),
     /// Vcpu not present in TLS
@@ -285,11 +294,18 @@ impl Vcpu {
                     .send(VcpuResponse::Resumed)
                     .expect("vcpu channel unexpectedly closed");
             }
-            // SaveState cannot be performed on a running Vcpu.
-            Ok(VcpuEvent::SaveState) => {
+            // Saving or restoring state cannot be performed on a running vCPU.
+            Ok(VcpuEvent::SaveState) | Ok(VcpuEvent::RestoreState(_)) => {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
                         "save/restore unavailable while running",
+                    )))
+                    .expect("vcpu channel unexpectedly closed");
+            }
+            Ok(VcpuEvent::CompleteIo) => {
+                self.response_sender
+                    .send(VcpuResponse::NotAllowed(String::from(
+                        "I/O completion is unavailable while running",
                     )))
                     .expect("vcpu channel unexpectedly closed");
             }
@@ -312,6 +328,46 @@ impl Vcpu {
         }
 
         state
+    }
+
+    /// Completes pending userspace I/O without entering the guest.
+    ///
+    /// Completion can write guest RAM, so pending I/O must finish before reset reverts memory.
+    fn complete_pending_io(&mut self) -> Result<(), VcpuError> {
+        let immediate_exit = self.kvm_vcpu.fd.get_kvm_run().immediate_exit;
+        self.kvm_vcpu.fd.set_kvm_immediate_exit(1);
+
+        // Both x86 and arm64 kvm_arch_vcpu_ioctl_run() complete userspace I/O before honoring
+        // immediate_exit. run_emulation() skips that ioctl when immediate_exit is set.
+        let mut runs = 0;
+        let result = loop {
+            runs += 1;
+            let emulation = match self.kvm_vcpu.fd.run() {
+                Err(err) if err.errno() == libc::EINTR => break Ok(()),
+                Err(err) => break Err(VcpuError::CompletePendingIo(err)),
+                Ok(exit @ (VcpuExit::MmioRead(_, _) | VcpuExit::MmioWrite(_, _))) => {
+                    handle_kvm_exit(&mut self.kvm_vcpu.peripherals, Ok(exit))
+                }
+                #[cfg(target_arch = "x86_64")]
+                Ok(exit @ (VcpuExit::IoIn(_, _) | VcpuExit::IoOut(_, _))) => {
+                    handle_kvm_exit(&mut self.kvm_vcpu.peripherals, Ok(exit))
+                }
+                Ok(_) => {
+                    break Err(VcpuError::UnexpectedIoCompletionExit(
+                        self.kvm_vcpu.fd.get_kvm_run().exit_reason,
+                    ));
+                }
+            };
+            if let Err(err) = emulation {
+                break Err(err);
+            }
+            // Handle the last exit before stopping so a later RUN has valid response data.
+            if runs == MAX_IO_COMPLETION_RUNS {
+                break Err(VcpuError::IoCompletionLimit(MAX_IO_COMPLETION_RUNS));
+            }
+        };
+        self.kvm_vcpu.fd.set_kvm_immediate_exit(immediate_exit);
+        result
     }
 
     // This is the main loop of the `Paused` state.
@@ -353,6 +409,37 @@ impl Vcpu {
                             .expect("vcpu channel unexpectedly closed");
                     });
 
+                VcpuRunState::Paused
+            }
+            Ok(VcpuEvent::CompleteIo) => {
+                let response = match self.complete_pending_io() {
+                    Ok(()) => VcpuResponse::IoCompleted,
+                    Err(err) => VcpuResponse::Error(err),
+                };
+                self.response_sender
+                    .send(response)
+                    .expect("vcpu channel unexpectedly closed");
+                VcpuRunState::Paused
+            }
+            Ok(VcpuEvent::RestoreState(state)) => {
+                // Reset completes old I/O before reverting RAM, with no intervening resume.
+                // Keep this defensive completion before any saved KVM_SET operation.
+                let result = self.complete_pending_io().and_then(|()| {
+                    // On x86_64, snapshot load already set the TSC frequency, which nothing
+                    // changes afterwards, so only the saved state needs restoring.
+                    #[cfg(target_arch = "x86_64")]
+                    let result = self.kvm_vcpu.restore_state(&state);
+                    #[cfg(target_arch = "aarch64")]
+                    let result = self.kvm_vcpu.restore_state_in_place(&state);
+                    result.map_err(VcpuError::VcpuResponse)
+                });
+                let response = match result {
+                    Ok(()) => VcpuResponse::RestoredState,
+                    Err(err) => VcpuResponse::Error(err),
+                };
+                self.response_sender
+                    .send(response)
+                    .expect("vcpu channel unexpectedly closed");
                 VcpuRunState::Paused
             }
             Ok(VcpuEvent::DumpCpuConfig) => {
@@ -530,7 +617,7 @@ fn handle_kvm_exit(
 }
 
 /// List of events that the Vcpu can receive.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum VcpuEvent {
     /// The vCPU thread will end when receiving this message.
     Finish,
@@ -540,6 +627,10 @@ pub enum VcpuEvent {
     Resume,
     /// Event to save the state of a paused Vcpu.
     SaveState,
+    /// Complete pending userspace I/O on a paused vCPU before reverting memory or devices.
+    CompleteIo,
+    /// Event to restore the state of a paused vCPU.
+    RestoreState(Box<VcpuState>),
     /// Event to dump CPU configuration of a paused Vcpu.
     DumpCpuConfig,
 }
@@ -558,6 +649,10 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu state is saved.
     SavedState(Box<VcpuState>),
+    /// Pending userspace I/O has completed without guest entry.
+    IoCompleted,
+    /// Vcpu state is restored.
+    RestoredState,
     /// Vcpu is in the state where CPU config is dumped.
     DumpedCpuConfig(Box<CpuConfiguration>),
 }
@@ -570,6 +665,8 @@ impl fmt::Debug for VcpuResponse {
             Resumed => write!(f, "VcpuResponse::Resumed"),
             Exited(code) => write!(f, "VcpuResponse::Exited({:?})", code),
             SavedState(_) => write!(f, "VcpuResponse::SavedState"),
+            IoCompleted => write!(f, "VcpuResponse::IoCompleted"),
+            RestoredState => write!(f, "VcpuResponse::RestoredState"),
             Error(err) => write!(f, "VcpuResponse::Error({:?})", err),
             NotAllowed(reason) => write!(f, "VcpuResponse::NotAllowed({})", reason),
             DumpedCpuConfig(_) => write!(f, "VcpuResponse::DumpedCpuConfig"),
@@ -694,6 +791,7 @@ pub(crate) mod tests {
     use std::sync::{Arc, Barrier, Mutex};
 
     use linux_loader::loader::KernelLoader;
+    use vm_memory::Bytes;
     use vmm_sys_util::errno;
 
     use super::*;
@@ -841,7 +939,7 @@ pub(crate) mod tests {
             use crate::VcpuResponse::*;
             // Guard match with no wildcard to make sure we catch new enum variants.
             match self {
-                Paused | Resumed | Exited(_) => (),
+                Paused | Resumed | IoCompleted | RestoredState | Exited(_) => (),
                 Error(_) | NotAllowed(_) | SavedState(_) | DumpedCpuConfig(_) => (),
             };
             match (self, other) {
@@ -849,6 +947,8 @@ pub(crate) mod tests {
                 (Exited(code), Exited(other_code)) => code == other_code,
                 (NotAllowed(_), NotAllowed(_))
                 | (SavedState(_), SavedState(_))
+                | (IoCompleted, IoCompleted)
+                | (RestoredState, RestoredState)
                 | (DumpedCpuConfig(_), DumpedCpuConfig(_)) => true,
                 (Error(err), Error(other_err)) => {
                     format!("{:?}", err) == format!("{:?}", other_err)
@@ -1053,6 +1153,497 @@ pub(crate) mod tests {
             vcpu.kvm_vcpu.fd.get_kvm_run().immediate_exit,
             "Immediate Exit should have been disabled by sending Resume to a paused VM"
         )
+    }
+
+    // The restore test changes one register to prove that the saved state reached KVM.
+    #[cfg(target_arch = "x86_64")]
+    fn marker_register(state: &VcpuState) -> u64 {
+        state.regs.rax
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_marker_register(state: &mut VcpuState, value: u64) {
+        state.regs.rax = value;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn marker_register(state: &VcpuState) -> u64 {
+        use crate::arch::aarch64::regs::PC;
+        state.regs.iter().find(|reg| reg.id == PC).unwrap().value()
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn set_marker_register(state: &mut VcpuState, value: u64) {
+        use crate::arch::aarch64::regs::PC;
+        let mut pc = state.regs.iter_mut().find(|reg| reg.id == PC).unwrap();
+        pc.set_value(value);
+    }
+
+    fn save_vcpu_state(handle: &mut VcpuHandle) -> Box<VcpuState> {
+        handle.send_event(VcpuEvent::SaveState).unwrap();
+        match handle
+            .response_receiver()
+            .recv_timeout(RECV_TIMEOUT_SEC)
+            .unwrap()
+        {
+            VcpuResponse::SavedState(state) => state,
+            response => panic!("unexpected vCPU response: {response:?}"),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[derive(Default)]
+    struct IoCompletionState {
+        reads: std::sync::atomic::AtomicUsize,
+        writes: std::sync::atomic::AtomicUsize,
+        written_byte: std::sync::atomic::AtomicU8,
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    struct IoCompletionDevice {
+        state: Arc<IoCompletionState>,
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    impl BusDevice for IoCompletionDevice {
+        fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
+            self.state.reads.fetch_add(1, Ordering::Relaxed);
+            for (index, byte) in data.iter_mut().enumerate() {
+                *byte = u8::try_from(offset + index as u64 + 1).unwrap();
+            }
+        }
+
+        fn write(&mut self, _base: u64, _offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+            assert_eq!(data.len(), 1);
+            self.state.writes.fetch_add(1, Ordering::Relaxed);
+            self.state.written_byte.store(data[0], Ordering::Relaxed);
+            None
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn vcpu_with_pending_string_io(
+        program: &[u8],
+        count: u64,
+        state: Arc<IoCompletionState>,
+    ) -> (KvmVm, Vcpu, Arc<Mutex<IoCompletionDevice>>) {
+        let (vm, mut vcpu) = setup_vcpu(0x1000);
+        vm.guest_memory()
+            .write_slice(program, GuestAddress(0))
+            .unwrap();
+        vm.guest_memory()
+            .write_slice(&[0xcc; 32], GuestAddress(0x400))
+            .unwrap();
+        vcpu.kvm_vcpu
+            .fd
+            .set_cpuid2(&vm.kvm().supported_cpuid)
+            .unwrap();
+        let mut sregs = vcpu.kvm_vcpu.fd.get_sregs().unwrap();
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        sregs.ds.base = 0;
+        sregs.ds.selector = 0;
+        sregs.es.base = 0;
+        sregs.es.selector = 0;
+        vcpu.kvm_vcpu.fd.set_sregs(&sregs).unwrap();
+        set_pending_io_registers(&mut vcpu, 0, 0);
+        let mut regs = vcpu.kvm_vcpu.fd.get_regs().unwrap();
+        regs.rsi = 0x2000;
+        regs.rdi = 0x400;
+        regs.rcx = count;
+        vcpu.kvm_vcpu.fd.set_regs(&regs).unwrap();
+
+        let device = Arc::new(Mutex::new(IoCompletionDevice { state }));
+        let mmio_bus = Arc::new(Bus::new());
+        mmio_bus.insert(device.clone(), 0x2000, 0x100).unwrap();
+        vcpu.set_mmio_bus(mmio_bus);
+        let pio_bus = Arc::new(Bus::new());
+        pio_bus.insert(device.clone(), 0x1234, 1).unwrap();
+        vcpu.kvm_vcpu.peripherals.pio_bus = Some(pio_bus);
+
+        let exit = vcpu.kvm_vcpu.fd.run().unwrap();
+        assert!(matches!(exit, VcpuExit::MmioRead(0x2000, _)), "{exit:?}");
+        handle_kvm_exit(&mut vcpu.kvm_vcpu.peripherals, Ok(exit)).unwrap();
+        (vm, vcpu, device)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn complete_io_event(vcpu: &mut Vcpu) -> VcpuResponse {
+        vcpu.event_sender
+            .as_ref()
+            .unwrap()
+            .send(VcpuEvent::CompleteIo)
+            .unwrap();
+        assert!(matches!(vcpu.paused(), VcpuRunState::Paused));
+        vcpu.response_receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(RECV_TIMEOUT_SEC)
+            .unwrap()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PendingIo {
+        MmioRead,
+        MmioWrite,
+        #[cfg(target_arch = "x86_64")]
+        PioIn,
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn pending_io_program(io: PendingIo) -> &'static [u8] {
+        match io {
+            // Real-mode mov eax, [0x2000] and mov [0x2000], eax.
+            PendingIo::MmioRead => &[0x66, 0xa1, 0x00, 0x20],
+            PendingIo::MmioWrite => &[0x66, 0xa3, 0x00, 0x20],
+            // Real-mode in eax, dx.
+            PendingIo::PioIn => &[0x66, 0xed],
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn pending_io_program(io: PendingIo) -> &'static [u8] {
+        match io {
+            // ldr w1, [x0] and str w1, [x0].
+            PendingIo::MmioRead => &[0x01, 0x00, 0x40, 0xb9],
+            PendingIo::MmioWrite => &[0x01, 0x00, 0x00, 0xb9],
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn set_pending_io_registers(vcpu: &mut Vcpu, pc: u64, value: u64) {
+        let mut regs = vcpu.kvm_vcpu.fd.get_regs().unwrap();
+        regs.rip = pc;
+        regs.rax = value;
+        regs.rdx = 0x1234;
+        regs.rflags = 2;
+        vcpu.kvm_vcpu.fd.set_regs(&regs).unwrap();
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn set_pending_io_registers(vcpu: &mut Vcpu, pc: u64, value: u64) {
+        use crate::arch::aarch64::regs::PC;
+
+        vcpu.kvm_vcpu.fd.set_one_reg(PC, &pc.to_le_bytes()).unwrap();
+        // Core register IDs for X0 (MMIO address) and X1 (I/O data).
+        vcpu.kvm_vcpu
+            .fd
+            .set_one_reg(0x6030_0000_0010_0000, &0x2000_u64.to_le_bytes())
+            .unwrap();
+        vcpu.kvm_vcpu
+            .fd
+            .set_one_reg(0x6030_0000_0010_0002, &value.to_le_bytes())
+            .unwrap();
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn pending_io_registers(vcpu: &Vcpu) -> (u64, u64) {
+        let regs = vcpu.kvm_vcpu.fd.get_regs().unwrap();
+        (regs.rip, regs.rax)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn pending_io_registers(vcpu: &Vcpu) -> (u64, u64) {
+        use crate::arch::aarch64::regs::PC;
+
+        let mut pc = [0; 8];
+        let mut value = [0; 8];
+        vcpu.kvm_vcpu.fd.get_one_reg(PC, &mut pc).unwrap();
+        vcpu.kvm_vcpu
+            .fd
+            .get_one_reg(0x6030_0000_0010_0002, &mut value)
+            .unwrap();
+        (u64::from_le_bytes(pc), u64::from_le_bytes(value))
+    }
+
+    fn check_restore_completes_pending_io(
+        io: PendingIo,
+        saved_pc: u64,
+        saved_mp_state: u32,
+        immediate_exit: u8,
+    ) {
+        const SAVED_VALUE: u64 = 0x1122_3344;
+        const IO_VALUE: u32 = 0xdead_beef;
+        let (vm, mut vcpu) = setup_vcpu(0x1000);
+        let program = pending_io_program(io);
+        // A mistaken guest entry exits on another I/O instruction instead of hanging.
+        for pc in [
+            0,
+            program.len() as u64,
+            saved_pc,
+            saved_pc + program.len() as u64,
+        ] {
+            vm.guest_memory()
+                .write_slice(program, GuestAddress(pc))
+                .unwrap();
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            vcpu.kvm_vcpu
+                .fd
+                .set_cpuid2(&vm.kvm().supported_cpuid)
+                .unwrap();
+            let mut sregs = vcpu.kvm_vcpu.fd.get_sregs().unwrap();
+            sregs.cs.base = 0;
+            sregs.cs.selector = 0;
+            sregs.ds.base = 0;
+            sregs.ds.selector = 0;
+            vcpu.kvm_vcpu.fd.set_sregs(&sregs).unwrap();
+        }
+        set_pending_io_registers(&mut vcpu, saved_pc, SAVED_VALUE);
+
+        // Complete first-RUN setup before capturing the clean snapshot, without guest entry.
+        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
+        assert_eq!(vcpu.kvm_vcpu.fd.run().unwrap_err().errno(), libc::EINTR);
+        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(0);
+        vcpu.kvm_vcpu
+            .fd
+            .set_mp_state(kvm_bindings::kvm_mp_state {
+                mp_state: saved_mp_state,
+            })
+            .unwrap();
+        let state = vcpu.kvm_vcpu.save_state().unwrap();
+
+        vcpu.kvm_vcpu
+            .fd
+            .set_mp_state(kvm_bindings::kvm_mp_state {
+                mp_state: kvm_bindings::KVM_MP_STATE_RUNNABLE,
+            })
+            .unwrap();
+        set_pending_io_registers(&mut vcpu, 0, u64::from(IO_VALUE));
+        match (io, vcpu.kvm_vcpu.fd.run().unwrap()) {
+            (PendingIo::MmioRead, VcpuExit::MmioRead(address, data)) => {
+                assert_eq!(address, 0x2000);
+                data.copy_from_slice(&IO_VALUE.to_le_bytes());
+            }
+            (PendingIo::MmioWrite, VcpuExit::MmioWrite(address, data)) => {
+                assert_eq!(address, 0x2000);
+                assert_eq!(data, IO_VALUE.to_le_bytes());
+            }
+            #[cfg(target_arch = "x86_64")]
+            (PendingIo::PioIn, VcpuExit::IoIn(port, data)) => {
+                assert_eq!(port, 0x1234);
+                data.copy_from_slice(&IO_VALUE.to_le_bytes());
+            }
+            (_, exit) => panic!("unexpected pending {io:?} exit: {exit:?}"),
+        }
+
+        // Leave the response pending, including when the ARM vCPU has been powered off.
+        vcpu.kvm_vcpu
+            .fd
+            .set_mp_state(kvm_bindings::kvm_mp_state {
+                mp_state: saved_mp_state,
+            })
+            .unwrap();
+        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(immediate_exit);
+        vcpu.event_sender
+            .as_ref()
+            .unwrap()
+            .send(VcpuEvent::RestoreState(Box::new(state)))
+            .unwrap();
+        assert!(matches!(vcpu.paused(), VcpuRunState::Paused));
+        let response = vcpu
+            .response_receiver
+            .as_ref()
+            .unwrap()
+            .recv_timeout(RECV_TIMEOUT_SEC)
+            .unwrap();
+        assert!(
+            matches!(response, VcpuResponse::RestoredState),
+            "{response:?}"
+        );
+        assert_eq!(
+            vcpu.kvm_vcpu.fd.get_kvm_run().immediate_exit,
+            immediate_exit
+        );
+        assert_eq!(
+            vcpu.kvm_vcpu.fd.get_mp_state().unwrap().mp_state,
+            saved_mp_state
+        );
+        assert_eq!(pending_io_registers(&vcpu), (saved_pc, SAVED_VALUE));
+
+        // A leftover completion would overwrite the restored PC/data before returning EINTR.
+        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
+        assert_eq!(vcpu.kvm_vcpu.fd.run().unwrap_err().errno(), libc::EINTR);
+        assert_eq!(pending_io_registers(&vcpu), (saved_pc, SAVED_VALUE));
+    }
+
+    #[test]
+    fn test_vcpu_restore_state_completes_pending_mmio_read() {
+        check_restore_completes_pending_io(
+            PendingIo::MmioRead,
+            0x100,
+            kvm_bindings::KVM_MP_STATE_RUNNABLE,
+            1,
+        );
+    }
+
+    #[test]
+    fn test_vcpu_restore_state_completes_pending_mmio_write() {
+        check_restore_completes_pending_io(
+            PendingIo::MmioWrite,
+            0x100,
+            kvm_bindings::KVM_MP_STATE_RUNNABLE,
+            0,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_vcpu_restore_state_completes_pending_pio() {
+        // Fast PIO completion checks RIP, so use an earlier snapshot at the same instruction.
+        check_restore_completes_pending_io(
+            PendingIo::PioIn,
+            0,
+            kvm_bindings::KVM_MP_STATE_RUNNABLE,
+            0,
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_vcpu_restore_state_completes_pending_mmio_stopped() {
+        check_restore_completes_pending_io(
+            PendingIo::MmioRead,
+            0x100,
+            kvm_bindings::KVM_MP_STATE_STOPPED,
+            1,
+        );
+    }
+
+    #[test]
+    fn test_vcpu_complete_io_events() {
+        let (_vm, mut handle, _) = vcpu_configured_for_boot();
+        queue_event_expect_response(
+            &mut handle,
+            VcpuEvent::CompleteIo,
+            VcpuResponse::IoCompleted,
+        );
+        queue_event_expect_response(&mut handle, VcpuEvent::Resume, VcpuResponse::Resumed);
+        queue_event_expect_response(
+            &mut handle,
+            VcpuEvent::CompleteIo,
+            VcpuResponse::NotAllowed(String::new()),
+        );
+        queue_event_expect_response(&mut handle, VcpuEvent::Pause, VcpuResponse::Paused);
+        queue_event_expect_response(
+            &mut handle,
+            VcpuEvent::CompleteIo,
+            VcpuResponse::IoCompleted,
+        );
+        handle.send_event(VcpuEvent::Finish).unwrap();
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_vcpu_complete_io_handles_pio_continuation() {
+        // outsb from MMIO first exits for a memory read, then for the port write.
+        // The following MMIO loop makes an unintended guest entry return to userspace.
+        let state = Arc::new(IoCompletionState::default());
+        let (_vm, mut vcpu, _device) = vcpu_with_pending_string_io(
+            &[0x6e, 0x66, 0xa1, 0x00, 0x20, 0xeb, 0xfa],
+            1,
+            state.clone(),
+        );
+        let response = complete_io_event(&mut vcpu);
+        assert!(
+            matches!(response, VcpuResponse::IoCompleted),
+            "{response:?}"
+        );
+        assert_eq!(state.writes.load(Ordering::Relaxed), 1);
+        assert_eq!(state.written_byte.load(Ordering::Relaxed), 1);
+        assert_eq!(vcpu.kvm_vcpu.fd.get_regs().unwrap().rip, 1);
+        assert_eq!(vcpu.kvm_vcpu.fd.get_kvm_run().immediate_exit, 0);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_vcpu_complete_io_limit_keeps_response_valid() {
+        // REP MOVSB reads MMIO and writes RAM one byte at a time without guest re-entry.
+        // The following MMIO loop makes an unintended guest entry return to userspace.
+        let state = Arc::new(IoCompletionState::default());
+        let (vm, mut vcpu, _device) = vcpu_with_pending_string_io(
+            &[0xf3, 0xa4, 0x66, 0xa1, 0x00, 0x20, 0xeb, 0xfa],
+            32,
+            state.clone(),
+        );
+        let response = complete_io_event(&mut vcpu);
+        assert!(
+            matches!(
+                response,
+                VcpuResponse::Error(VcpuError::IoCompletionLimit(16))
+            ),
+            "{response:?}"
+        );
+        assert_eq!(vcpu.kvm_vcpu.fd.get_kvm_run().immediate_exit, 0);
+
+        let mut copied = [0; 32];
+        vm.guest_memory()
+            .read_slice(&mut copied, GuestAddress(0x400))
+            .unwrap();
+        let expected: [u8; 32] = std::array::from_fn(|index| u8::try_from(index + 1).unwrap());
+        assert_eq!(&copied[..16], &expected[..16]);
+        assert_eq!(&copied[16..], &[0xcc; 16]);
+        // The first exit was handled before CompleteIo; the sixteenth continuation also has data.
+        assert_eq!(state.reads.load(Ordering::Relaxed), 17);
+
+        // A later completion consumes that last response, rather than stale data from byte 16.
+        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
+        let response = complete_io_event(&mut vcpu);
+        assert!(
+            matches!(response, VcpuResponse::IoCompleted),
+            "{response:?}"
+        );
+        assert_eq!(vcpu.kvm_vcpu.fd.get_kvm_run().immediate_exit, 1);
+        vm.guest_memory()
+            .read_slice(&mut copied, GuestAddress(0x400))
+            .unwrap();
+        assert_eq!(copied, expected);
+        assert_eq!(state.reads.load(Ordering::Relaxed), 32);
+
+        // Normal execution must finish REP and reach the following 32-bit MMIO load.
+        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(0);
+        let exit = vcpu.kvm_vcpu.fd.run().unwrap();
+        match &exit {
+            VcpuExit::MmioRead(address, data) => {
+                assert_eq!(*address, 0x2000);
+                assert_eq!(data.len(), 4);
+            }
+            _ => panic!("unexpected exit after completing REP MOVSB: {exit:?}"),
+        }
+        handle_kvm_exit(&mut vcpu.kvm_vcpu.peripherals, Ok(exit)).unwrap();
+        let regs = vcpu.kvm_vcpu.fd.get_regs().unwrap();
+        assert_eq!(regs.rip, 2);
+        assert_eq!(regs.rcx, 0);
+        assert_eq!(state.reads.load(Ordering::Relaxed), 33);
+        vm.guest_memory()
+            .read_slice(&mut copied, GuestAddress(0x400))
+            .unwrap();
+        assert_eq!(copied, expected);
+    }
+
+    #[test]
+    fn test_vcpu_restore_state_events() {
+        let (_vm, mut handle, _) = vcpu_configured_for_boot();
+
+        let mut state = save_vcpu_state(&mut handle);
+        set_marker_register(&mut state, 0x1234);
+        queue_event_expect_response(
+            &mut handle,
+            VcpuEvent::RestoreState(state),
+            VcpuResponse::RestoredState,
+        );
+        let state = save_vcpu_state(&mut handle);
+        assert_eq!(marker_register(&state), 0x1234);
+
+        // A running vCPU refuses the restore.
+        queue_event_expect_response(&mut handle, VcpuEvent::Resume, VcpuResponse::Resumed);
+        queue_event_expect_response(
+            &mut handle,
+            VcpuEvent::RestoreState(state),
+            VcpuResponse::NotAllowed(String::new()),
+        );
+        handle.send_event(VcpuEvent::Finish).unwrap();
     }
 
     #[test]

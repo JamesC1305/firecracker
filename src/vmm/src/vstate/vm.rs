@@ -41,7 +41,7 @@ use crate::vstate::memory::{
     GuestRegionMmapExt, MemoryError,
 };
 use crate::vstate::resources::ResourceAllocator;
-use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
+use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle, VcpuSendEventError};
 use crate::{DirtyBitmap, Vcpu, mem_size_mib};
 
 /// Error type for [`KvmVm::start_vcpus`].
@@ -51,6 +51,19 @@ pub enum StartVcpusError {
     SetTerminalMode(#[from] vmm_sys_util::errno::Error),
     /// Vcpu handle error: {0}
     VcpuHandle(#[from] StartThreadedError),
+}
+
+/// Errors returned while preparing or restoring vCPU state.
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum RestoreVcpuStatesError {
+    /// Cannot signal vCPU: {0}
+    SignalVcpu(#[from] VcpuSendEventError),
+    /// Cannot restore vCPU state: {0}
+    RestoreVcpuState(VcpuError),
+    /// Operation not allowed: {0}
+    NotAllowed(String),
+    /// vCPU is in an unexpected state.
+    UnexpectedVcpuResponse,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -359,6 +372,80 @@ impl KvmVm {
                 _ => Err(MicrovmStateError::UnexpectedVcpuResponse),
             })
             .collect()
+    }
+
+    /// Completes userspace I/O on every paused vCPU before guest memory is reverted.
+    pub fn complete_vcpu_io(&self) -> Result<(), RestoreVcpuStatesError> {
+        // Finish each request before sending the next, so a failure leaves no pending replies.
+        for handle in self.vcpus_handles().iter_mut() {
+            handle.send_event(crate::VcpuEvent::CompleteIo)?;
+            match handle
+                .response_receiver()
+                .recv_timeout(crate::RECV_TIMEOUT_SEC)
+            {
+                Ok(crate::VcpuResponse::IoCompleted) => (),
+                Ok(crate::VcpuResponse::Error(err)) => {
+                    return Err(RestoreVcpuStatesError::RestoreVcpuState(err));
+                }
+                Ok(crate::VcpuResponse::NotAllowed(reason)) => {
+                    return Err(RestoreVcpuStatesError::NotAllowed(reason));
+                }
+                _ => return Err(RestoreVcpuStatesError::UnexpectedVcpuResponse),
+            }
+        }
+        Ok(())
+    }
+
+    /// Restores vCPU states by sending each state to its paused vCPU thread.
+    /// `states` holds one state per vCPU, in vCPU order.
+    pub fn restore_vcpu_states(
+        &self,
+        states: &[crate::vstate::vcpu::VcpuState],
+    ) -> Result<(), RestoreVcpuStatesError> {
+        let mut handles = self.vcpus_handles();
+        let check_response = |response| match response {
+            crate::VcpuResponse::RestoredState => Ok(()),
+            crate::VcpuResponse::Error(err) => Err(RestoreVcpuStatesError::RestoreVcpuState(err)),
+            crate::VcpuResponse::NotAllowed(reason) => {
+                Err(RestoreVcpuStatesError::NotAllowed(reason))
+            }
+            _ => Err(RestoreVcpuStatesError::UnexpectedVcpuResponse),
+        };
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // KVM's timer_context_init shares counter offsets between all vCPUs, and
+            // arch_timer_set_user rewrites them through timer_set_offset. Restore in
+            // vCPU order, as snapshot load does, rather than race on the shared offsets.
+            for (handle, state) in handles.iter_mut().zip(states) {
+                handle.send_event(crate::VcpuEvent::RestoreState(Box::new(state.clone())))?;
+                let response = handle
+                    .response_receiver()
+                    .recv_timeout(crate::RECV_TIMEOUT_SEC)
+                    .map_err(|_| RestoreVcpuStatesError::UnexpectedVcpuResponse)?;
+                check_response(response)?;
+            }
+            Ok(())
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            for (handle, state) in handles.iter_mut().zip(states) {
+                handle.send_event(crate::VcpuEvent::RestoreState(Box::new(state.clone())))?;
+            }
+
+            let responses = handles
+                .iter()
+                .map(|handle| {
+                    handle
+                        .response_receiver()
+                        .recv_timeout(crate::RECV_TIMEOUT_SEC)
+                })
+                .collect::<Result<Vec<crate::VcpuResponse>, _>>()
+                .map_err(|_| RestoreVcpuStatesError::UnexpectedVcpuResponse)?;
+
+            responses.into_iter().try_for_each(check_response)
+        }
     }
 
     /// Dumps CPU configuration from all vCPU threads.

@@ -790,7 +790,7 @@ impl Peripherals {
 }
 
 /// Structure holding VCPU kvm state.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct VcpuState {
     /// CpuId.
     pub cpuid: CpuId,
