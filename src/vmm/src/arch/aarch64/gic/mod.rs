@@ -54,6 +54,8 @@ pub enum GicError {
     CreateGIC(kvm_ioctls::Error),
     /// Error while setting or getting device attributes for the GIC: {0}, {1}, {2}
     DeviceAttribute(kvm_ioctls::Error, bool, u32),
+    /// Failed to deassert an interrupt line during reset: {0}
+    ResetInterrupt(kvm_ioctls::Error),
     /// The number of vCPUs in the GicState doesn't match the number of vCPUs on the system.
     InconsistentVcpuCount,
     /// The VgicSysRegsState is invalid.
@@ -165,6 +167,25 @@ impl GICDevice {
         match self {
             Self::V2(x) => x.restore_device(mpidrs, state),
             Self::V3(x) => x.restore_device(mpidrs, state),
+        }
+    }
+
+    /// Restore a paused, existing GIC after reverting guest memory and vCPU state.
+    /// Interrupt producers must remain stopped until device restoration finishes.
+    pub fn restore_device_in_place(
+        &self,
+        vm_fd: &VmFd,
+        mpidrs: &[u64],
+        state: &GicState,
+    ) -> Result<(), GicError> {
+        // User register ioctls do not call vgic_prune_ap_list. If an active SPI moved
+        // after the checkpoint, vgic_target_oracle keeps its live AP-list owner even
+        // when that CPU runs again, rather than applying the saved route.
+        // An inactive pending retarget waits for its old CPU to sync and prune; delivery
+        // can remain delayed if that CPU is offline or never runs again.
+        match self {
+            Self::V2(x) => x.restore_device_in_place(vm_fd, mpidrs, state),
+            Self::V3(x) => x.restore_device_in_place(mpidrs, state),
         }
     }
 }

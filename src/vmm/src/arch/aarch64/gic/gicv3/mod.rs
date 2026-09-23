@@ -110,6 +110,14 @@ impl GICv3 {
         regs::restore_state(&self.fd, self.its_device.as_ref().unwrap(), mpidrs, state)
     }
 
+    pub fn restore_device_in_place(
+        &self,
+        mpidrs: &[u64],
+        state: &GicState,
+    ) -> Result<(), GicError> {
+        regs::restore_state_in_place(&self.fd, self.its_device.as_ref().unwrap(), mpidrs, state)
+    }
+
     pub fn init_device_attributes(gic_device: &Self) -> Result<(), GicError> {
         // Setting up the distributor attribute.
         // We are placing the GIC below 1GB so we need to subtract the size of the distributor.

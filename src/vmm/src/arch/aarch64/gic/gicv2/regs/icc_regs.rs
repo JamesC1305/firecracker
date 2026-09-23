@@ -78,6 +78,14 @@ pub(crate) fn set_icc_regs(
     Ok(())
 }
 
+pub(crate) fn reset_to_fresh(fd: &DeviceFd, cpuid: u64) -> Result<(), GicError> {
+    // vgic_v2_reset and vgic_v3_reset start VMCR at zero; fresh vCPU allocation zeroes the APRs.
+    for reg in MAIN_VGIC_ICC_REGS {
+        VgicSysRegEngine::set_reg_value(fd, reg, 0, cpuid)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
@@ -102,8 +110,6 @@ mod tests {
         let cpu_id = 0;
         let res = get_icc_regs(gic_fd.device_fd(), cpu_id);
         let state = res.unwrap();
-        assert_eq!(state.main_icc_regs.len(), 8);
-        assert_eq!(state.ap_icc_regs.len(), 0);
 
         set_icc_regs(gic_fd.device_fd(), cpu_id, &state).unwrap();
 

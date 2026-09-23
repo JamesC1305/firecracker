@@ -126,6 +126,23 @@ pub(crate) fn set_dist_regs(fd: &DeviceFd, state: &[GicRegState<u32>]) -> Result
     DistRegEngine::set_regs_data(fd, Box::new(VGIC_DIST_REGS.iter()), state, 0)
 }
 
+pub(crate) fn set_dist_regs_in_place(
+    fd: &DeviceFd,
+    state: &[GicRegState<u32>],
+) -> Result<(), GicError> {
+    // vgic_uaccess_write_senable() and vgic_mmio_uaccess_write_sactive() only set 1 bits.
+    // Clear live bits before applying the saved clear-before-set sequence.
+    DistRegEngine::set_reg_value(fd, &GICD_ICENABLER, u32::MAX, 0)?;
+    DistRegEngine::set_reg_value(fd, &GICD_ICACTIVER, u32::MAX, 0)?;
+    // GicState omits line levels. vgic_write_irq_line_level_info() clears them before
+    // replaying saved pending latches, matching a fresh VM's deasserted IRQ inputs.
+    for intid in (SPI_START..SPI_START + GSI_LEGACY_NUM).step_by(32) {
+        DistRegEngine::set_line_level(fd, intid, 0, 0)?;
+    }
+    // vgic_v3_uaccess_write_pending() replaces the pending word; ICPENDR is write-ignored.
+    set_dist_regs(fd, state)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
@@ -162,6 +179,69 @@ mod tests {
 
         // dropping gic_fd would double close the gic fd, so leak it
         std::mem::forget(gic_fd);
+    }
+
+    #[test]
+    fn test_set_dist_regs_in_place_replaces_spi_bitmaps() {
+        let kvm = Kvm::new().unwrap();
+        let vm = kvm.create_vm().unwrap();
+        let _vcpu = vm.create_vcpu(0).unwrap();
+        let gic = create_gic(&vm, 1, Some(GICVersion::GICV3)).unwrap();
+        let fd = gic.device_fd();
+        let bitmaps = [
+            (&GICD_ISENABLER, 0x1111_1111),
+            (&GICD_ISPENDR, 0x2222_2222),
+            (&GICD_ISACTIVER, 0x4444_4444),
+        ];
+        let live_only = 0x8888_8888;
+
+        DistRegEngine::set_reg_value(fd, &GICD_ICENABLER, u32::MAX, 0).unwrap();
+        DistRegEngine::set_reg_value(fd, &GICD_ICACTIVER, u32::MAX, 0).unwrap();
+        DistRegEngine::set_reg_value(fd, &GICD_ICFGR, 0, 0).unwrap();
+        for &(reg, saved_word) in &bitmaps {
+            DistRegEngine::set_reg_value(fd, reg, saved_word, 0).unwrap();
+            assert_eq!(
+                DistRegEngine::get_reg_data(fd, reg, 0).unwrap().chunks,
+                vec![saved_word; reg.iter::<u32>().count()]
+            );
+        }
+        let saved = get_dist_regs(fd).unwrap();
+
+        DistRegEngine::set_reg_value(fd, &GICD_ICENABLER, u32::MAX, 0).unwrap();
+        DistRegEngine::set_reg_value(fd, &GICD_ICACTIVER, u32::MAX, 0).unwrap();
+        for &(reg, _) in &bitmaps {
+            DistRegEngine::set_reg_value(fd, reg, live_only, 0).unwrap();
+            assert_eq!(
+                DistRegEngine::get_reg_data(fd, reg, 0).unwrap().chunks,
+                vec![live_only; reg.iter::<u32>().count()]
+            );
+        }
+        for intid in (SPI_START..SPI_START + GSI_LEGACY_NUM).step_by(32) {
+            DistRegEngine::set_line_level(fd, intid, live_only, 0).unwrap();
+            let mut level = 0;
+            unsafe {
+                fd.get_device_attr(&mut DistRegEngine::line_level_attr(intid, &mut level, 0))
+                    .unwrap();
+            }
+            assert_eq!(level, live_only);
+        }
+
+        set_dist_regs_in_place(fd, &saved).unwrap();
+
+        for &(reg, saved_word) in &bitmaps {
+            assert_eq!(
+                DistRegEngine::get_reg_data(fd, reg, 0).unwrap().chunks,
+                vec![saved_word; reg.iter::<u32>().count()]
+            );
+        }
+        for intid in (SPI_START..SPI_START + GSI_LEGACY_NUM).step_by(32) {
+            let mut level = u32::MAX;
+            unsafe {
+                fd.get_device_attr(&mut DistRegEngine::line_level_attr(intid, &mut level, 0))
+                    .unwrap();
+            }
+            assert_eq!(level, 0);
+        }
     }
 
     #[test]

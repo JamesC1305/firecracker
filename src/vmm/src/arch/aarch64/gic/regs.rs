@@ -5,7 +5,10 @@ use std::fmt::Debug;
 use std::iter::StepBy;
 use std::ops::Range;
 
-use kvm_bindings::kvm_device_attr;
+use kvm_bindings::{
+    KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO, KVM_DEV_ARM_VGIC_LINE_LEVEL_INFO_SHIFT,
+    KVM_DEV_ARM_VGIC_LINE_LEVEL_INTID_MASK, VGIC_LEVEL_INFO_LINE_LEVEL, kvm_device_attr,
+};
 use kvm_ioctls::DeviceFd;
 use serde::{Deserialize, Serialize};
 
@@ -128,6 +131,44 @@ pub(crate) trait VgicRegEngine {
         }
 
         Ok(())
+    }
+
+    fn set_reg_value(
+        fd: &DeviceFd,
+        reg: &Self::Reg,
+        mut value: Self::RegChunk,
+        mpidr: u64,
+    ) -> Result<(), GicError>
+    where
+        Self: Sized,
+    {
+        for offset in reg.iter::<Self::RegChunk>() {
+            fd.set_device_attr(&Self::kvm_device_attr(offset, &mut value, mpidr))
+                .map_err(|err| GicError::DeviceAttribute(err, true, Self::group()))?;
+        }
+
+        Ok(())
+    }
+
+    fn line_level_attr(intid: u32, value: &mut u32, mpidr: u64) -> kvm_device_attr {
+        kvm_device_attr {
+            group: KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO,
+            attr: (mpidr & Self::mpidr_mask())
+                | (u64::from(VGIC_LEVEL_INFO_LINE_LEVEL) << KVM_DEV_ARM_VGIC_LINE_LEVEL_INFO_SHIFT)
+                | u64::from(intid & KVM_DEV_ARM_VGIC_LINE_LEVEL_INTID_MASK),
+            addr: value as *mut u32 as u64,
+            flags: 0,
+        }
+    }
+
+    fn set_line_level(
+        fd: &DeviceFd,
+        intid: u32,
+        mut value: u32,
+        mpidr: u64,
+    ) -> Result<(), GicError> {
+        fd.set_device_attr(&Self::line_level_attr(intid, &mut value, mpidr))
+            .map_err(|err| GicError::DeviceAttribute(err, true, KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO))
     }
 
     fn set_regs_data(

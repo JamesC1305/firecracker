@@ -6,7 +6,7 @@ mod icc_regs;
 pub mod its_regs;
 mod redist_regs;
 
-use its_regs::{ItsRegisterState, its_save_tables};
+use its_regs::{ItsRegisterState, its_reset, its_save_tables};
 use kvm_ioctls::DeviceFd;
 
 use crate::arch::aarch64::gic::GicError;
@@ -18,9 +18,10 @@ pub fn save_state(
     its_device: &DeviceFd,
     mpidrs: &[u64],
 ) -> Result<GicState, GicError> {
-    // Flush redistributors pending tables to guest RAM.
+    // vgic_v3_save_pending_tables and vgic_its_save_tables_v0 write kernel-owned state
+    // into guest RAM. Capture the memory snapshot after these calls; calling them after
+    // memory reversion would overwrite the checkpoint with the live interrupt state.
     super::save_pending_tables(gic_device)?;
-    // Flush ITS tables into guest memory.
     its_save_tables(its_device)?;
 
     let mut vcpu_states = Vec::with_capacity(mpidrs.len());
@@ -62,6 +63,39 @@ pub fn restore_state(
         .as_ref()
         .ok_or(GicError::MissingItsState)?
         .restore(its_device)
+}
+
+/// Restore an existing GIC after guest memory and vCPU state have been reverted.
+pub fn restore_state_in_place(
+    gic_device: &DeviceFd,
+    its_device: &DeviceFd,
+    mpidrs: &[u64],
+    state: &GicState,
+) -> Result<(), GicError> {
+    if mpidrs.len() != state.gic_vcpu_states.len() {
+        return Err(GicError::InconsistentVcpuCount);
+    }
+    let its_state = state.its_state.as_ref().ok_or(GicError::MissingItsState)?;
+
+    // vgic_mmio_write_v3r_ctlr drops AP-list LPI references and invalidates ITS caches.
+    // Disable every redistributor before vgic_its_reset drops the remaining ITE references.
+    // Otherwise vgic_add_lpi can reuse a live LPI with stale target or pending state.
+    for mpidr in mpidrs {
+        redist_regs::disable_lpis(gic_device, *mpidr)?;
+    }
+    its_reset(its_device)?;
+
+    dist_regs::set_dist_regs_in_place(gic_device, &state.dist)?;
+    for (mpidr, vcpu_state) in mpidrs.iter().zip(&state.gic_vcpu_states) {
+        redist_regs::set_redist_regs_in_place(gic_device, *mpidr, &vcpu_state.rdist)?;
+        icc_regs::set_icc_regs(gic_device, *mpidr, &vcpu_state.icc)?;
+    }
+
+    // The redistributor bases and saved EnableLPIs bits must precede ITS table restore.
+    // vgic_add_lpi imports each recreated LPI through vgic_v3_lpi_sync_pending_status,
+    // which consumes its pending-table bit. Enabling LPIs afterward would reread that
+    // cleared bit in vgic_enable_lpis and discard the restored pending interrupt.
+    its_state.restore(its_device)
 }
 
 #[cfg(test)]

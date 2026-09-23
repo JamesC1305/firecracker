@@ -146,6 +146,16 @@ impl KvmVm {
 
         Ok(())
     }
+
+    /// Restore the live GIC without replacing resource allocations held by existing devices.
+    ///
+    /// Guest memory and vCPU state must already be restored, and all vCPUs must remain outside
+    /// KVM_RUN. KVM's vgic_its_ctrl and VGIC register accessors acquire every vCPU mutex.
+    pub fn restore_kvm_state(&self, mpidrs: &[u64], state: &VmState) -> Result<(), KvmVmError> {
+        self.get_irqchip()
+            .restore_device_in_place(self.fd(), mpidrs, &state.gic)
+            .map_err(KvmVmError::RestoreGic)
+    }
 }
 
 /// Structure holding an general specific VM state.
@@ -157,4 +167,46 @@ pub struct VmState {
     pub gic: GicState,
     /// resource allocator
     pub resource_allocator: ResourceAllocatorState,
+}
+
+#[cfg(test)]
+mod tests {
+    use kvm_bindings::{KVM_DEV_ARM_VGIC_GRP_DIST_REGS, kvm_device_attr};
+
+    use crate::vstate::vm::tests::setup_vm_with_memory;
+
+    #[test]
+    fn test_restore_kvm_state_keeps_live_allocations() {
+        let mut vm = setup_vm_with_memory(0x10000);
+        let _vcpu = vm.fd().create_vcpu(0).unwrap();
+        vm.setup_irqchip(1).unwrap();
+        let gic_fd = vm.get_irqchip().device_fd();
+
+        let enabled = 1_u32;
+        let mut attr = kvm_device_attr {
+            group: KVM_DEV_ARM_VGIC_GRP_DIST_REGS,
+            attr: 0x0104,
+            addr: &enabled as *const u32 as u64,
+            flags: 0,
+        };
+        gic_fd.set_device_attr(&attr).unwrap();
+        let state = vm.save_state(&[0]).unwrap();
+
+        let live_only = 2_u32;
+        attr.addr = &live_only as *const u32 as u64;
+        gic_fd.set_device_attr(&attr).unwrap();
+        let gsi = vm.resource_allocator().allocate_gsi_msi(1).unwrap()[0];
+
+        vm.restore_kvm_state(&[0], &state).unwrap();
+
+        let mut restored = 0_u32;
+        attr.addr = &mut restored as *mut u32 as u64;
+        // SAFETY: attr.addr points to the u32 required by the distributor register API.
+        unsafe { gic_fd.get_device_attr(&mut attr) }.unwrap();
+        assert_eq!(restored, enabled);
+        assert_eq!(
+            vm.resource_allocator().allocate_gsi_msi(1).unwrap()[0],
+            gsi + 1
+        );
+    }
 }

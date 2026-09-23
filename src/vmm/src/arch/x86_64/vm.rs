@@ -139,6 +139,19 @@ impl KvmVm {
         state: &VmState,
         clock_realtime: bool,
     ) -> Result<(), KvmVmError> {
+        self.restore_kvm_state(state, clock_realtime)?;
+        self.common.resource_allocator =
+            Mutex::new(ResourceAllocator::restore((), &state.resource_allocator)?);
+        Ok(())
+    }
+
+    /// Restores the PIT, clock and irqchip state that KVM holds. [`Self::restore_state`] also
+    /// restores the resource allocator.
+    pub fn restore_kvm_state(
+        &self,
+        state: &VmState,
+        clock_realtime: bool,
+    ) -> Result<(), KvmVmError> {
         self.fd()
             .set_pit2(&state.pitstate)
             .map_err(KvmVmError::SetPit2)?;
@@ -162,8 +175,6 @@ impl KvmVm {
         self.fd()
             .set_irqchip(&state.ioapic)
             .map_err(KvmVmError::SetIrqChipIoAPIC)?;
-        self.common.resource_allocator =
-            Mutex::new(ResourceAllocator::restore((), &state.resource_allocator)?);
         Ok(())
     }
 
@@ -299,6 +310,36 @@ mod tests {
         vm.setup_irqchip().unwrap();
 
         vm.restore_state(&vm_state, false).unwrap();
+    }
+
+    #[test]
+    fn test_restore_kvm_state() {
+        let vm = setup_vm_with_memory(0x1000);
+        vm.setup_irqchip().unwrap();
+        let state = vm.save_state().unwrap();
+
+        // Change the PIC interrupt mask, and allocate a GSI as a live device would.
+        let mut pic_master = state.pic_master;
+        // SAFETY: the PIC master chip state holds the `pic` member of the union.
+        unsafe { pic_master.chip.pic.imr = !pic_master.chip.pic.imr };
+        vm.fd().set_irqchip(&pic_master).unwrap();
+        let gsi = vm.resource_allocator().allocate_gsi_msi(1).unwrap()[0];
+
+        vm.restore_kvm_state(&state, false).unwrap();
+
+        let restored = vm.save_state().unwrap();
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(
+                restored.pic_master.chip.pic.imr,
+                state.pic_master.chip.pic.imr
+            );
+        }
+        // The GSI is still allocated.
+        assert_eq!(
+            vm.resource_allocator().allocate_gsi_msi(1).unwrap()[0],
+            gsi + 1
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
