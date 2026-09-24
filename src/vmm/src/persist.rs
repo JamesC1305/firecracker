@@ -40,11 +40,11 @@ use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, Mach
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
-    self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
+    self, GuestMemoryExtension, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
 };
 use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
-use crate::{EventManager, Vmm, vstate};
+use crate::{DirtyBitmap, EventManager, Vmm, vstate};
 
 /// Holds information related to the VM that is not part of VmState.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -115,6 +115,8 @@ pub struct ResetContext {
     pub device_states: DevicesState,
     /// Whether snapshot load applied wall-clock time to kvmclock.
     pub clock_realtime: bool,
+    /// Pages written since load whose dirty bits snapshot creation cleared.
+    pub dirty_pages: DirtyBitmap,
 }
 
 /// This describes the mapping between Firecracker base virtual address and
@@ -206,6 +208,9 @@ pub fn create_snapshot(
         &params.mem_file_path,
         params.snapshot_type,
         params.sync_snapshot_files,
+        vmm.reset_context
+            .as_mut()
+            .map(|context| &mut context.dirty_pages),
     )?;
 
     // We need to mark queues as dirty again for all activated devices. The reason we
@@ -526,13 +531,20 @@ pub fn restore_from_snapshot(
     // Reset needs the file mapping to refault snapshot pages, and dirty tracking to find
     // the pages that changed since load.
     if params.mem_backend.backend_type == MemBackendType::File && track_dirty_pages {
-        vmm.lock().expect("Poisoned lock").reset_context = Some(ResetContext {
+        let mut locked_vmm = vmm.lock().expect("Poisoned lock");
+        let dirty_pages = locked_vmm
+            .vm
+            .as_kvm()
+            .map(|vm| vm.guest_memory().clean_dirty_bitmap())
+            .unwrap_or_default();
+        locked_vmm.reset_context = Some(ResetContext {
             vm_state: microvm_state.vm_state,
             #[cfg(target_arch = "aarch64")]
             mpidrs: crate::construct_kvm_mpidrs(&microvm_state.vcpu_states),
             vcpu_states: microvm_state.vcpu_states,
             device_states: microvm_state.device_states,
             clock_realtime: params.clock_realtime,
+            dirty_pages,
         });
     }
     Ok(vmm)

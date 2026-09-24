@@ -684,11 +684,16 @@ impl KvmVm {
     /// If `snapshot_type` is [`SnapshotType::Diff`], and `mem_file_path` exists and is a snapshot
     /// file of matching size, then the diff snapshot will be directly merged into the existing
     /// snapshot. Otherwise, existing files are simply overwritten.
+    ///
+    /// Snapshot creation clears the dirty logs. A microVM that can reset passes
+    /// `dirty_since_load`, the set of pages written since snapshot load. The pages that the
+    /// logs mark are added to it first, so that a later reset still finds them.
     pub(crate) fn snapshot_memory_to_file(
         &self,
         mem_file_path: &Path,
         snapshot_type: SnapshotType,
         sync_snapshot_files: bool,
+        dirty_since_load: Option<&mut DirtyBitmap>,
     ) -> Result<(), CreateSnapshotError> {
         use self::CreateSnapshotError::*;
 
@@ -732,9 +737,17 @@ impl KvmVm {
         match snapshot_type {
             SnapshotType::Diff => {
                 let dirty_bitmap = self.get_dirty_bitmap()?;
+                if let Some(dirty_pages) = dirty_since_load {
+                    self.guest_memory()
+                        .accumulate_dirty(&dirty_bitmap, dirty_pages);
+                }
                 self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
             }
             SnapshotType::Full => {
+                if let Some(dirty_pages) = dirty_since_load {
+                    self.guest_memory()
+                        .accumulate_dirty(&self.get_dirty_bitmap()?, dirty_pages);
+                }
                 self.guest_memory().dump(&mut file)?;
                 self.reset_dirty_bitmap();
                 self.guest_memory().reset_dirty();
@@ -916,6 +929,58 @@ pub(crate) mod tests {
         let gm = single_region_mem_raw(mem_size);
         vm.register_dram_memory_regions(gm).unwrap();
         vm
+    }
+
+    #[test]
+    fn test_snapshot_memory_to_file_keeps_dirty_since_load() {
+        use std::io::Write;
+
+        use vm_memory::Bytes;
+        use vmm_sys_util::tempfile::TempFile;
+
+        use crate::vstate::memory;
+
+        let page_size = host_page_size();
+        let loaded = TempFile::new().unwrap();
+        loaded
+            .as_file()
+            .write_all(&vec![0x42; mib_to_bytes(1)])
+            .unwrap();
+        let mut vm = setup_vm();
+        let regions = memory::snapshot_file(
+            loaded.as_file().try_clone().unwrap(),
+            std::iter::once((GuestAddress(0), mib_to_bytes(1))),
+            true,
+            HugePageConfig::None,
+        )
+        .unwrap();
+        vm.register_dram_memory_regions(regions).unwrap();
+
+        // Each snapshot type clears the dirty logs after the page it follows is written.
+        let mut dirty_pages = vm.guest_memory().clean_dirty_bitmap();
+        for (page, snapshot_type) in [(0, SnapshotType::Diff), (2, SnapshotType::Full)] {
+            vm.guest_memory()
+                .write_slice(&[1], GuestAddress((page * page_size) as u64))
+                .unwrap();
+            let snapshot = TempFile::new().unwrap();
+            vm.snapshot_memory_to_file(
+                snapshot.as_path(),
+                snapshot_type,
+                false,
+                Some(&mut dirty_pages),
+            )
+            .unwrap();
+        }
+        assert_eq!(dirty_pages[&0][0], 0b101);
+
+        vm.guest_memory().revert_to_file(&dirty_pages).unwrap();
+        for page in [0, 2] {
+            let byte: u8 = vm
+                .guest_memory()
+                .read_obj(GuestAddress((page * page_size) as u64))
+                .unwrap();
+            assert_eq!(byte, 0x42);
+        }
     }
 
     #[test]
