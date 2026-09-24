@@ -927,14 +927,10 @@ impl GuestRegionMmapExt {
                 // Madvise the region in order to mark it as not used.
                 let host_addr = self.get_host_address(caddr)?;
                 // SAFETY: The address and length are known to be valid.
-                let ret = unsafe { libc::madvise(host_addr.cast(), len, libc::MADV_DONTNEED) };
-                if ret < 0 {
-                    let os_error = std::io::Error::last_os_error();
+                unsafe { madvise_dontneed(host_addr, len) }.map_err(|os_error| {
                     error!("discard_range: madvise failed: {:?}", os_error);
-                    Err(GuestMemoryError::IOError(os_error))
-                } else {
-                    Ok(())
-                }
+                    GuestMemoryError::IOError(os_error)
+                })
             }
         }
     }
@@ -1135,6 +1131,23 @@ where
     /// Discards a memory range, freeing up memory pages
     fn discard_range(&self, addr: GuestAddress, range_len: usize) -> Result<(), GuestMemoryError>;
 
+    /// Returns a dirty bitmap with one bitmap for each memory slot, plugged or not, marking no
+    /// page. Slots that virtio-mem plugs later already have a bitmap.
+    fn clean_dirty_bitmap(&self) -> DirtyBitmap;
+
+    /// Marks in `accumulator` every page that is dirty in `kvm_bitmap` or in the VMM's own
+    /// dirty bitmap. Both sources stay unchanged. `kvm_bitmap` holds a bitmap for every plugged
+    /// slot, and `accumulator` one for every slot, as [`Self::clean_dirty_bitmap`] returns.
+    fn accumulate_dirty(&self, kvm_bitmap: &DirtyBitmap, accumulator: &mut DirtyBitmap);
+
+    /// Drops the private copy of every page that `dirty_bitmap` marks, so that the next
+    /// access reads the page from the backing file again. Unlike [`Self::discard_range`],
+    /// which makes pages read as zeros, this reverts them to the file contents.
+    ///
+    /// All regions must be private file mappings, and `dirty_bitmap` must hold a bitmap for
+    /// every plugged slot.
+    fn revert_to_file(&self, dirty_bitmap: &DirtyBitmap) -> Result<(), MemoryError>;
+
     /// Check whether the given guest address range falls entirely within plugged memory.
     /// Returns Err if the address is not in any region or is in an unplugged slot.
     fn check_range_plugged(&self, addr: GuestAddress, len: usize) -> Result<(), GuestMemoryError>;
@@ -1278,6 +1291,62 @@ impl GuestMemoryExtension for GuestMemoryMmap {
             });
     }
 
+    fn clean_dirty_bitmap(&self) -> DirtyBitmap {
+        let page_size = host_page_size();
+        self.iter()
+            .flat_map(|region| region.slots())
+            .map(|(mem_slot, _)| {
+                let num_pfns = mem_slot.slice.len() / page_size;
+                (mem_slot.slot, vec![0; num_pfns.div_ceil(64)])
+            })
+            .collect()
+    }
+
+    fn accumulate_dirty(&self, kvm_bitmap: &DirtyBitmap, accumulator: &mut DirtyBitmap) {
+        let page_size = host_page_size();
+        for mem_slot in self.iter().flat_map(|region| region.plugged_slots()) {
+            let kvm_bits = &kvm_bitmap[&mem_slot.slot];
+            let vmm_bits = mem_slot.slice.bitmap();
+            let bits = accumulator
+                .get_mut(&mem_slot.slot)
+                .expect("the accumulator has a bitmap for each slot");
+            let num_pfns = mem_slot.slice.len() / page_size;
+            for pfn in 0..num_pfns {
+                if is_pfn_dirty(kvm_bits, pfn) || vmm_bits.dirty_at(pfn * page_size) {
+                    bits[pfn / 64] |= 1 << (pfn % 64);
+                }
+            }
+        }
+    }
+
+    fn revert_to_file(&self, dirty_bitmap: &DirtyBitmap) -> Result<(), MemoryError> {
+        let page_size = host_page_size();
+        for mem_slot in self.iter().flat_map(|region| region.plugged_slots()) {
+            let bits = &dirty_bitmap[&mem_slot.slot];
+            let num_pfns = mem_slot.slice.len() / page_size;
+            let slot_start = mem_slot.slice.ptr_guard_mut();
+            let mut pfn = 0;
+            while pfn < num_pfns {
+                if !is_pfn_dirty(bits, pfn) {
+                    pfn += 1;
+                    continue;
+                }
+                // Drop the whole run of dirty pages that starts here with a single call.
+                let first_pfn = pfn;
+                while pfn < num_pfns && is_pfn_dirty(bits, pfn) {
+                    pfn += 1;
+                }
+                let addr = slot_start.as_ptr().wrapping_add(first_pfn * page_size);
+                let len = (pfn - first_pfn) * page_size;
+                // SAFETY: the pages lie inside this slot's mapping. Guest memory is only
+                // accessed through volatile slices, so dropping pages cannot invalidate a
+                // Rust reference.
+                unsafe { madvise_dontneed(addr, len) }.map_err(MemoryError::Madvise)?;
+            }
+        }
+        Ok(())
+    }
+
     fn try_for_each_region_in_range<F>(
         &self,
         addr: GuestAddress,
@@ -1326,6 +1395,27 @@ impl GuestMemoryExtension for GuestMemoryMmap {
             region.check_range_plugged(offset, chunk_len)
         })
     }
+}
+
+/// Returns whether `bitmap` marks the page with page frame number `pfn` as dirty. Page frame
+/// numbers count from the start of a memory slot.
+fn is_pfn_dirty(bitmap: &[u64], pfn: usize) -> bool {
+    bitmap[pfn / 64] & (1 << (pfn % 64)) != 0
+}
+
+/// Drops the pages of `[addr, addr + len)`. The next access reads a page again from the
+/// backing file of a private file mapping, or as zeros from an anonymous mapping.
+///
+/// # Safety
+///
+/// The range must lie inside one guest memory mapping.
+unsafe fn madvise_dontneed(addr: *mut u8, len: usize) -> io::Result<()> {
+    // SAFETY: the caller guarantees that the range is mapped.
+    let ret = unsafe { libc::madvise(addr.cast(), len, libc::MADV_DONTNEED) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn create_memfd(
@@ -1391,6 +1481,87 @@ mod tests {
     use crate::test_utils::{multi_region_mem, single_region_mem};
     use crate::utils::mib_to_bytes;
     use crate::vstate::memory::test_utils::into_region_ext;
+
+    #[test]
+    fn test_accumulate_dirty_and_revert_to_file() {
+        let page_size = host_page_size();
+        let num_pages = 130;
+        let page_byte = |page: usize| u8::try_from(page + 1).unwrap();
+        let mut file = TempFile::new().unwrap().into_file();
+        let contents: Vec<u8> = (0..num_pages)
+            .flat_map(|page| vec![page_byte(page); page_size])
+            .collect();
+        file.write_all(&contents).unwrap();
+        let memory = into_region_ext(
+            snapshot_file(
+                file,
+                std::iter::once((GuestAddress(0), num_pages * page_size)),
+                true,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+
+        // A VMM write marks the VMM bitmap. Raw writes model guest writes, which only KVM
+        // tracks. No bitmap marks page 100, so it must keep its new contents.
+        memory
+            .write_slice(&vec![0xff; page_size], GuestAddress(0))
+            .unwrap();
+        let host = memory
+            .iter()
+            .next()
+            .unwrap()
+            .get_host_address(MemoryRegionAddress(0))
+            .unwrap();
+        for page in [64, 65, 100, 129] {
+            unsafe { std::ptr::write_bytes(host.add(page * page_size), 0xff, page_size) };
+        }
+        let kvm_bitmap = HashMap::from([(0, vec![0, 0b11, 0b10])]);
+
+        let mut accumulator = memory.clean_dirty_bitmap();
+        assert_eq!(accumulator[&0], vec![0; 3]);
+        memory.accumulate_dirty(&kvm_bitmap, &mut accumulator);
+        assert_eq!(accumulator[&0], vec![0b1, 0b11, 0b10]);
+        memory.revert_to_file(&accumulator).unwrap();
+
+        let mut readback = vec![0; contents.len()];
+        memory.read_slice(&mut readback, GuestAddress(0)).unwrap();
+        for page in 0..num_pages {
+            let expected = if page == 100 { 0xff } else { page_byte(page) };
+            assert!(
+                readback[page * page_size..(page + 1) * page_size]
+                    .iter()
+                    .all(|&byte| byte == expected),
+                "page {page}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_clean_dirty_bitmap_covers_unplugged_slots() {
+        let page_size = host_page_size();
+        let region = anonymous(
+            std::iter::once((GuestAddress(0), 2 * page_size)),
+            true,
+            HugePageConfig::None,
+        )
+        .unwrap()
+        .remove(0);
+        let state = GuestMemoryRegionState {
+            base_address: 0,
+            size: 2 * page_size,
+            region_type: GuestRegionType::Hotpluggable,
+            plugged: vec![true, false],
+        };
+        let memory = GuestMemoryMmap::from_regions(vec![
+            GuestRegionMmapExt::from_state(region, &state, 0).unwrap(),
+        ])
+        .unwrap();
+
+        // virtio-mem can plug slot 1 later, and accumulate_dirty then needs its bitmap.
+        let bitmap = memory.clean_dirty_bitmap();
+        assert_eq!(bitmap, HashMap::from([(0, vec![0]), (1, vec![0])]));
+    }
 
     #[test]
     fn test_anonymous() {
