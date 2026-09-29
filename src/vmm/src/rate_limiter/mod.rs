@@ -331,7 +331,7 @@ pub struct RateLimiter {
     // because `Self::update_buckets()` might re-enable it later, and we might be
     // seccomp-blocked from creating the timer_fd at that time.
     timer_fd: TimerFd,
-    // Internal flag that quickly determines timer state.
+    // Set while the timer is armed or holds an unread expiry.
     timer_active: bool,
 }
 

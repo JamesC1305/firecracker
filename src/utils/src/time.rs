@@ -282,6 +282,11 @@ impl TimerFd {
         );
     }
 
+    /// Disarms the timer and cancels pending expirations.
+    pub fn disarm(&mut self) {
+        self.arm(Duration::ZERO, None);
+    }
+
     /// Read the value from the timer. Since a real timer is always created with the NONBLOCK
     /// flag, this function does not block and returns `0` if the timer has not fired. For a mock
     /// timer it returns the number of expirations that have occurred (per the virtual clock)

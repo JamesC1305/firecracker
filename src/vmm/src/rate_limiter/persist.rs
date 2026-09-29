@@ -6,7 +6,6 @@
 use std::io;
 
 use serde::{Deserialize, Serialize};
-use utils::time::TimerFd;
 
 use super::*;
 use crate::snapshot::Persist;
@@ -38,19 +37,26 @@ impl Persist<'_> for TokenBucket {
     }
 
     fn restore(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
+        let mut bucket = Self::new(state.size, state.one_time_burst, state.refill_time)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        bucket.restore_in_place(state, ())?;
+        Ok(bucket)
+    }
+}
+
+impl TokenBucket {
+    /// Restores runtime state after construction from the saved bucket configuration.
+    pub fn restore_in_place(&mut self, state: &TokenBucketState, _: ()) -> Result<(), io::Error> {
         let now = Instant::now();
         let last_update = now
             .checked_sub(Duration::from_nanos(state.elapsed_ns))
             .unwrap_or(now);
 
-        let mut token_bucket =
-            TokenBucket::new(state.size, state.one_time_burst, state.refill_time)
-                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        self.budget = state.budget;
+        self.one_time_burst = state.one_time_burst;
+        self.last_update = last_update;
 
-        token_bucket.budget = state.budget;
-        token_bucket.last_update = last_update;
-
-        Ok(token_bucket)
+        Ok(())
     }
 }
 
@@ -74,22 +80,33 @@ impl Persist<'_> for RateLimiter {
     }
 
     fn restore(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let rate_limiter = RateLimiter {
-            ops: if let Some(ops) = state.ops.as_ref() {
-                Some(TokenBucket::restore((), ops)?)
-            } else {
-                None
-            },
-            bandwidth: if let Some(bw) = state.bandwidth.as_ref() {
-                Some(TokenBucket::restore((), bw)?)
-            } else {
-                None
-            },
-            timer_fd: TimerFd::new(),
-            timer_active: false,
-        };
-
+        let mut rate_limiter = Self::default();
+        rate_limiter.restore_in_place(state, ())?;
         Ok(rate_limiter)
+    }
+}
+
+impl RateLimiter {
+    /// Restores token buckets while retaining the EventManager-registered timer fd.
+    pub fn restore_in_place(&mut self, state: &RateLimiterState, _: ()) -> Result<(), io::Error> {
+        let apply_bucket = |state: &TokenBucketState| -> Result<TokenBucket, io::Error> {
+            // Rebuild fixed bucket parameters too, since runtime PATCH can replace them.
+            let mut bucket = TokenBucket::new(state.size, state.one_time_burst, state.refill_time)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            bucket.restore_in_place(state, ())?;
+            Ok(bucket)
+        };
+        let ops = state.ops.as_ref().map(apply_bucket).transpose()?;
+        let bandwidth = state.bandwidth.as_ref().map(apply_bucket).transpose()?;
+        self.ops = ops;
+        self.bandwidth = bandwidth;
+        // The timer is armed or has an unread expiry only while timer_active is set.
+        if self.timer_active {
+            self.timer_fd.disarm();
+            self.timer_fd.read();
+            self.timer_active = false;
+        }
+        Ok(())
     }
 }
 
@@ -100,110 +117,110 @@ mod tests {
 
     #[test]
     fn test_token_bucket_persistence() {
-        let mut tb = TokenBucket::new(1000, 2000, 3000).unwrap();
+        let mut bucket = TokenBucket::new(1000, 2000, 3000).unwrap();
+        bucket.reduce(2100);
+        let serialized_data = bitcode::serialize(&bucket.save()).unwrap();
+        let state: TokenBucketState = bitcode::deserialize(&serialized_data).unwrap();
+        let mut restored =
+            TokenBucket::new(state.size, state.one_time_burst, state.refill_time).unwrap();
+        restored.restore_in_place(&state, ()).unwrap();
 
-        // Check that TokenBucket restores correctly if untouched.
-        let restored_tb = TokenBucket::restore((), &tb.save()).unwrap();
-        assert!(tb.partial_eq(&restored_tb));
-
-        // Check that TokenBucket restores correctly after partially consuming tokens.
-        tb.reduce(100);
-        let restored_tb = TokenBucket::restore((), &tb.save()).unwrap();
-        assert!(tb.partial_eq(&restored_tb));
-
-        // Check that TokenBucket restores correctly after replenishing tokens.
-        tb.force_replenish(100);
-        let restored_tb = TokenBucket::restore((), &tb.save()).unwrap();
-        assert!(tb.partial_eq(&restored_tb));
-
-        // Test serialization.
-        let tb_state = tb.save();
-        let serialized_data = bitcode::serialize(&tb_state).unwrap();
-
-        let restored_state = bitcode::deserialize(&serialized_data).unwrap();
-        let restored_tb = TokenBucket::restore((), &restored_state).unwrap();
-        assert!(tb.partial_eq(&restored_tb));
+        assert!(bucket.partial_eq(&restored));
+        assert_eq!(restored.budget, 900);
+        restored.force_replenish(u64::MAX);
+        assert_eq!(restored.budget, 1000);
+        assert_eq!(restored.one_time_burst(), 0);
     }
 
     #[test]
     fn test_rate_limiter_persistence() {
         let refill_time = 100_000;
         let mut rate_limiter = RateLimiter::new(100, 0, refill_time, 10, 0, refill_time);
+        assert!(rate_limiter.consume(60, TokenType::Bytes));
+        assert!(rate_limiter.consume(4, TokenType::Ops));
+        let serialized_data = bitcode::serialize(&rate_limiter.save()).unwrap();
+        let state = bitcode::deserialize(&serialized_data).unwrap();
 
-        // Check that RateLimiter restores correctly if untouched.
-        let restored_rate_limiter =
-            RateLimiter::restore((), &rate_limiter.save()).expect("Unable to restore rate limiter");
+        let mut restored = RateLimiter::default();
+        let fd = restored.as_raw_fd();
+        restored.restore_in_place(&state, ()).unwrap();
+        assert_eq!(restored.as_raw_fd(), fd);
+        assert!(!restored.is_blocked());
+        assert!(restored.consume(40, TokenType::Bytes));
+        assert!(restored.consume(6, TokenType::Ops));
+        assert!(!restored.consume(1, TokenType::Bytes));
 
-        assert!(
-            rate_limiter
-                .ops()
-                .unwrap()
-                .partial_eq(restored_rate_limiter.ops().unwrap())
+        restored
+            .restore_in_place(
+                &RateLimiterState {
+                    ops: None,
+                    bandwidth: None,
+                },
+                (),
+            )
+            .unwrap();
+        assert!(!restored.is_blocked());
+        assert!(restored.consume(u64::MAX, TokenType::Bytes));
+        assert!(restored.consume(u64::MAX, TokenType::Ops));
+
+        restored.restore_in_place(&state, ()).unwrap();
+        assert_eq!(restored.as_raw_fd(), fd);
+        assert!(restored.consume(40, TokenType::Bytes));
+        assert!(restored.consume(6, TokenType::Ops));
+        assert!(!restored.consume(1, TokenType::Ops));
+    }
+
+    #[test]
+    fn test_rate_limiter_apply() {
+        use std::os::fd::AsRawFd;
+
+        let mut source = RateLimiter::new(100, 0, 100_000, 10, 0, 100_000);
+        assert!(source.consume(10, TokenType::Bytes));
+        assert!(source.consume(3, TokenType::Ops));
+        let state = source.save();
+        let mut live = RateLimiter::new(100, 0, 100_000, 10, 0, 100_000);
+        let fd = live.as_raw_fd();
+        assert!(live.consume(100, TokenType::Bytes));
+        assert!(live.consume(10, TokenType::Ops));
+        assert!(!live.consume(1, TokenType::Bytes));
+        assert!(live.is_blocked());
+
+        let mut invalid = state.clone();
+        invalid.bandwidth.as_mut().unwrap().refill_time = u64::MAX;
+        assert_eq!(
+            live.restore_in_place(&invalid, ()).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
         );
-        assert!(
-            rate_limiter
-                .bandwidth()
-                .unwrap()
-                .partial_eq(restored_rate_limiter.bandwidth().unwrap())
-        );
-        assert!(!restored_rate_limiter.timer_fd.is_armed());
+        assert!(live.is_blocked());
+        assert_eq!(live.ops().unwrap().budget(), 0);
+        assert_eq!(live.bandwidth().unwrap().budget(), 0);
 
-        // Check that RateLimiter restores correctly after partially consuming tokens.
-        rate_limiter.consume(10, TokenType::Bytes);
-        rate_limiter.consume(10, TokenType::Ops);
-        let restored_rate_limiter =
-            RateLimiter::restore((), &rate_limiter.save()).expect("Unable to restore rate limiter");
+        live.restore_in_place(&state, ()).unwrap();
+        assert_eq!(live.as_raw_fd(), fd);
+        assert!(!live.timer_fd.is_armed());
+        assert_eq!(live.timer_fd.read(), 0);
+        assert!(!live.is_blocked());
+        assert!(live.consume(90, TokenType::Bytes));
+        assert!(live.consume(7, TokenType::Ops));
+        assert!(!live.consume(1, TokenType::Ops));
 
-        assert!(
-            rate_limiter
-                .ops()
-                .unwrap()
-                .partial_eq(restored_rate_limiter.ops().unwrap())
-        );
-        assert!(
-            rate_limiter
-                .bandwidth()
-                .unwrap()
-                .partial_eq(restored_rate_limiter.bandwidth().unwrap())
-        );
-        assert!(!restored_rate_limiter.timer_fd.is_armed());
+        for handle_expiry in [false, true] {
+            let clock = MockClock::new();
+            let mut live = RateLimiter::new_mocked(100, 0, 100_000, 10, 0, 100_000, &clock);
+            assert!(live.consume(100, TokenType::Bytes));
+            assert!(!live.consume(1, TokenType::Bytes));
+            clock.advance(REFILL_TIMER_DURATION);
+            if handle_expiry {
+                live.event_handler().unwrap();
+            }
 
-        // Check that RateLimiter restores correctly after totally consuming tokens.
-        rate_limiter.consume(1000, TokenType::Bytes);
-        let restored_rate_limiter =
-            RateLimiter::restore((), &rate_limiter.save()).expect("Unable to restore rate limiter");
-
-        assert!(
-            rate_limiter
-                .ops()
-                .unwrap()
-                .partial_eq(restored_rate_limiter.ops().unwrap())
-        );
-        assert!(
-            rate_limiter
-                .bandwidth()
-                .unwrap()
-                .partial_eq(restored_rate_limiter.bandwidth().unwrap())
-        );
-
-        // Test serialization.
-        let rate_limiter_state = rate_limiter.save();
-        let serialized_data = bitcode::serialize(&rate_limiter_state).unwrap();
-
-        let restored_state = bitcode::deserialize(&serialized_data).unwrap();
-        let restored_rate_limiter = RateLimiter::restore((), &restored_state).unwrap();
-
-        assert!(
-            rate_limiter
-                .ops()
-                .unwrap()
-                .partial_eq(restored_rate_limiter.ops().unwrap())
-        );
-        assert!(
-            rate_limiter
-                .bandwidth()
-                .unwrap()
-                .partial_eq(restored_rate_limiter.bandwidth().unwrap())
-        );
+            live.restore_in_place(&state, ()).unwrap();
+            assert!(!live.timer_fd.is_armed());
+            assert_eq!(live.timer_fd.read(), 0);
+            assert!(!live.is_blocked());
+            assert!(live.consume(90, TokenType::Bytes));
+            assert!(live.consume(7, TokenType::Ops));
+            assert!(!live.consume(1, TokenType::Ops));
+        }
     }
 }
