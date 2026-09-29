@@ -20,6 +20,7 @@
     - [Syncing snapshot files](#syncing-snapshot-files)
   - [Resuming the microVM](#resuming-the-microvm)
   - [Loading snapshots](#loading-snapshots)
+  - [Resetting a microVM to its snapshot](#resetting-a-microvm-to-its-snapshot)
 - [Provisioning host disk space for snapshots](#provisioning-host-disk-space-for-snapshots)
 - [Ensure continued network connectivity for clones](#ensure-continued-network-connectivity-for-clones)
 - [Snapshot security and uniqueness](#snapshot-security-and-uniqueness)
@@ -177,7 +178,8 @@ format versions can be found at [versioning](./versioning.md).
 
 Firecracker exposes the following APIs for manipulating snapshots: `Pause`,
 `Resume` and `CreateSnapshot` can be called only after booting the microVM,
-while `LoadSnapshot` is allowed only before boot.
+while `LoadSnapshot` is allowed only before boot. `ResetSnapshot` is allowed
+only on a paused microVM restored from a snapshot.
 
 ### Pausing the microVM
 
@@ -529,6 +531,103 @@ set the `clock_realtime: true` in the `LoadSnapshot` request to advance the
 clock on the guest at restore time (host Linux >= 5.16 is required to support
 this feature). Note that this may cause issues within the guest as the clock
 will appear to suddenly jump.
+
+### Resetting a microVM to its snapshot
+
+`PUT /snapshot/reset` returns a microVM to the snapshot it was loaded from,
+without replacing the Firecracker process. The microVM stays paused after reset.
+You can reset it repeatedly to that same snapshot. Creating another snapshot
+does not change the reset target.
+
+**Prerequisites**:
+
+- The microVM runs on x86_64 or aarch64, is `Paused`, and was restored with
+  `PUT /snapshot/load`. A microVM booted without loading a snapshot cannot
+  reset.
+- The load request used the `File` memory backend and `track_dirty_pages: true`.
+  Reset does not support the `Uffd` backend or a load without dirty tracking.
+- The microVM has no balloon, virtio-mem, writable pmem, or vhost-user block
+  devices. These restrictions apply to both MMIO and PCI devices.
+- The virtio devices match the load: no device was hot-plugged or unplugged,
+  each device is activated if and only if it was activated after the load, and
+  the guest has not moved the BAR of a PCI device. Reset returns HTTP 400
+  otherwise.
+- The snapshot memory file remains available and immutable for the lifetime of
+  the microVM, for example through a read-only bind mount. Do not create a
+  snapshot into this file. Reset does not check for changes to this file.
+
+Before rollback, reset completes pending MMIO and PIO without entering the
+guest. The preparation phase permits at most 16 `KVM_RUN` calls per vCPU. If
+more are needed, reset returns an error without applying the snapshot or
+poisoning the microVM. The original microVM stays usable with the I/O that has
+already completed, as it would after resuming.
+
+Reset discards memory pages dirtied since load so they refault from the snapshot
+memory file. It reapplies the vCPU, KVM VM, and device state retained at load
+time. The MMDS datastore returns to its contents when the load finished.
+Snapshots do not contain MMDS data, so these contents are empty unless you put
+data before loading. The MMDS token key rotates, invalidating existing MMDS
+tokens. VMGenID changes on every reset. The
+[snapshot uniqueness considerations](#snapshot-security-and-uniqueness) still
+apply to guest application state.
+
+On aarch64, reset returns the PL031 RTC to its power-on state, as snapshot load
+does. Its data register reads the current host time rather than the snapshot
+time.
+
+The aarch64 GIC restore has an interrupt-routing limitation: KVM retains its
+live per-vCPU lists of queued interrupts. An active non-LPI interrupt that was
+retargeted after the snapshot can remain owned by its previous vCPU. A pending,
+inactive interrupt can wait for that vCPU to run before moving to its restored
+target, including when the previous vCPU stays powered off. Load the snapshot
+into a new microVM when these cases require the interrupt ownership of a fresh
+restore.
+
+Apart from MMDS, reset does **not** revert host-side state: block device
+contents and host-side connections stay as they are. If the guest wrote to a
+block device, restore its backing file contents to match the snapshot before
+resuming. Use fresh SSH, network, and vsock connections after reset rather than
+reusing connections opened after the snapshot.
+
+Reset also returns the guest ARP cache to the snapshot. If the host tap device
+has a different MAC address than when the snapshot was taken, the guest keeps
+sending to the old address until its ARP entry expires, which can take a minute.
+While the microVM is paused, flush the host neighbour entries of the tap, for
+example with `ip neigh flush dev tap0`. The host then asks for the guest MAC
+address, and the guest learns the MAC address of the current tap.
+
+Follow this sequence, checking each API response before proceeding:
+
+1. Pause with `PATCH /vm` and `{"state": "Paused"}`.
+
+1. Reset with `PUT /snapshot/reset`. The call takes no parameters. Send `{}` or
+   an empty body; unknown fields are rejected.
+
+   ```bash
+   curl --unix-socket /tmp/firecracker.socket -i \
+       -X PUT 'http://localhost/snapshot/reset' \
+       -H 'Accept: application/json' \
+       -H 'Content-Type: application/json' \
+       -d '{}'
+   ```
+
+1. While the microVM remains paused, revert any modified block device contents
+   and flush the host neighbour entries of each tap. Put MMDS data again if the
+   guest needs it, as you would after a snapshot load.
+
+1. Resume with `PATCH /vm` and `{"state": "Resumed"}`.
+
+A successful reset returns HTTP 204. Invalid preconditions return HTTP 400 and
+leave the microVM usable. If reset fails while applying checkpoint memory or
+state, the microVM is **poisoned**: resume, snapshot creation, and further
+resets are refused. Terminate that Firecracker process and restore a new microVM
+from a valid snapshot instead.
+
+Reset is not an isolation boundary between tenants with different trust levels.
+Do not use it to recycle a microVM between such tenants.
+
+Reset latency is reported in `latencies_us.reset_snapshot` and
+`latencies_us.vmm_reset_snapshot`.
 
 ## Provisioning host disk space for snapshots
 

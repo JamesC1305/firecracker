@@ -10,9 +10,11 @@ and this project adheres to
 
 ### Added
 
-- Added `PUT /snapshot/reset` to reset a paused microVM in place to the snapshot
-  from which it was loaded. It takes no parameters and requires file-backed
-  memory with dirty-page tracking on x86_64 or aarch64.
+- Added
+  [`PUT /snapshot/reset`](docs/snapshotting/snapshot-support.md#resetting-a-microvm-to-its-snapshot)
+  to reset a paused microVM in place to the snapshot from which it was loaded.
+  It takes no parameters and requires file-backed memory with dirty-page
+  tracking on x86_64 or aarch64.
 
 ### Changed
 
