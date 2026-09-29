@@ -29,6 +29,10 @@ and this project adheres to
 
 ### Fixed
 
+- Fixed pausing a vCPU while its MMIO or port I/O exit was being handled. The
+  access stayed pending in KVM, so a snapshot taken at that point re-executed it
+  after load, repeating a device write or losing the data that a read consumed.
+
 - [#6208](https://github.com/firecracker-microvm/firecracker/pull/6208): Fixed
   the vsock device stalling the VMM thread when the guest connects to a
   host-side Unix socket whose accept backlog is full. Such connection requests

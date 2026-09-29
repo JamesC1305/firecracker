@@ -405,12 +405,9 @@ impl Vcpu {
     ///
     /// Returns error or enum specifying whether emulation was handled or interrupted.
     pub fn run_emulation(&mut self) -> Result<VcpuEmulation, VcpuError> {
-        if self.kvm_vcpu.fd.get_kvm_run().immediate_exit == 1u8 {
-            warn!("Requested a vCPU run with immediate_exit enabled. The operation was skipped");
-            self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
-            return Ok(VcpuEmulation::Interrupted);
-        }
-
+        // Enter KVM_RUN even when a kick has already set immediate_exit. KVM finishes the
+        // MMIO or PIO exit handled since the last run before it checks immediate_exit, so the
+        // vCPU cannot pause holding a completion that the next KVM_RUN would apply.
         match self.kvm_vcpu.fd.run() {
             Err(ref err) if err.errno() == libc::EINTR => {
                 self.kvm_vcpu.fd.set_kvm_immediate_exit(0);
@@ -694,6 +691,7 @@ pub(crate) mod tests {
     use std::sync::{Arc, Barrier, Mutex};
 
     use linux_loader::loader::KernelLoader;
+    use vm_memory::Bytes;
     use vmm_sys_util::errno;
 
     use super::*;
@@ -1031,17 +1029,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_immediate_exit_shortcircuits_execution() {
+    fn test_immediate_exit_interrupts_emulation() {
         let (_, mut vcpu) = setup_vcpu(0x1000);
 
         vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
-        // Set a dummy value to be returned by the emulate call
         let result = vcpu.run_emulation().expect("Failed to run emulation");
         assert_eq!(
             result,
             VcpuEmulation::Interrupted,
-            "The Immediate Exit short-circuit should have prevented the execution of emulate"
+            "KVM_RUN should have returned EINTR without entering the guest"
         );
+        assert_eq!(vcpu.kvm_vcpu.fd.get_kvm_run().immediate_exit, 0);
 
         let event_sender = vcpu.event_sender.take().expect("vCPU already started");
         let _ = event_sender.send(VcpuEvent::Resume);
@@ -1053,6 +1051,79 @@ pub(crate) mod tests {
             vcpu.kvm_vcpu.fd.get_kvm_run().immediate_exit,
             "Immediate Exit should have been disabled by sending Resume to a paused VM"
         )
+    }
+
+    #[test]
+    fn test_interrupted_run_completes_handled_mmio_read() {
+        const IO_VALUE: u32 = 0xdead_beef;
+        let (vm, mut vcpu) = setup_vcpu(0x1000);
+        // Guest code loads 32 bits from 0x2000, which is outside guest memory.
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Real-mode mov eax, [0x2000].
+            vm.guest_memory()
+                .write_slice(&[0x66, 0xa1, 0x00, 0x20], GuestAddress(0))
+                .unwrap();
+            let mut sregs = vcpu.kvm_vcpu.fd.get_sregs().unwrap();
+            sregs.cs.base = 0;
+            sregs.cs.selector = 0;
+            sregs.ds.base = 0;
+            sregs.ds.selector = 0;
+            vcpu.kvm_vcpu.fd.set_sregs(&sregs).unwrap();
+            let mut regs = vcpu.kvm_vcpu.fd.get_regs().unwrap();
+            regs.rip = 0;
+            regs.rax = 0;
+            regs.rflags = 2;
+            vcpu.kvm_vcpu.fd.set_regs(&regs).unwrap();
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // ldr w1, [x0]. Core register IDs: X0 is 0x6030_0000_0010_0000, X1 is
+            // 0x6030_0000_0010_0002.
+            vm.guest_memory()
+                .write_slice(&[0x01, 0x00, 0x40, 0xb9], GuestAddress(0))
+                .unwrap();
+            vcpu.kvm_vcpu
+                .fd
+                .set_one_reg(crate::arch::aarch64::regs::PC, &0_u64.to_le_bytes())
+                .unwrap();
+            vcpu.kvm_vcpu
+                .fd
+                .set_one_reg(0x6030_0000_0010_0000, &0x2000_u64.to_le_bytes())
+                .unwrap();
+        }
+
+        match vcpu.kvm_vcpu.fd.run().unwrap() {
+            VcpuExit::MmioRead(0x2000, data) => data.copy_from_slice(&IO_VALUE.to_le_bytes()),
+            exit => panic!("unexpected exit: {exit:?}"),
+        }
+        // A pause kick that lands while userspace handles the exit sets immediate_exit.
+        vcpu.kvm_vcpu.fd.set_kvm_immediate_exit(1);
+        assert_eq!(vcpu.run_emulation().unwrap(), VcpuEmulation::Interrupted);
+
+        // KVM retired the load: the data reached the register and the PC moved past it.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let regs = vcpu.kvm_vcpu.fd.get_regs().unwrap();
+            assert_eq!((regs.rip, regs.rax), (4, u64::from(IO_VALUE)));
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut pc = [0; 8];
+            let mut x1 = [0; 8];
+            vcpu.kvm_vcpu
+                .fd
+                .get_one_reg(crate::arch::aarch64::regs::PC, &mut pc)
+                .unwrap();
+            vcpu.kvm_vcpu
+                .fd
+                .get_one_reg(0x6030_0000_0010_0002, &mut x1)
+                .unwrap();
+            assert_eq!(
+                (u64::from_le_bytes(pc), u64::from_le_bytes(x1)),
+                (4, u64::from(IO_VALUE))
+            );
+        }
     }
 
     #[test]
