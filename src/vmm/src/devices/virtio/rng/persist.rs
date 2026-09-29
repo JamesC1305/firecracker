@@ -57,6 +57,10 @@ impl<'a> Persist<'a> for Entropy {
         self.set_avail_features(state.virtio_state.avail_features);
         Ok(())
     }
+
+    fn check_reset(&self, _state: &Self::State) -> Result<(), crate::snapshot::ResetUnsupported> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

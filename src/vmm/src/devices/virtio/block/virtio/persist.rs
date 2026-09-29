@@ -150,6 +150,16 @@ impl<'a> Persist<'a> for VirtioBlock {
             .restore_in_place(&state.rate_limiter_state, ())
             .map_err(VirtioBlockError::RateLimiter)
     }
+
+    /// In-flight asynchronous I/O can write guest memory after reset reverted it.
+    fn check_reset(&self, _state: &Self::State) -> Result<(), crate::snapshot::ResetUnsupported> {
+        if self.file_engine_type() == FileEngineType::Async {
+            return Err(crate::snapshot::ResetUnsupported(
+                "block devices with the async I/O engine",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

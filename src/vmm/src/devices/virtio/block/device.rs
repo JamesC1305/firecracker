@@ -303,4 +303,14 @@ impl<'a> Persist<'a> for Block {
             _ => Err(BlockError::InvalidBlockBackend),
         }
     }
+
+    fn check_reset(&self, state: &Self::State) -> Result<(), crate::snapshot::ResetUnsupported> {
+        match (self, state) {
+            (Self::Virtio(block), BlockState::Virtio(state)) => block.check_reset(state),
+            (Self::VhostUser(_), _) => Err(crate::snapshot::ResetUnsupported(
+                "vhost-user block devices",
+            )),
+            _ => Err(crate::snapshot::ResetUnsupported("block backend changes")),
+        }
+    }
 }

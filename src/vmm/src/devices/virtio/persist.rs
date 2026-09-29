@@ -219,6 +219,10 @@ impl<'a> Persist<'a> for MmioTransport {
             .store(state.interrupt_status, Ordering::SeqCst);
         Ok(())
     }
+
+    fn check_reset(&self, _state: &Self::State) -> Result<(), crate::snapshot::ResetUnsupported> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

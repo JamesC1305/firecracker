@@ -612,7 +612,7 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
             net_devices,
             vsock_device,
             balloon_device,
-            // MMDS configuration is unchanged.
+            // MMDS configuration is unchanged; the VMM restores its datastore and token key.
             mmds: _,
             entropy_device,
             pmem_devices,
@@ -658,12 +658,25 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
         Ok(())
     }
 
-    fn check_reset(&self, _state: &Self::State) -> Result<(), ResetUnsupported> {
-        if self.virtio_devices.is_empty() {
-            Ok(())
-        } else {
-            Err(ResetUnsupported("virtio devices"))
+    fn check_reset(&self, state: &Self::State) -> Result<(), ResetUnsupported> {
+        let saved_count = state.block_devices.len()
+            + state.net_devices.len()
+            + state.pmem_devices.len()
+            + usize::from(state.balloon_device.is_some())
+            + usize::from(state.vsock_device.is_some())
+            + usize::from(state.entropy_device.is_some())
+            + usize::from(state.memory_device.is_some());
+        if self.virtio_devices.len() != saved_count {
+            return Err(ResetUnsupported("device topology changes"));
         }
+        self.check_devices_reset::<Balloon>(state.balloon_device.as_slice())?;
+        self.check_devices_reset::<Block>(state.block_devices.as_slice())?;
+        self.check_devices_reset::<Net>(state.net_devices.as_slice())?;
+        self.check_devices_reset::<Vsock<VsockUnixBackend>>(state.vsock_device.as_slice())?;
+        self.check_devices_reset::<Entropy>(state.entropy_device.as_slice())?;
+        self.check_devices_reset::<Pmem>(state.pmem_devices.as_slice())?;
+        self.check_devices_reset::<VirtioMem>(state.memory_device.as_slice())?;
+        Ok(())
     }
 }
 
@@ -730,6 +743,29 @@ impl MMIOVirtioDevices {
                 .lock()
                 .expect("Poisoned lock")
                 .activate_restored(activated(&state.device_state))?;
+        }
+        Ok(())
+    }
+
+    fn check_devices_reset<'a, D>(
+        &self,
+        states: &[VirtioDeviceState<D::State>],
+    ) -> Result<(), ResetUnsupported>
+    where
+        D: VirtioDevice + Persist<'a> + 'static,
+    {
+        for state in states {
+            let device = self
+                .get_virtio_device(D::const_device_type(), &state.device_id)
+                .ok_or(ResetUnsupported("device topology changes"))?;
+            let transport = device.inner.lock().expect("Poisoned lock");
+            transport
+                .locked_device()
+                .as_any()
+                .downcast_ref::<D>()
+                .ok_or(ResetUnsupported("device type changes"))?
+                .check_reset(&state.device_state)?;
+            transport.check_reset(&state.transport_state)?;
         }
         Ok(())
     }

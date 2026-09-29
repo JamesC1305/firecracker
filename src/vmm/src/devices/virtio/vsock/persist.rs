@@ -80,6 +80,10 @@ impl<'a> Persist<'a> for VsockUnixBackend {
         self.local_port_last = state.local_port_last;
         Ok(())
     }
+
+    fn check_reset(&self, _state: &Self::State) -> Result<(), crate::snapshot::ResetUnsupported> {
+        Ok(())
+    }
 }
 
 impl<'a, B> Persist<'a> for Vsock<B>
@@ -143,6 +147,10 @@ where
         self.backend
             .post_restore(&state.backend, load)
             .map_err(VsockError::VsockUdsBackend)
+    }
+
+    fn check_reset(&self, state: &Self::State) -> Result<(), crate::snapshot::ResetUnsupported> {
+        self.backend.check_reset(&state.backend)
     }
 }
 

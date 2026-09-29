@@ -141,6 +141,10 @@ impl<'a> Persist<'a> for Net {
         }
         Ok(())
     }
+
+    fn check_reset(&self, _state: &Self::State) -> Result<(), crate::snapshot::ResetUnsupported> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

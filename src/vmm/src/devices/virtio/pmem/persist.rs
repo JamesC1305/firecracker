@@ -81,6 +81,14 @@ impl<'a> Persist<'a> for Pmem {
             .restore_in_place(&state.rate_limiter_state, ())
             .map_err(PmemPersistError::RateLimiter)
     }
+
+    fn check_reset(&self, _state: &Self::State) -> Result<(), crate::snapshot::ResetUnsupported> {
+        if self.config.read_only {
+            Ok(())
+        } else {
+            Err(crate::snapshot::ResetUnsupported("writable pmem devices"))
+        }
+    }
 }
 
 #[cfg(test)]

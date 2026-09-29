@@ -108,6 +108,10 @@ impl<'a> Persist<'a> for VirtioMem {
         self.set_avail_features(state.virtio_state.avail_features);
         Ok(())
     }
+
+    fn check_reset(&self, _state: &Self::State) -> Result<(), crate::snapshot::ResetUnsupported> {
+        Err(crate::snapshot::ResetUnsupported("virtio-mem devices"))
+    }
 }
 
 #[cfg(test)]

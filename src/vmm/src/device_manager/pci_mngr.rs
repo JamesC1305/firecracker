@@ -706,7 +706,7 @@ impl<'a> Persist<'a> for PciDevices {
             net_devices,
             vsock_device,
             balloon_device,
-            // MMDS configuration is unchanged.
+            // MMDS configuration is unchanged; the VMM restores its datastore and token key.
             mmds: _,
             entropy_device,
             pmem_devices,

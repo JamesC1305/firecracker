@@ -163,6 +163,10 @@ impl<'a> Persist<'a> for Balloon {
 
         Ok(())
     }
+
+    fn check_reset(&self, _state: &Self::State) -> Result<(), crate::snapshot::ResetUnsupported> {
+        Err(crate::snapshot::ResetUnsupported("balloon devices"))
+    }
 }
 
 #[cfg(test)]

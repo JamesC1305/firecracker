@@ -3,6 +3,7 @@
 
 //! Defines state structures for saving/restoring a Firecracker microVM.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -29,7 +30,9 @@ use crate::device_manager::{DevicePersistError, DevicesState};
 // Re-exported so external crates inspecting a `MicrovmState` snapshot can match on the
 // serialised virtio transport variant.
 pub use crate::device_manager::VirtioDevicesState;
+use crate::devices::virtio::device::VirtioDeviceId;
 use crate::logger::{info, warn};
+use crate::mmds::data_store::MmdsData;
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Snapshot;
@@ -113,6 +116,11 @@ pub struct ResetContext {
     pub mpidrs: Vec<u64>,
     /// Device state to reapply while keeping host resources open.
     pub device_states: DevicesState,
+    /// Whether each virtio device was activated after load. In-place restore cannot add,
+    /// remove, activate or deactivate a device, so reset requires the same devices here.
+    pub virtio_devices: HashMap<VirtioDeviceId, bool>,
+    /// MMDS data after load.
+    pub mmds_data: MmdsData,
     /// Whether snapshot load applied wall-clock time to kvmclock.
     pub clock_realtime: bool,
     /// Pages written since load whose dirty bits snapshot creation cleared.
@@ -197,6 +205,10 @@ pub enum ResetSnapshotError {
     Poisoned,
     /// Reset does not support {0}.
     Unsupported(&'static str),
+    /// Virtio devices were added, removed, activated or reset since the snapshot was loaded.
+    DevicesChanged,
+    /// Failed to create a new MMDS token key: {0}
+    MmdsTokenKey(#[from] crate::mmds::data_store::MmdsDatastoreError),
     /// Failed to complete pending vCPU I/O: {0}
     CompleteVcpuIo(crate::vstate::vm::RestoreVcpuStatesError),
     /// Failed to get the dirty bitmap: {0}
@@ -268,6 +280,7 @@ pub fn reset_to_snapshot(vmm: &mut Vmm) -> Result<(), ResetSnapshotError> {
     if vmm.instance_info.state != InstanceState::Paused {
         return Err(ResetSnapshotError::NotPaused);
     }
+    let mmds = vmm.get_mmds();
     let context = vmm
         .reset_context
         .as_mut()
@@ -285,14 +298,32 @@ pub fn reset_to_snapshot(vmm: &mut Vmm) -> Result<(), ResetSnapshotError> {
     kvm_vm
         .complete_vcpu_io()
         .map_err(ResetSnapshotError::CompleteVcpuIo)?;
+    // The per-device checks pair each live device with its saved state, so a device added
+    // since load reports the topology change rather than its kind.
+    if vmm.device_manager.virtio_device_activation() != context.virtio_devices {
+        return Err(ResetSnapshotError::DevicesChanged);
+    }
     vmm.device_manager
         .check_reset(&context.device_states)
         .map_err(|error| ResetSnapshotError::Unsupported(error.0))?;
+    // Create the new MMDS token key now, so that a failure leaves the microVM unchanged.
+    let mmds_authority = mmds
+        .as_ref()
+        .map(|_| crate::mmds::data_store::Mmds::new_token_authority())
+        .transpose()?;
 
     // A failure from here on can leave the microVM partly reset, which poisons it.
     let result = apply_reset(kvm_vm, &mut vmm.device_manager, context);
     context.poisoned = result.is_err();
-    result
+    result?;
+    if let (Some(mmds), Some(authority)) = (mmds, mmds_authority) {
+        mmds.lock().expect("Poisoned lock").restore_data(
+            &context.mmds_data,
+            authority,
+            &vmm.instance_info.id,
+        );
+    }
+    Ok(())
 }
 
 /// Returns guest memory, the vCPUs, the in-kernel VM state and the devices to the state in
@@ -644,12 +675,18 @@ pub fn restore_from_snapshot(
             .as_kvm()
             .map(|vm| vm.guest_memory().clean_dirty_bitmap())
             .unwrap_or_default();
+        let mmds_data = locked_vmm
+            .get_mmds()
+            .map(|mmds| mmds.lock().expect("Poisoned lock").save_data())
+            .unwrap_or_default();
         locked_vmm.reset_context = Some(ResetContext {
             vm_state: microvm_state.vm_state,
             #[cfg(target_arch = "aarch64")]
             mpidrs: crate::construct_kvm_mpidrs(&microvm_state.vcpu_states),
             vcpu_states: microvm_state.vcpu_states,
             device_states: microvm_state.device_states,
+            virtio_devices: locked_vmm.device_manager.virtio_device_activation(),
+            mmds_data,
             clock_realtime: params.clock_realtime,
             dirty_pages,
             poisoned: false,
@@ -919,22 +956,37 @@ mod tests {
         track_dirty_pages: bool,
         pci_enabled: bool,
     ) -> (Arc<Mutex<Vmm>>, EventManager) {
-        use crate::builder::build_microvm_for_boot;
-        use crate::seccomp::get_empty_filters;
-        use crate::test_utils::mock_resources::{MockBootSourceConfig, MockVmResources};
         use crate::vmm_config::balloon::BalloonBuilder;
-        use crate::vmm_config::snapshot::{MemBackendConfig, SnapshotType};
+
+        let mut resources = fixture_resources(pci_enabled);
+        // Test builds give the resources a balloon by default, and reset rejects balloons.
+        resources.balloon = BalloonBuilder::new();
+        snapshot_load_fixture_from(&resources, track_dirty_pages)
+    }
+
+    fn fixture_resources(pci_enabled: bool) -> VmResources {
+        use crate::test_utils::mock_resources::{MockBootSourceConfig, MockVmResources};
 
         let boot_source = MockBootSourceConfig::new().with_default_boot_args().into();
         let mut resources: VmResources =
             MockVmResources::new().with_boot_source(boot_source).into();
         resources.pci_enabled = pci_enabled;
-        // Test builds give the resources a balloon by default, and reset rejects balloons.
-        resources.balloon = BalloonBuilder::new();
+        resources
+    }
+
+    /// Loads a Full snapshot of an unbooted microVM built from `resources`.
+    fn snapshot_load_fixture_from(
+        resources: &VmResources,
+        track_dirty_pages: bool,
+    ) -> (Arc<Mutex<Vmm>>, EventManager) {
+        use crate::builder::build_microvm_for_boot;
+        use crate::seccomp::get_empty_filters;
+        use crate::vmm_config::snapshot::{MemBackendConfig, SnapshotType};
+
         let mut source_events = EventManager::new().unwrap();
         let source = build_microvm_for_boot(
             &InstanceInfo::default(),
-            &resources,
+            resources,
             &mut source_events,
             &get_empty_filters(),
         )
@@ -1225,11 +1277,11 @@ mod tests {
         ));
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
-    fn test_reset_rejects_virtio_before_poison() {
+    fn test_reset_rejects_device_changes_before_poison() {
         use crate::builder::tests::insert_entropy_device;
 
+        // A device added after load.
         let (vmm, mut events) = snapshot_load_fixture(true);
         let mut vmm = vmm.lock().unwrap();
         insert_entropy_device(
@@ -1240,7 +1292,17 @@ mod tests {
         );
         assert!(matches!(
             reset_to_snapshot(&mut vmm),
-            Err(ResetSnapshotError::Unsupported("virtio devices"))
+            Err(ResetSnapshotError::DevicesChanged)
+        ));
+        assert!(!vmm.reset_poisoned());
+
+        // A snapshot-loaded device that reset cannot restore in place. The test build's
+        // default resources include a balloon.
+        let (vmm, _events) = snapshot_load_fixture_from(&fixture_resources(false), true);
+        let mut vmm = vmm.lock().unwrap();
+        assert!(matches!(
+            reset_to_snapshot(&mut vmm),
+            Err(ResetSnapshotError::Unsupported("balloon devices"))
         ));
         assert!(!vmm.reset_poisoned());
     }

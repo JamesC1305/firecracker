@@ -5,6 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -417,6 +418,15 @@ impl DeviceManager {
             VirtioDevices::Mmio(mmio_devices) => mmio_devices.for_each_virtio_device(&mut f),
             VirtioDevices::Pci(pci_devices) => pci_devices.for_each_virtio_device(&mut f),
         }
+    }
+
+    /// Returns whether each virtio device is activated.
+    pub fn virtio_device_activation(&self) -> HashMap<VirtioDeviceId, bool> {
+        let mut devices = HashMap::new();
+        self.for_each_virtio_device(|device_type, device| {
+            devices.insert((device_type, device.id().to_owned()), device.is_activated());
+        });
+        devices
     }
 
     fn for_each_virtio_device_mut(
