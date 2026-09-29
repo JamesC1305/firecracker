@@ -352,6 +352,18 @@ impl VsockMuxer {
         Ok(muxer)
     }
 
+    /// Drops all connections and their listeners, and keeps listening on the host socket if
+    /// it did.
+    pub(crate) fn drop_connections(&mut self) -> Result<(), VsockUnixBackendError> {
+        let listening = self.listener_map.contains_key(&self.host_sock.as_raw_fd());
+        self.reset();
+        // `reset` also stops listening on the host socket.
+        if listening {
+            self.add_listener(self.host_sock.as_raw_fd(), EpollListener::HostSock)?;
+        }
+        Ok(())
+    }
+
     /// Return the file system path of the host-side Unix socket.
     pub fn host_sock_path(&self) -> &str {
         &self.host_sock_path
@@ -871,6 +883,7 @@ mod tests {
     use super::super::super::csm::defs as csm_defs;
     use super::*;
     use crate::devices::virtio::vsock::device::{RXQ_INDEX, TXQ_INDEX};
+    use crate::devices::virtio::vsock::persist::VsockBackendState;
     use crate::devices::virtio::vsock::test_utils;
     use crate::devices::virtio::vsock::test_utils::TestContext as VsockTestContext;
 
@@ -1780,5 +1793,22 @@ mod tests {
 
         // Check that the connection was removed.
         assert_eq!(METRICS.conns_removed.count(), conns_removed + 1);
+    }
+
+    #[test]
+    fn test_apply() {
+        let mut ctx = MuxerTestContext::new("apply");
+        let (_old_stream, _) = ctx.local_connect(1025);
+        let state = VsockBackendState {
+            uds_path: ctx.muxer.host_sock_path.clone(),
+            local_port_last: 0x5000_1234,
+        };
+
+        ctx.muxer.restore_in_place(&state, ()).unwrap();
+
+        // The connection is gone, and the host socket still accepts new ones.
+        assert!(ctx.muxer.conn_map.is_empty());
+        let (_stream, local_port) = ctx.local_connect(1026);
+        assert_eq!(local_port, state.local_port_last + 1);
     }
 }

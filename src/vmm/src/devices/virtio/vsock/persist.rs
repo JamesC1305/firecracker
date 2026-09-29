@@ -75,9 +75,29 @@ impl Persist<'_> for VsockUnixBackend {
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        let mut backend = Self::new(constructor_args.cid, state.uds_path.clone())?;
-        backend.local_port_last = state.local_port_last;
+        let mut backend = Self::create((constructor_args.cid, state.uds_path.clone()), state)?;
+        backend.restore_in_place(state, ())?;
         Ok(backend)
+    }
+}
+
+impl VsockUnixBackend {
+    pub fn create(
+        (cid, path): (u64, String),
+        _state: &VsockBackendState,
+    ) -> Result<Self, VsockUnixBackendError> {
+        Self::new(cid, path)
+    }
+
+    /// Drops all connections and keeps the host socket.
+    pub fn restore_in_place(
+        &mut self,
+        state: &VsockBackendState,
+        _: (),
+    ) -> Result<(), VsockUnixBackendError> {
+        self.drop_connections()?;
+        self.local_port_last = state.local_port_last;
+        Ok(())
     }
 }
 
@@ -157,8 +177,25 @@ pub(crate) mod tests {
             }
         }
 
-        fn restore(_: Self::ConstructorArgs, _state: &Self::State) -> Result<Self, Self::Error> {
-            Ok(TestBackend::new())
+        fn restore(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
+            let mut backend = Self::new();
+            backend.restore_in_place(state, ())?;
+            Ok(backend)
+        }
+    }
+
+    impl TestBackend {
+        pub fn restore_in_place(
+            &mut self,
+            _state: &VsockBackendState,
+            _: (),
+        ) -> Result<(), VsockUnixBackendError> {
+            self.rx_err = None;
+            self.pending_rx = false;
+            self.rx_ok_cnt = 0;
+            self.tx_ok_cnt = 0;
+            self.evset = None;
+            Ok(())
         }
     }
 
