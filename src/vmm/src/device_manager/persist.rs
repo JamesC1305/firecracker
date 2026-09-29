@@ -383,10 +383,7 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
 
                     // Save state after potential notification to the guest. This
                     // way we save changes to the queue the notification can cause.
-                    let device_state = VsockState {
-                        backend: vsock.backend().save(),
-                        frontend: vsock.save(),
-                    };
+                    let device_state = vsock.save();
 
                     states.vsock_device = Some(VirtioDeviceState {
                         device_id,
@@ -601,7 +598,7 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
                     mem: mem.clone(),
                     backend,
                 },
-                &vsock_state.device_state.frontend,
+                &vsock_state.device_state,
                 (),
                 &mut load,
             )?));

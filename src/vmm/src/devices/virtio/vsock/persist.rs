@@ -84,30 +84,40 @@ impl Provision<'_> for VsockUnixBackend {
     }
 }
 
-impl<B> Persist<'_> for Vsock<B>
+impl<'a, B> Persist<'a> for Vsock<B>
 where
-    B: VsockBackend + 'static + Debug,
+    B: VsockBackend
+        + Persist<'a, State = VsockBackendState, Error = VsockUnixBackendError>
+        + 'static
+        + Debug,
 {
-    type State = VsockFrontendState;
+    type State = VsockState;
     type ApplyArgs = ();
     type Error = VsockError;
 
     fn save(&self) -> Self::State {
-        VsockFrontendState {
-            cid: self.cid(),
-            virtio_state: VirtioDeviceState::from_device(self),
-            pending_event_ack: self.pending_event_ack,
+        VsockState {
+            backend: self.backend().save(),
+            frontend: VsockFrontendState {
+                cid: self.cid(),
+                virtio_state: VirtioDeviceState::from_device(self),
+                pending_event_ack: self.pending_event_ack,
+            },
         }
     }
 }
 
-impl<B> Provision<'_> for Vsock<B>
+impl<'a, B> Provision<'a> for Vsock<B>
 where
-    B: VsockBackend + 'static + Debug,
+    B: VsockBackend
+        + Persist<'a, State = VsockBackendState, Error = VsockUnixBackendError>
+        + 'static
+        + Debug,
 {
     type ProvisionArgs = VsockProvisionArgs<B>;
 
     fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
+        let state = &state.frontend;
         // Restore queues.
         let queues = state
             .virtio_state
@@ -159,14 +169,14 @@ pub(crate) mod tests {
 
     #[test]
     fn test_persist_pending_event_ack() {
-        // The RX gate must survive a save/restore cycle: a restored device must keep
-        // gating RX while a TRANSPORT_RESET ack is outstanding, and must not gate RX
+        // The RX gate must survive a save/restore cycle: a restored device must keep gating
+        // RX while a transport-event acknowledgment is outstanding, and must not gate RX
         // when none is.
         let mut ctx = TestContext::new();
         for armed in [false, true] {
             ctx.device.pending_event_ack = armed;
             let state = ctx.device.save();
-            assert_eq!(state.pending_event_ack, armed);
+            assert_eq!(state.frontend.pending_event_ack, armed);
 
             let restored = Vsock::provision(
                 VsockProvisionArgs {
@@ -195,11 +205,7 @@ pub(crate) mod tests {
         ];
 
         // Test serialization
-        // Save backend and device state separately.
-        let state = VsockState {
-            backend: ctx.device.backend().save(),
-            frontend: ctx.device.save(),
-        };
+        let state = ctx.device.save();
 
         let serialized_data = bitcode::serialize(&state).unwrap();
 
@@ -213,7 +219,7 @@ pub(crate) mod tests {
                     TestBackend::new()
                 },
             },
-            &restored_state.frontend,
+            &restored_state,
         )
         .unwrap();
 
