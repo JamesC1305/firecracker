@@ -886,6 +886,7 @@ mod tests {
     use crate::devices::virtio::vsock::persist::VsockBackendState;
     use crate::devices::virtio::vsock::test_utils;
     use crate::devices::virtio::vsock::test_utils::TestContext as VsockTestContext;
+    use crate::snapshot::Persist;
 
     const PEER_CID: u64 = 3;
     const PEER_BUF_ALLOC: u32 = 64 * 1024;

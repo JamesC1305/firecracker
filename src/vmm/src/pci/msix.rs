@@ -14,6 +14,7 @@ use zerocopy::FromBytes;
 use crate::logger::{debug, error, warn};
 use crate::pci::configuration::PciCapability;
 use crate::pci::{PciCapabilityId, PciSBDF};
+use crate::snapshot::Persist;
 use crate::vstate::interrupts::{InterruptError, MsixVectorGroup};
 
 const MAX_MSIX_VECTORS_PER_DEVICE: u16 = 2048;
@@ -437,9 +438,13 @@ impl MsixConfig {
     }
 }
 
-impl MsixConfig {
-    /// Returns the current state of the component.
-    pub fn save(&self) -> MsixConfigState {
+impl<'a> Persist<'a> for MsixConfig {
+    type State = MsixConfigState;
+    type ConstructorArgs = std::convert::Infallible;
+    type ApplyArgs = ();
+    type Error = InterruptError;
+
+    fn save(&self) -> Self::State {
         MsixConfigState {
             table_entries: self.table_entries.clone(),
             pba_entries: self.pba_entries.clone(),
@@ -449,16 +454,20 @@ impl MsixConfig {
         }
     }
 
+    fn create(never: Self::ConstructorArgs, _state: &Self::State) -> Result<Self, Self::Error> {
+        match never {}
+    }
+
     /// Applies guest state and stages routes using the live GSIs and eventfds.
     /// All IRQFDs remain disabled until the owner calls
     /// [`crate::vstate::vm::KvmVm::set_gsi_routes`], then [`Self::enable_unmasked_vectors`].
     /// Pending bits are restored without injecting interrupts; live eventfd signals are discarded
     /// independently of the saved PBA.
-    pub fn restore_in_place(
+    fn restore_in_place(
         &mut self,
-        state: &MsixConfigState,
-        _: (),
-    ) -> Result<(), InterruptError> {
+        state: &Self::State,
+        _: Self::ApplyArgs,
+    ) -> Result<(), Self::Error> {
         let num_vectors = state.checked_gsis()?.len();
         if self.vectors.vectors.len() != num_vectors {
             return Err(InterruptError::MsixStateSizeMismatch(format!(

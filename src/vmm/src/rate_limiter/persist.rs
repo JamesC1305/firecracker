@@ -20,9 +20,10 @@ pub struct TokenBucketState {
     elapsed_ns: u64,
 }
 
-impl Persist<'_> for TokenBucket {
+impl<'a> Persist<'a> for TokenBucket {
     type State = TokenBucketState;
     type ConstructorArgs = ();
+    type ApplyArgs = ();
     type Error = io::Error;
 
     fn save(&self) -> Self::State {
@@ -36,17 +37,17 @@ impl Persist<'_> for TokenBucket {
         }
     }
 
-    fn restore(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let mut bucket = Self::new(state.size, state.one_time_burst, state.refill_time)
-            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-        bucket.restore_in_place(state, ())?;
-        Ok(bucket)
+    fn create(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
+        Self::new(state.size, state.one_time_burst, state.refill_time)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))
     }
-}
 
-impl TokenBucket {
     /// Restores runtime state after construction from the saved bucket configuration.
-    pub fn restore_in_place(&mut self, state: &TokenBucketState, _: ()) -> Result<(), io::Error> {
+    fn restore_in_place(
+        &mut self,
+        state: &Self::State,
+        _: Self::ApplyArgs,
+    ) -> Result<(), Self::Error> {
         let now = Instant::now();
         let last_update = now
             .checked_sub(Duration::from_nanos(state.elapsed_ns))
@@ -67,9 +68,10 @@ pub struct RateLimiterState {
     bandwidth: Option<TokenBucketState>,
 }
 
-impl Persist<'_> for RateLimiter {
+impl<'a> Persist<'a> for RateLimiter {
     type State = RateLimiterState;
     type ConstructorArgs = ();
+    type ApplyArgs = ();
     type Error = io::Error;
 
     fn save(&self) -> Self::State {
@@ -79,20 +81,19 @@ impl Persist<'_> for RateLimiter {
         }
     }
 
-    fn restore(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let mut rate_limiter = Self::default();
-        rate_limiter.restore_in_place(state, ())?;
-        Ok(rate_limiter)
+    fn create(_: Self::ConstructorArgs, _state: &Self::State) -> Result<Self, Self::Error> {
+        Ok(Self::default())
     }
-}
 
-impl RateLimiter {
     /// Restores token buckets while retaining the EventManager-registered timer fd.
-    pub fn restore_in_place(&mut self, state: &RateLimiterState, _: ()) -> Result<(), io::Error> {
+    fn restore_in_place(
+        &mut self,
+        state: &Self::State,
+        _: Self::ApplyArgs,
+    ) -> Result<(), Self::Error> {
         let apply_bucket = |state: &TokenBucketState| -> Result<TokenBucket, io::Error> {
             // Rebuild fixed bucket parameters too, since runtime PATCH can replace them.
-            let mut bucket = TokenBucket::new(state.size, state.one_time_burst, state.refill_time)
-                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let mut bucket = TokenBucket::create((), state)?;
             bucket.restore_in_place(state, ())?;
             Ok(bucket)
         };

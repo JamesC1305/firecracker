@@ -23,6 +23,7 @@ use vmm_sys_util::eventfd::EventFd;
 use crate::devices::legacy::EventFdTrigger;
 use crate::logger::{IncMetric, SharedIncMetric, error, warn};
 use crate::rate_limiter::{BucketReduction, TokenBucket};
+use crate::snapshot::Persist;
 use crate::utils::usize_to_u64;
 use crate::vstate::bus::BusDevice;
 
@@ -261,14 +262,29 @@ impl<I: Read + AsRawFd + Send + Debug> SerialWrapper<EventFdTrigger, SerialEvent
     }
 }
 
-impl<I: Read + AsRawFd + Send + Debug> SerialWrapper<EventFdTrigger, SerialEventsWrapper, I> {
-    pub fn save(&self) -> SerialState {
+impl<'a, I: Read + AsRawFd + Send + Debug> Persist<'a>
+    for SerialWrapper<EventFdTrigger, SerialEventsWrapper, I>
+{
+    type State = SerialState;
+    type ConstructorArgs = std::convert::Infallible;
+    type ApplyArgs = ();
+    type Error = RawIOError;
+
+    fn save(&self) -> Self::State {
         self.serial.state()
+    }
+
+    fn create(never: Self::ConstructorArgs, _state: &Self::State) -> Result<Self, Self::Error> {
+        match never {}
     }
 
     /// Restores UART registers and input buffers while retaining the live eventfds,
     /// input source and output sink, including its rate limiter.
-    pub fn restore_in_place(&mut self, state: &SerialState, _: ()) -> Result<(), RawIOError> {
+    fn restore_in_place(
+        &mut self,
+        state: &Self::State,
+        _: Self::ApplyArgs,
+    ) -> Result<(), Self::Error> {
         // vm-superio applies a state only by building a new `Serial`, and cannot hand back the
         // eventfds of the old one. KVM and the event loop watch those descriptors, so the new
         // `Serial` shares them instead of getting new ones.

@@ -38,6 +38,7 @@ use crate::pci::{
     PciCapabilityId, PciClassCode, PciDevice, PciMassStorageSubclass, PciNetworkControllerSubclass,
     PciSBDF,
 };
+use crate::snapshot::Persist;
 use crate::vstate::bus::BusDevice;
 use crate::vstate::interrupts::{InterruptError, MsixVectorGroup};
 use crate::vstate::vm::KvmVm;
@@ -434,6 +435,12 @@ impl VirtioPciDevice {
         }
     }
 
+    /// Sets the BAR address that the device is mapped at before its saved registers are
+    /// applied. The mapping can differ from partially written guest BAR registers.
+    pub(crate) fn set_restored_bar_address(&mut self, address: u64) {
+        self.bar_address = address;
+    }
+
     /// Enable unmasked MSI-X vectors by registering IRQFDs with KVM.
     ///
     /// Must be called after the GSI routes have been set up (see [KvmVm::set_gsi_routes]).
@@ -761,8 +768,13 @@ impl VirtioPciDevice {
     }
 }
 
-impl VirtioPciDevice {
-    pub fn save(&self) -> VirtioPciDeviceState {
+impl<'a> Persist<'a> for VirtioPciDevice {
+    type State = VirtioPciDeviceState;
+    type ConstructorArgs = std::convert::Infallible;
+    type ApplyArgs = ();
+    type Error = VirtioPciDeviceError;
+
+    fn save(&self) -> Self::State {
         VirtioPciDeviceState {
             sbdf: self.sbdf,
             device_activated: self.device_activated.load(Ordering::Acquire),
@@ -784,15 +796,19 @@ impl VirtioPciDevice {
         }
     }
 
+    fn create(never: Self::ConstructorArgs, _state: &Self::State) -> Result<Self, Self::Error> {
+        match never {}
+    }
+
     /// Applies transport state while retaining its bus mapping, ioeventfds and selector Arcs.
-    /// Reset requires unchanged activation and BAR mapping. Load activates a saved-active
-    /// backend before transport registration. The owner installs the staged GSI routes before
+    /// Reset requires unchanged activation and BAR mapping. Load-only activation belongs to
+    /// post_restore. The owner installs the staged GSI routes before
     /// calling [`Self::enable_unmasked_vectors`].
-    pub fn restore_in_place(
+    fn restore_in_place(
         &mut self,
-        state: &VirtioPciDeviceState,
-        _: (),
-    ) -> Result<(), VirtioPciDeviceError> {
+        state: &Self::State,
+        _: Self::ApplyArgs,
+    ) -> Result<(), Self::Error> {
         self.msix_config
             .lock()
             .expect("Poisoned lock")
@@ -846,6 +862,14 @@ impl VirtioPciDevice {
 
         self.device_activated
             .store(state.device_activated, Ordering::Release);
+        Ok(())
+    }
+
+    fn post_restore(
+        &mut self,
+        state: &Self::State,
+        _load: &mut crate::snapshot::LoadContext<'_>,
+    ) -> Result<(), Self::Error> {
         // The transport flag has already been restored. Inspect the backend, not that flag.
         let mut device = self.device.lock().expect("Poisoned lock");
         if state.device_activated && !device.is_activated() {
@@ -1242,6 +1266,7 @@ mod tests {
     use crate::pci::msix::MsixCap;
     use crate::pci::{PciCapabilityId, PciClassCode, PciDevice};
     use crate::rate_limiter::RateLimiter;
+    use crate::snapshot::Persist;
 
     /// The address the single virtio-pci BAR of a freshly booted VM ends up
     /// at: the first CAPABILITY_BAR_SIZE-aligned address of the 32-bit MMIO

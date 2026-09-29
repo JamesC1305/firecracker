@@ -24,8 +24,7 @@ pub struct PmemState {
 }
 
 #[derive(Debug)]
-pub struct PmemConstructorArgs<'a> {
-    pub mem: &'a GuestMemoryMmap,
+pub struct PmemConstructorArgs {
     pub vm: Arc<KvmVm>,
 }
 
@@ -43,7 +42,8 @@ pub enum PmemPersistError {
 
 impl<'a> Persist<'a> for Pmem {
     type State = PmemState;
-    type ConstructorArgs = PmemConstructorArgs<'a>;
+    type ConstructorArgs = PmemConstructorArgs;
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = PmemPersistError;
 
     fn save(&self) -> Self::State {
@@ -55,22 +55,10 @@ impl<'a> Persist<'a> for Pmem {
         }
     }
 
-    fn restore(
+    fn create(
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        let mem = constructor_args.mem;
-        let mut pmem = Self::create(constructor_args, state)?;
-        pmem.restore_in_place(state, mem)?;
-        Ok(pmem)
-    }
-}
-
-impl Pmem {
-    pub fn create(
-        constructor_args: PmemConstructorArgs<'_>,
-        state: &PmemState,
-    ) -> Result<Self, PmemPersistError> {
         Ok(Pmem::new_with_queues(
             constructor_args.vm,
             state.config.clone(),
@@ -83,11 +71,11 @@ impl Pmem {
     /// Keeps the backing-file mapping, KVM memory slot, eventfds and rate limiter timer.
     /// This does not revert backing-file contents; reset rejects writable pmem before applying
     /// state, while snapshot load supports both read-only and writable devices.
-    pub fn restore_in_place(
+    fn restore_in_place(
         &mut self,
-        state: &PmemState,
+        state: &Self::State,
         mem: &GuestMemoryMmap,
-    ) -> Result<(), PmemPersistError> {
+    ) -> Result<(), Self::Error> {
         state.virtio_state.apply_to(self, mem)?;
         self.rate_limiter
             .restore_in_place(&state.rate_limiter_state, ())
@@ -124,7 +112,9 @@ mod tests {
         let data = bitcode::serialize(&pmem.save()).unwrap();
         drop(pmem);
         let state: PmemState = bitcode::deserialize(&data).unwrap();
-        let mut restored = Pmem::restore(PmemConstructorArgs { mem: &mem, vm }, &state).unwrap();
+        let mut restored =
+            crate::snapshot::restore_for_test::<Pmem>(PmemConstructorArgs { vm }, &state, &mem)
+                .unwrap();
         assert_eq!(restored.config, state.config);
         assert_eq!(restored.config_as_bytes(), state.config_space.as_slice());
         assert_eq!(restored.acked_features(), state.virtio_state.acked_features);
@@ -165,12 +155,10 @@ mod tests {
 
         pmem_state.config_space.size += Pmem::ALIGNMENT;
 
-        let err = Pmem::restore(
-            PmemConstructorArgs {
-                mem: &guest_mem,
-                vm: vm.clone(),
-            },
+        let err = crate::snapshot::restore_for_test::<Pmem>(
+            PmemConstructorArgs { vm: vm.clone() },
             &pmem_state,
+            &guest_mem,
         )
         .unwrap_err();
         assert_matches!(

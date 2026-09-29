@@ -48,9 +48,10 @@ pub enum VirtioMemPersistError {
     VirtioState(#[from] VirtioStateError),
 }
 
-impl Persist<'_> for VirtioMem {
+impl<'a> Persist<'a> for VirtioMem {
     type State = VirtioMemState;
     type ConstructorArgs = VirtioMemConstructorArgs;
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = VirtioMemPersistError;
 
     fn save(&self) -> Self::State {
@@ -66,22 +67,10 @@ impl Persist<'_> for VirtioMem {
         }
     }
 
-    fn restore(
+    fn create(
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        let vm = Arc::clone(&constructor_args.vm);
-        let mut virtio_mem = Self::create(constructor_args, state)?;
-        virtio_mem.restore_in_place(state, vm.guest_memory())?;
-        Ok(virtio_mem)
-    }
-}
-
-impl VirtioMem {
-    pub fn create(
-        constructor_args: VirtioMemConstructorArgs,
-        state: &VirtioMemState,
-    ) -> Result<Self, VirtioMemPersistError> {
         // Fixed geometry is also needed by the manager's load-time resource bookkeeping.
         Ok(VirtioMem::from_state(
             constructor_args.vm,
@@ -98,11 +87,11 @@ impl VirtioMem {
     }
 
     /// Keeps the VM and eventfds. The guest-memory owner restores the KVM slot map.
-    pub fn restore_in_place(
+    fn restore_in_place(
         &mut self,
-        state: &VirtioMemState,
+        state: &Self::State,
         mem: &GuestMemoryMmap,
-    ) -> Result<(), VirtioMemPersistError> {
+    ) -> Result<(), Self::Error> {
         state.virtio_state.apply_to(self, mem)?;
         self.plugged_blocks.clear();
         self.plugged_blocks.extend(state.plugged_blocks.iter());
@@ -141,7 +130,9 @@ mod tests {
         let state = bitcode::deserialize(&bitcode::serialize(&original.save()).unwrap()).unwrap();
         let vm = Arc::new(setup_vm_with_memory(0x1000));
         let args = VirtioMemConstructorArgs::new(Arc::clone(&vm));
-        let mut restored = VirtioMem::restore(args, &state).unwrap();
+        let mut restored =
+            crate::snapshot::restore_for_test::<VirtioMem>(args, &state, vm.guest_memory())
+                .unwrap();
         assert_eq!(restored.config, original.config);
         assert_eq!(restored.slot_size, original.slot_size);
         assert_eq!(restored.plugged_blocks, original.plugged_blocks);

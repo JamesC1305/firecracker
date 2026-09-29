@@ -6,12 +6,10 @@
 use std::convert::Infallible;
 use std::num::Wrapping;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
 use super::queue::{InvalidAvailIdx, QueueError};
-use super::transport::mmio::IrqTrigger;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use crate::devices::virtio::queue::Queue;
@@ -61,6 +59,7 @@ pub struct QueueState {
 impl<'a> Persist<'a> for Queue {
     type State = QueueState;
     type ConstructorArgs = ();
+    type ApplyArgs = ();
     type Error = Infallible;
 
     fn save(&self) -> Self::State {
@@ -77,16 +76,16 @@ impl<'a> Persist<'a> for Queue {
         }
     }
 
-    fn restore(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let mut queue = Queue::new(state.max_size);
-        queue.restore_in_place(state, ())?;
-        Ok(queue)
+    fn create(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
+        Ok(Queue::new(state.max_size))
     }
-}
 
-impl Queue {
     /// Applies queue state with unresolved rings; the device initializes activated queues.
-    pub fn restore_in_place(&mut self, state: &QueueState, _: ()) -> Result<(), Infallible> {
+    fn restore_in_place(
+        &mut self,
+        state: &Self::State,
+        _: Self::ApplyArgs,
+    ) -> Result<(), Self::Error> {
         *self = Queue {
             max_size: state.max_size,
             size: state.size,
@@ -183,22 +182,10 @@ pub struct MmioTransportState {
     interrupt_status: u32,
 }
 
-/// Auxiliary structure for initializing the transport when resuming from a snapshot.
-#[derive(Debug)]
-pub struct MmioTransportConstructorArgs {
-    /// Pointer to guest memory.
-    pub mem: GuestMemoryMmap,
-    /// Interrupt to use for the device
-    pub interrupt: Arc<IrqTrigger>,
-    /// Device associated with the current MMIO state.
-    pub device: Arc<Mutex<dyn VirtioDevice>>,
-    /// Is device backed by vhost-user.
-    pub is_vhost_user: bool,
-}
-
 impl<'a> Persist<'a> for MmioTransport {
     type State = MmioTransportState;
-    type ConstructorArgs = MmioTransportConstructorArgs;
+    type ConstructorArgs = std::convert::Infallible;
+    type ApplyArgs = ();
     type Error = Infallible;
 
     fn save(&self) -> Self::State {
@@ -212,28 +199,16 @@ impl<'a> Persist<'a> for MmioTransport {
         }
     }
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
-        let mut transport = MmioTransport::new(
-            constructor_args.mem,
-            constructor_args.interrupt,
-            constructor_args.device,
-            constructor_args.is_vhost_user,
-        );
-        transport.restore_in_place(state, ())?;
-        Ok(transport)
+    fn create(never: Self::ConstructorArgs, _state: &Self::State) -> Result<Self, Self::Error> {
+        match never {}
     }
-}
 
-impl MmioTransport {
     /// Applies the register values of `state`, keeping the device and its interrupt.
-    pub fn restore_in_place(
+    fn restore_in_place(
         &mut self,
-        state: &MmioTransportState,
-        _: (),
-    ) -> Result<(), Infallible> {
+        state: &Self::State,
+        _: Self::ApplyArgs,
+    ) -> Result<(), Self::Error> {
         self.features_select = state.features_select;
         self.acked_features_select = state.acked_features_select;
         self.queue_select = state.queue_select;

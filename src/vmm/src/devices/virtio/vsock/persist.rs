@@ -46,22 +46,14 @@ pub struct VsockBackendState {
 /// A helper structure that holds the constructor arguments for a vsock device
 #[derive(Debug)]
 pub struct VsockConstructorArgs<B> {
-    /// Pointer to guest memory.
-    pub mem: GuestMemoryMmap,
     /// Backend with its host resources already created.
     pub backend: B,
 }
 
-/// A helper structure that holds the constructor arguments for VsockUnixBackend
-#[derive(Debug)]
-pub struct VsockUdsConstructorArgs {
-    /// cid available in VsockFrontendState.
-    pub cid: u64,
-}
-
-impl Persist<'_> for VsockUnixBackend {
+impl<'a> Persist<'a> for VsockUnixBackend {
     type State = VsockBackendState;
-    type ConstructorArgs = VsockUdsConstructorArgs;
+    type ConstructorArgs = (u64, String);
+    type ApplyArgs = ();
     type Error = VsockUnixBackendError;
 
     fn save(&self) -> Self::State {
@@ -71,30 +63,19 @@ impl Persist<'_> for VsockUnixBackend {
         }
     }
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
+    fn create(
+        (cid, path): Self::ConstructorArgs,
+        _state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        let mut backend = Self::create((constructor_args.cid, state.uds_path.clone()), state)?;
-        backend.restore_in_place(state, ())?;
-        Ok(backend)
-    }
-}
-
-impl VsockUnixBackend {
-    pub fn create(
-        (cid, path): (u64, String),
-        _state: &VsockBackendState,
-    ) -> Result<Self, VsockUnixBackendError> {
         Self::new(cid, path)
     }
 
     /// Drops all connections and keeps the host socket.
-    pub fn restore_in_place(
+    fn restore_in_place(
         &mut self,
-        state: &VsockBackendState,
-        _: (),
-    ) -> Result<(), VsockUnixBackendError> {
+        state: &Self::State,
+        _: Self::ApplyArgs,
+    ) -> Result<(), Self::Error> {
         self.drop_connections()?;
         self.local_port_last = state.local_port_last;
         Ok(())
@@ -104,12 +85,13 @@ impl VsockUnixBackend {
 impl<'a, B> Persist<'a> for Vsock<B>
 where
     B: VsockBackend
-        + Persist<'a, State = VsockBackendState, Error = VsockUnixBackendError>
+        + Persist<'a, State = VsockBackendState, Error = VsockUnixBackendError, ApplyArgs = ()>
         + 'static
         + Debug,
 {
     type State = VsockState;
     type ConstructorArgs = VsockConstructorArgs<B>;
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = VsockError;
 
     fn save(&self) -> Self::State {
@@ -123,42 +105,44 @@ where
         }
     }
 
-    fn restore(
+    fn create(
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        let VsockConstructorArgs { mem, backend } = constructor_args;
-        let mut vsock = Self::create(backend, state)?;
-        vsock.restore_in_place(state, &mem)?;
-        Ok(vsock)
-    }
-}
-
-impl<B> Vsock<B>
-where
-    B: VsockBackend + 'static + Debug,
-{
-    pub fn create(backend: B, state: &VsockState) -> Result<Self, VsockError> {
-        Self::new(state.frontend.cid, backend)
+        Self::new(state.frontend.cid, constructor_args.backend)
     }
 
-    /// Keeps the host socket, eventfds and event loop registrations.
-    pub fn restore_in_place(
+    /// Keeps the host socket, eventfds and event loop registrations, and drops the live
+    /// connections.
+    fn restore_in_place(
         &mut self,
-        state: &VsockState,
+        state: &Self::State,
         mem: &GuestMemoryMmap,
-    ) -> Result<(), VsockError> {
+    ) -> Result<(), Self::Error> {
         state
             .frontend
             .virtio_state
             .apply_to(self, mem)
             .map_err(VsockError::VirtioState)?;
         self.avail_features = state.frontend.virtio_state.avail_features;
+        self.backend
+            .restore_in_place(&state.backend, ())
+            .map_err(VsockError::VsockUdsBackend)?;
         // Drop the packets parsed from the old queues.
         self.rx_packet.clear();
         self.tx_packet.clear();
         self.pending_event_ack = state.frontend.pending_event_ack;
         Ok(())
+    }
+
+    fn post_restore(
+        &mut self,
+        state: &Self::State,
+        load: &mut crate::snapshot::LoadContext<'_>,
+    ) -> Result<(), Self::Error> {
+        self.backend
+            .post_restore(&state.backend, load)
+            .map_err(VsockError::VsockUdsBackend)
     }
 }
 
@@ -172,9 +156,10 @@ pub(crate) mod tests {
     use crate::devices::virtio::vsock::test_utils::{TestBackend, TestContext};
     use crate::utils::byte_order;
 
-    impl Persist<'_> for TestBackend {
+    impl<'a> Persist<'a> for TestBackend {
         type State = VsockBackendState;
-        type ConstructorArgs = VsockUdsConstructorArgs;
+        type ConstructorArgs = std::convert::Infallible;
+        type ApplyArgs = ();
         type Error = VsockUnixBackendError;
 
         fn save(&self) -> Self::State {
@@ -184,19 +169,15 @@ pub(crate) mod tests {
             }
         }
 
-        fn restore(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
-            let mut backend = Self::new();
-            backend.restore_in_place(state, ())?;
-            Ok(backend)
+        fn create(never: Self::ConstructorArgs, _state: &Self::State) -> Result<Self, Self::Error> {
+            match never {}
         }
-    }
 
-    impl TestBackend {
-        pub fn restore_in_place(
+        fn restore_in_place(
             &mut self,
-            _state: &VsockBackendState,
-            _: (),
-        ) -> Result<(), VsockUnixBackendError> {
+            _state: &Self::State,
+            _: Self::ApplyArgs,
+        ) -> Result<(), Self::Error> {
             self.rx_err = None;
             self.pending_rx = false;
             self.rx_ok_cnt = 0;
@@ -217,12 +198,12 @@ pub(crate) mod tests {
             let state = ctx.device.save();
             assert_eq!(state.frontend.pending_event_ack, armed);
 
-            let restored = Vsock::restore(
+            let restored = crate::snapshot::restore_for_test::<Vsock<TestBackend>>(
                 VsockConstructorArgs {
-                    mem: ctx.mem.clone(),
                     backend: TestBackend::new(),
                 },
                 &state,
+                &ctx.mem,
             )
             .unwrap();
             assert_eq!(restored.pending_event_ack, armed);
@@ -253,16 +234,12 @@ pub(crate) mod tests {
         let serialized_data = bitcode::serialize(&state).unwrap();
 
         let restored_state: VsockState = bitcode::deserialize(&serialized_data).unwrap();
-        let mut restored_device = Vsock::restore(
+        let mut restored_device = crate::snapshot::restore_for_test::<Vsock<TestBackend>>(
             VsockConstructorArgs {
-                mem: ctx.mem.clone(),
-                backend: {
-                    assert_eq!(restored_state.backend.uds_path, "test".to_owned());
-                    assert_eq!(restored_state.backend.local_port_last, 0xdeadbeef);
-                    TestBackend::new()
-                },
+                backend: TestBackend::new(),
             },
             &restored_state,
+            &ctx.mem,
         )
         .unwrap();
 

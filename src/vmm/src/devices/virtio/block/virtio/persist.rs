@@ -9,7 +9,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::device::DiskProperties;
 use super::*;
-use crate::devices::virtio::block::persist::BlockConstructorArgs;
+
 use crate::devices::virtio::block::virtio::device::FileEngineType;
 use crate::devices::virtio::block::virtio::device::VirtioBlkTopology;
 use crate::devices::virtio::block::virtio::metrics::BlockMetricsPerDevice;
@@ -68,9 +68,10 @@ pub struct VirtioBlockState {
     discard_sector_alignment: u32,
 }
 
-impl Persist<'_> for VirtioBlock {
+impl<'a> Persist<'a> for VirtioBlock {
     type State = VirtioBlockState;
-    type ConstructorArgs = BlockConstructorArgs;
+    type ConstructorArgs = ();
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = VirtioBlockError;
 
     fn save(&self) -> Self::State {
@@ -90,18 +91,7 @@ impl Persist<'_> for VirtioBlock {
         }
     }
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
-        let mut block = Self::create((), state)?;
-        block.restore_in_place(state, &constructor_args.mem)?;
-        Ok(block)
-    }
-}
-
-impl VirtioBlock {
-    pub fn create(_: (), state: &VirtioBlockState) -> Result<Self, VirtioBlockError> {
+    fn create(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
         let is_read_only = state.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0;
         let rate_limiter = RateLimiter::default();
 
@@ -147,11 +137,11 @@ impl VirtioBlock {
     }
 
     /// Keeps the open disk, eventfds, rate limiter timer and metrics.
-    pub fn restore_in_place(
+    fn restore_in_place(
         &mut self,
-        state: &VirtioBlockState,
+        state: &Self::State,
         mem: &GuestMemoryMmap,
-    ) -> Result<(), VirtioBlockError> {
+    ) -> Result<(), Self::Error> {
         state
             .virtio_state
             .apply_to(self, mem)
@@ -231,8 +221,8 @@ mod tests {
         let mem = default_mem();
         let data = bitcode::serialize(&block.save()).unwrap();
         let state = bitcode::deserialize(&data).unwrap();
-        let args = BlockConstructorArgs { mem: mem.clone() };
-        let mut restored = VirtioBlock::restore(args, &state).unwrap();
+        let mut restored =
+            crate::snapshot::restore_for_test::<VirtioBlock>((), &state, &mem).unwrap();
         assert_eq!(restored.config_space, block.config_space);
         assert_eq!(restored.disk.file_path, block.disk.file_path);
         assert_eq!(restored.acked_features(), block.acked_features());

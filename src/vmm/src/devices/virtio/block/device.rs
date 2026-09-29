@@ -7,7 +7,7 @@ use event_manager::{EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::BlockError;
-use super::persist::{BlockConstructorArgs, BlockState};
+use super::persist::BlockState;
 use super::vhost_user::device::{VhostUserBlock, VhostUserBlockConfig};
 use super::virtio::device::{VirtioBlock, VirtioBlockConfig};
 use crate::devices::virtio::ActivateError;
@@ -245,9 +245,10 @@ impl MutEventSubscriber for Block {
     }
 }
 
-impl Persist<'_> for Block {
+impl<'a> Persist<'a> for Block {
     type State = BlockState;
-    type ConstructorArgs = BlockConstructorArgs;
+    type ConstructorArgs = ();
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = BlockError;
 
     fn save(&self) -> Self::State {
@@ -257,18 +258,10 @@ impl Persist<'_> for Block {
         }
     }
 
-    fn restore(
+    fn create(
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        let mut block = Self::create((), state)?;
-        block.restore_in_place(state, &constructor_args.mem)?;
-        Ok(block)
-    }
-}
-
-impl Block {
-    pub fn create(constructor_args: (), state: &BlockState) -> Result<Self, BlockError> {
         match state {
             BlockState::Virtio(s) => VirtioBlock::create(constructor_args, s)
                 .map(Self::Virtio)
@@ -279,17 +272,33 @@ impl Block {
         }
     }
 
-    pub fn restore_in_place(
+    fn restore_in_place(
         &mut self,
-        state: &BlockState,
+        state: &Self::State,
         mem: &GuestMemoryMmap,
-    ) -> Result<(), BlockError> {
+    ) -> Result<(), Self::Error> {
         match (self, state) {
             (Self::Virtio(block), BlockState::Virtio(state)) => block
                 .restore_in_place(state, mem)
                 .map_err(BlockError::VirtioBackend),
             (Self::VhostUser(block), BlockState::VhostUser(state)) => block
                 .restore_in_place(state, mem)
+                .map_err(BlockError::VhostUserBackend),
+            _ => Err(BlockError::InvalidBlockBackend),
+        }
+    }
+
+    fn post_restore(
+        &mut self,
+        state: &Self::State,
+        load: &mut crate::snapshot::LoadContext<'_>,
+    ) -> Result<(), Self::Error> {
+        match (self, state) {
+            (Self::Virtio(block), BlockState::Virtio(state)) => block
+                .post_restore(state, load)
+                .map_err(BlockError::VirtioBackend),
+            (Self::VhostUser(block), BlockState::VhostUser(state)) => block
+                .post_restore(state, load)
                 .map_err(BlockError::VhostUserBackend),
             _ => Err(BlockError::InvalidBlockBackend),
         }

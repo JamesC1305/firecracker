@@ -22,9 +22,10 @@ pub struct MmdsNetworkStackState {
     tcp_port: u16,
 }
 
-impl Persist<'_> for MmdsNetworkStack {
+impl<'a> Persist<'a> for MmdsNetworkStack {
     type State = MmdsNetworkStackState;
     type ConstructorArgs = Arc<Mutex<Mmds>>;
+    type ApplyArgs = ();
     type Error = Infallible;
 
     fn save(&self) -> Self::State {
@@ -38,19 +39,7 @@ impl Persist<'_> for MmdsNetworkStack {
         }
     }
 
-    fn restore(mmds: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let mut ns = Self::create(mmds, state)?;
-        ns.restore_in_place(state, ())?;
-        Ok(ns)
-    }
-}
-
-impl MmdsNetworkStack {
-    /// Creates host resources and fixed configuration, without applying runtime state.
-    pub fn create(
-        mmds: Arc<Mutex<Mmds>>,
-        state: &MmdsNetworkStackState,
-    ) -> Result<Self, Infallible> {
+    fn create(mmds: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
         Ok(Self::new(
             MacAddr::from_bytes_unchecked(&state.mac_addr),
             Ipv4Addr::from(state.ipv4_addr),
@@ -59,12 +48,11 @@ impl MmdsNetworkStack {
         ))
     }
 
-    /// Applies all runtime state, retaining host resources on a live component.
-    pub fn restore_in_place(
+    fn restore_in_place(
         &mut self,
-        state: &MmdsNetworkStackState,
-        _: (),
-    ) -> Result<(), Infallible> {
+        state: &Self::State,
+        _: Self::ApplyArgs,
+    ) -> Result<(), Self::Error> {
         *self = Self::new(
             MacAddr::from_bytes_unchecked(&state.mac_addr),
             Ipv4Addr::from(state.ipv4_addr),

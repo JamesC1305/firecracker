@@ -126,6 +126,7 @@ pub struct VMGenIDState {
 impl<'a> Persist<'a> for VmGenId {
     type State = VMGenIDState;
     type ConstructorArgs = &'a KvmVm;
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = VmGenIdError;
 
     fn save(&self) -> Self::State {
@@ -135,26 +136,18 @@ impl<'a> Persist<'a> for VmGenId {
         }
     }
 
-    fn restore(vm: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let mut device = Self::create(vm, state)?;
-        device.restore_in_place(state, vm.guest_memory())?;
-        Ok(device)
-    }
-}
-
-impl VmGenId {
-    pub fn create(vm: &KvmVm, state: &VMGenIDState) -> Result<Self, VmGenIdError> {
+    fn create(vm: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
         let device = Self::from_parts(GuestAddress(state.addr), state.gsi)?;
         vm.register_irq(&device.interrupt_evt, device.gsi)?;
         Ok(device)
     }
 
     /// Publishes a fresh generation while keeping the live address and IRQ.
-    pub fn restore_in_place(
+    fn restore_in_place(
         &mut self,
-        _state: &VMGenIDState,
+        _state: &Self::State,
         mem: &GuestMemoryMmap,
-    ) -> Result<(), VmGenIdError> {
+    ) -> Result<(), Self::Error> {
         self.gen_id = Self::make_genid();
         self.activate(mem)?;
         self.interrupt_evt

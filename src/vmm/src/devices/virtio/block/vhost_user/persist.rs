@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::VhostUserBlockError;
 use super::device::VhostUserBlock;
 use crate::devices::virtio::block::CacheType;
-use crate::devices::virtio::block::persist::BlockConstructorArgs;
+
 use crate::devices::virtio::persist::VirtioDeviceState;
 use crate::snapshot::Persist;
 use crate::vstate::memory::GuestMemoryMmap;
@@ -26,38 +26,28 @@ pub struct VhostUserBlockState {
     virtio_state: VirtioDeviceState,
 }
 
-impl Persist<'_> for VhostUserBlock {
+impl<'a> Persist<'a> for VhostUserBlock {
     type State = VhostUserBlockState;
-    type ConstructorArgs = BlockConstructorArgs;
+    type ConstructorArgs = ();
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = VhostUserBlockError;
 
     fn save(&self) -> Self::State {
         unimplemented!("VhostUserBlock does not support snapshotting yet");
     }
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
+    fn create(
+        _constructor_args: Self::ConstructorArgs,
+        _state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        let mut block = Self::create((), state)?;
-        block.restore_in_place(state, &constructor_args.mem)?;
-        Ok(block)
-    }
-}
-
-impl VhostUserBlock {
-    pub fn create(
-        _constructor_args: (),
-        _state: &VhostUserBlockState,
-    ) -> Result<Self, VhostUserBlockError> {
         Err(VhostUserBlockError::SnapshottingNotSupported)
     }
 
-    pub fn restore_in_place(
+    fn restore_in_place(
         &mut self,
-        _state: &VhostUserBlockState,
+        _state: &Self::State,
         _mem: &GuestMemoryMmap,
-    ) -> Result<(), VhostUserBlockError> {
+    ) -> Result<(), Self::Error> {
         Err(VhostUserBlockError::SnapshottingNotSupported)
     }
 }

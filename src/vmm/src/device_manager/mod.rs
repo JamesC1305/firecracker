@@ -23,7 +23,6 @@ use persist::{
 };
 use serde::{Deserialize, Serialize};
 use utils::time::TimestampUs;
-use vm_superio::serial;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::EventManager;
@@ -46,7 +45,7 @@ use crate::devices::virtio::net::persist::NetPersistError;
 use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::pmem::persist::PmemPersistError;
 use crate::devices::virtio::rng::persist::EntropyPersistError;
-use crate::devices::virtio::vsock::{VsockError, VsockUnixBackendError};
+use crate::devices::virtio::vsock::VsockError;
 use crate::logger::{error, info};
 use crate::rate_limiter::TokenBucket;
 use crate::resources::VmResources;
@@ -148,7 +147,6 @@ impl DeviceManager {
     /// Sets up the serial device.
     fn setup_serial_device(
         output: Option<&PathBuf>,
-        state: Option<&serial::SerialState>,
         rate_limiter: Option<TokenBucket>,
     ) -> Result<Arc<Mutex<SerialDevice>>, std::io::Error> {
         let (serial_in, serial_out) = match output {
@@ -169,16 +167,9 @@ impl DeviceManager {
             }
         };
 
-        let mut serial = SerialDevice::new(serial_in, serial_out)?;
-        if let Some(state) = state {
-            serial
-                .restore_in_place(state, ())
-                .map_err(|RawIOError::Serial(err)| match err {
-                    serial::Error::Trigger(e) | serial::Error::IOError(e) => e,
-                    serial::Error::FullFifo => std::io::Error::other("FIFO buffer too large"),
-                })?;
-        }
-        Ok(Arc::new(Mutex::new(serial)))
+        Ok(Arc::new(Mutex::new(SerialDevice::new(
+            serial_in, serial_out,
+        )?)))
     }
 
     fn serial_state(&self) -> Option<persist::SerialState> {
@@ -205,16 +196,13 @@ impl DeviceManager {
 
     #[cfg(target_arch = "x86_64")]
     fn create_legacy_devices(
-        event_manager: &mut EventManager,
         vcpus_exit_evt: &EventFd,
         vm: &KvmVm,
         serial_output: Option<&PathBuf>,
-        serial_state: Option<&serial::SerialState>,
         serial_rate_limiter: Option<TokenBucket>,
     ) -> Result<PortIODeviceManager, DeviceManagerCreateError> {
         // Create serial device
-        let serial = Self::setup_serial_device(serial_output, serial_state, serial_rate_limiter)?;
-        event_manager.add_subscriber(serial.clone());
+        let serial = Self::setup_serial_device(serial_output, serial_rate_limiter)?;
         let reset_evt = vcpus_exit_evt
             .try_clone()
             .map_err(DeviceManagerCreateError::EventFd)?;
@@ -240,14 +228,10 @@ impl DeviceManager {
         pci_enabled: bool,
     ) -> Result<Self, DeviceManagerCreateError> {
         #[cfg(target_arch = "x86_64")]
-        let legacy_devices = Self::create_legacy_devices(
-            event_manager,
-            vcpus_exit_evt,
-            vm,
-            serial_output,
-            None,
-            serial_rate_limiter,
-        )?;
+        let legacy_devices =
+            Self::create_legacy_devices(vcpus_exit_evt, vm, serial_output, serial_rate_limiter)?;
+        #[cfg(target_arch = "x86_64")]
+        event_manager.add_subscriber(legacy_devices.stdio_serial.clone());
 
         Ok(DeviceManager {
             mmio_platform_devices: MMIOPlatformDevices::new(),
@@ -365,7 +349,7 @@ impl DeviceManager {
             .contains("console=");
 
         if cmdline_contains_console {
-            let serial = Self::setup_serial_device(serial_out_path, None, serial_rate_limiter)?;
+            let serial = Self::setup_serial_device(serial_out_path, serial_rate_limiter)?;
             event_manager.add_subscriber(serial.clone());
             self.mmio_platform_devices
                 .register_mmio_serial(vm, serial, None)?;
@@ -630,8 +614,6 @@ pub enum DevicePersistError {
     Net(#[from] NetPersistError),
     /// Vsock: {0}
     Vsock(#[from] VsockError),
-    /// VsockUnixBackend: {0}
-    VsockUnixBackend(#[from] VsockUnixBackendError),
     /// MmdsConfig: {0}
     MmdsConfig(#[from] MmdsConfigError),
     /// Entropy: {0}
@@ -655,16 +637,19 @@ pub enum DeviceManagerPersistError {
     AcpiRestore(#[from] ACPIDeviceError),
     /// Error restoring PCI devices: {0}
     PciRestore(DevicePersistError),
+    /// Error restoring serial state: {0}
+    SerialRestore(#[from] RawIOError),
     /// Error inserting device in bus: {0}
     Bus(#[from] BusError),
     /// Error creating DeviceManager: {0}
     DeviceManager(#[from] DeviceManagerCreateError),
+    /// Live and saved virtio transports differ.
+    TransportMismatch,
 }
 
 pub struct DeviceRestoreArgs<'a> {
     pub mem: &'a GuestMemoryMmap,
     pub vm: &'a Arc<KvmVm>,
-    pub event_manager: &'a mut EventManager,
     pub vcpus_exit_evt: &'a EventFd,
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
@@ -684,6 +669,7 @@ impl std::fmt::Debug for DeviceRestoreArgs<'_> {
 impl<'a> Persist<'a> for DeviceManager {
     type State = DevicesState;
     type ConstructorArgs = DeviceRestoreArgs<'a>;
+    type ApplyArgs = &'a KvmVm;
     type Error = DeviceManagerPersistError;
 
     fn save(&self) -> Self::State {
@@ -700,65 +686,50 @@ impl<'a> Persist<'a> for DeviceManager {
         }
     }
 
-    fn restore(
+    fn create(
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        // Setup legacy devices in case of x86
-        #[cfg(target_arch = "x86_64")]
-        let serial_state: Option<vm_superio::serial::SerialState> =
-            state.serial_state.as_ref().map(Into::into);
         #[cfg(target_arch = "x86_64")]
         let legacy_devices = Self::create_legacy_devices(
-            constructor_args.event_manager,
             constructor_args.vcpus_exit_evt,
             constructor_args.vm,
             constructor_args.vm_resources.serial_out_path.as_ref(),
-            serial_state.as_ref(),
             constructor_args.vm_resources.serial_rate_limiter(),
         )?;
-
-        // Restore MMIO platform devices
         let platform_ctor_args = MMIOPlatformDevicesConstructorArgs {
             vm: constructor_args.vm,
-            event_manager: constructor_args.event_manager,
             vm_resources: constructor_args.vm_resources,
-            serial_state: state.serial_state.as_ref(),
         };
         let mmio_platform_devices =
-            MMIOPlatformDevices::restore(platform_ctor_args, &state.mmio_platform_state)
+            MMIOPlatformDevices::create(platform_ctor_args, &state.mmio_platform_state)
                 .map_err(DeviceManagerPersistError::MmioRestore)?;
-
-        // Restore ACPI devices
-        let acpi_devices = ACPIDeviceManager::restore(constructor_args.vm, &state.acpi_state)?;
-
+        let acpi_devices = ACPIDeviceManager::create(constructor_args.vm, &state.acpi_state)?;
         let virtio_devices = match &state.virtio_state {
             VirtioDevicesState::Pci(pci_state) => {
-                let pci_ctor_args = PciDevicesConstructorArgs {
+                let args = PciDevicesConstructorArgs {
                     vm: constructor_args.vm,
-                    mem: constructor_args.mem,
                     vm_resources: constructor_args.vm_resources,
                     instance_id: constructor_args.instance_id,
-                    event_manager: constructor_args.event_manager,
                 };
-                let pci_devices = PciDevices::restore(pci_ctor_args, pci_state)
-                    .map_err(DeviceManagerPersistError::PciRestore)?;
-                VirtioDevices::Pci(pci_devices)
+                VirtioDevices::Pci(
+                    PciDevices::create(args, pci_state)
+                        .map_err(DeviceManagerPersistError::PciRestore)?,
+                )
             }
             VirtioDevicesState::Mmio(mmio_state) => {
-                let mmio_ctor_args = MMIODevManagerConstructorArgs {
+                let args = MMIODevManagerConstructorArgs {
                     mem: constructor_args.mem,
                     vm: constructor_args.vm,
-                    event_manager: constructor_args.event_manager,
                     vm_resources: constructor_args.vm_resources,
                     instance_id: constructor_args.instance_id,
                 };
-                let mmio_virtio_devices = MMIOVirtioDevices::restore(mmio_ctor_args, mmio_state)
-                    .map_err(DeviceManagerPersistError::MmioRestore)?;
-                VirtioDevices::Mmio(mmio_virtio_devices)
+                VirtioDevices::Mmio(
+                    MMIOVirtioDevices::create(args, mmio_state)
+                        .map_err(DeviceManagerPersistError::MmioRestore)?,
+                )
             }
         };
-
         Ok(DeviceManager {
             mmio_platform_devices,
             #[cfg(target_arch = "x86_64")]
@@ -766,6 +737,80 @@ impl<'a> Persist<'a> for DeviceManager {
             acpi_devices,
             virtio_devices,
         })
+    }
+
+    fn restore_in_place(
+        &mut self,
+        state: &Self::State,
+        vm: Self::ApplyArgs,
+    ) -> Result<(), Self::Error> {
+        let mem = vm.guest_memory();
+        let DevicesState {
+            virtio_state,
+            mmio_platform_state,
+            acpi_state,
+            serial_state,
+        } = state;
+        // Use the load order on both paths: legacy, platform, ACPI, then virtio devices.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(legacy) = &self.legacy_devices {
+            if let Some(serial) = serial_state {
+                legacy
+                    .stdio_serial
+                    .lock()
+                    .expect("Poisoned lock")
+                    .restore_in_place(&serial.into(), ())?;
+            }
+            legacy.i8042.lock().expect("Poisoned lock").reset_to_fresh();
+        }
+        #[cfg(target_arch = "aarch64")]
+        if let (Some(device), Some(serial)) = (&self.mmio_platform_devices.serial, serial_state) {
+            device
+                .inner
+                .lock()
+                .expect("Poisoned lock")
+                .restore_in_place(&serial.into(), ())?;
+        }
+        self.mmio_platform_devices
+            .restore_in_place(mmio_platform_state, ())
+            .map_err(DeviceManagerPersistError::MmioRestore)?;
+        self.acpi_devices.restore_in_place(acpi_state, mem)?;
+        match (&mut self.virtio_devices, virtio_state) {
+            (VirtioDevices::Mmio(devices), VirtioDevicesState::Mmio(state)) => devices
+                .restore_in_place(state, mem)
+                .map_err(DeviceManagerPersistError::MmioRestore)?,
+            (VirtioDevices::Pci(devices), VirtioDevicesState::Pci(state)) => devices
+                .restore_in_place(state, vm)
+                .map_err(DeviceManagerPersistError::PciRestore)?,
+            _ => return Err(DeviceManagerPersistError::TransportMismatch),
+        }
+        Ok(())
+    }
+
+    fn post_restore(
+        &mut self,
+        state: &Self::State,
+        load: &mut crate::snapshot::LoadContext<'_>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(legacy) = &self.legacy_devices {
+            load.event_manager
+                .add_subscriber(legacy.stdio_serial.clone());
+        }
+        self.mmio_platform_devices
+            .post_restore(&state.mmio_platform_state, load)
+            .map_err(DeviceManagerPersistError::MmioRestore)?;
+        self.acpi_devices.post_restore(&state.acpi_state, load)?;
+        match (&mut self.virtio_devices, &state.virtio_state) {
+            (VirtioDevices::Mmio(devices), VirtioDevicesState::Mmio(state)) => devices
+                .post_restore(state, load)
+                .map_err(DeviceManagerPersistError::MmioRestore)?,
+            (VirtioDevices::Pci(devices), VirtioDevicesState::Pci(state)) => devices
+                .post_restore(state, load)
+                .map_err(DeviceManagerPersistError::PciRestore)?,
+            _ => return Err(DeviceManagerPersistError::TransportMismatch),
+        }
+        Ok(())
     }
 }
 

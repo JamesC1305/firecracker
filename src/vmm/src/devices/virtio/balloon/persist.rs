@@ -101,16 +101,10 @@ pub struct BalloonState {
     pub virtio_state: VirtioDeviceState,
 }
 
-/// Auxiliary structure for creating a device when resuming from a snapshot.
-#[derive(Debug)]
-pub struct BalloonConstructorArgs {
-    /// Pointer to guest memory.
-    pub mem: GuestMemoryMmap,
-}
-
-impl Persist<'_> for Balloon {
+impl<'a> Persist<'a> for Balloon {
     type State = BalloonState;
-    type ConstructorArgs = BalloonConstructorArgs;
+    type ConstructorArgs = ();
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = super::BalloonError;
 
     fn save(&self) -> Self::State {
@@ -127,18 +121,7 @@ impl Persist<'_> for Balloon {
         }
     }
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
-        let mut balloon = Self::create((), state)?;
-        balloon.restore_in_place(state, &constructor_args.mem)?;
-        Ok(balloon)
-    }
-}
-
-impl Balloon {
-    pub fn create(_: (), state: &BalloonState) -> Result<Self, BalloonError> {
+    fn create(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
         let free_page_hinting =
             state.virtio_state.avail_features & (1u64 << VIRTIO_BALLOON_F_FREE_PAGE_HINTING) != 0;
         let free_page_reporting =
@@ -153,15 +136,15 @@ impl Balloon {
     }
 
     /// Keeps the eventfds, stats timer and live activation state.
-    pub fn restore_in_place(
+    fn restore_in_place(
         &mut self,
-        state: &BalloonState,
+        state: &Self::State,
         mem: &GuestMemoryMmap,
-    ) -> Result<(), BalloonError> {
+    ) -> Result<(), Self::Error> {
         state
             .virtio_state
             .apply_to(self, mem)
-            .map_err(|_| BalloonError::QueueRestoreError)?;
+            .map_err(|_| Self::Error::QueueRestoreError)?;
         self.avail_features = state.virtio_state.avail_features;
         self.stats_polling_interval_s = state.stats_polling_interval_s;
         self.latest_stats = state.latest_stats.create_stats();
@@ -205,13 +188,8 @@ mod tests {
         balloon.latest_stats.free_memory = Some(0x1234);
         balloon.hinting_state.host_cmd = 37;
         let state = bitcode::deserialize(&bitcode::serialize(&balloon.save()).unwrap()).unwrap();
-        let restored = Balloon::restore(
-            BalloonConstructorArgs {
-                mem: guest_mem.clone(),
-            },
-            &state,
-        )
-        .unwrap();
+        let restored =
+            crate::snapshot::restore_for_test::<Balloon>((), &state, &guest_mem).unwrap();
         assert_eq!(restored.config_space.num_pages, 0x42 * 1024 * 1024 / 4096);
         assert_eq!(
             restored.config_space.free_page_hint_cmd_id,

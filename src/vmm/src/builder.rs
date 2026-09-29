@@ -45,7 +45,6 @@ use crate::logger::warn;
 use crate::persist::{MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
-use crate::snapshot::Persist;
 use crate::utils::{u32_mib_to_bytes, u64_to_usize};
 use crate::vmm_config::boot_source::{
     DEFAULT_KERNEL_CMDLINE, append_root_device_cmdline, build_cmdline,
@@ -502,14 +501,17 @@ pub fn build_microvm_from_snapshot(
     let device_ctor_args = DeviceRestoreArgs {
         mem: kvm_vm.guest_memory(),
         vm: &kvm_vm,
-        event_manager,
         vm_resources,
         instance_id: &instance_info.id,
         vcpus_exit_evt: kvm_vm.vcpus_exit_evt(),
     };
     #[allow(unused_mut)]
-    let mut device_manager =
-        DeviceManager::restore(device_ctor_args, &microvm_state.device_states)?;
+    let mut device_manager = crate::snapshot::restore::<DeviceManager>(
+        device_ctor_args,
+        &microvm_state.device_states,
+        &kvm_vm,
+        &mut crate::snapshot::LoadContext { event_manager },
+    )?;
 
     let vmm = Vmm {
         instance_info: instance_info.clone(),

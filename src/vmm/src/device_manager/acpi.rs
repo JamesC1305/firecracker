@@ -151,7 +151,9 @@ mod tests {
 
         let vm = setup_vm_with_memory(mib_to_bytes(1));
         vm.setup_irqchip().unwrap();
-        let mut acpi = ACPIDeviceManager::restore(&vm, &state).unwrap();
+        let mut acpi =
+            crate::snapshot::restore_for_test::<ACPIDeviceManager>(&vm, &state, vm.guest_memory())
+                .unwrap();
         let genid_fd = acpi.vmgenid().interrupt_evt.as_raw_fd();
         let clock_fd = acpi.vmclock().interrupt_evt.as_raw_fd();
         let mem = vm.guest_memory();

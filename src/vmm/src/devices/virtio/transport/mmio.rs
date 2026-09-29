@@ -95,6 +95,18 @@ impl MmioTransport {
         self.device.clone()
     }
 
+    /// Activates a saved-active backend after all runtime state has been applied.
+    pub(crate) fn activate_restored(
+        &self,
+        activated: bool,
+    ) -> Result<(), crate::devices::virtio::ActivateError> {
+        if activated {
+            self.locked_device()
+                .activate(self.mem.clone(), self.interrupt.clone())?;
+        }
+        Ok(())
+    }
+
     fn check_device_status(&self, set: u32, clr: u32) -> bool {
         self.device_status & (set | clr) == set
     }

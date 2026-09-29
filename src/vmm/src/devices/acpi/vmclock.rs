@@ -138,6 +138,7 @@ pub struct VmClockState {
 impl<'a> Persist<'a> for VmClock {
     type State = VmClockState;
     type ConstructorArgs = &'a KvmVm;
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = VmClockError;
 
     fn save(&self) -> Self::State {
@@ -148,15 +149,7 @@ impl<'a> Persist<'a> for VmClock {
         }
     }
 
-    fn restore(vm: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let mut device = Self::create(vm, state)?;
-        device.restore_in_place(state, vm.guest_memory())?;
-        Ok(device)
-    }
-}
-
-impl VmClock {
-    pub fn create(vm: &KvmVm, state: &VmClockState) -> Result<Self, VmClockError> {
+    fn create(vm: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
         let interrupt_evt = EventFdTrigger::new(
             EventFd::new(libc::EFD_NONBLOCK).map_err(VmClockError::CreateEventFd)?,
         );
@@ -173,11 +166,11 @@ impl VmClock {
     }
 
     /// Advances the live counters rather than reapplying the saved generation.
-    pub fn restore_in_place(
+    fn restore_in_place(
         &mut self,
-        _state: &VmClockState,
+        _state: &Self::State,
         mem: &GuestMemoryMmap,
-    ) -> Result<(), VmClockError> {
+    ) -> Result<(), Self::Error> {
         self.activate(mem)?;
         write_vmclock_field!(self, mem, seq_count, self.inner.seq_count | 1);
 
@@ -298,7 +291,8 @@ mod tests {
         vmclock.activate(mem).unwrap();
 
         let state = vmclock.save();
-        let vmclock_new = VmClock::restore(&vm, &state).unwrap();
+        let vmclock_new =
+            crate::snapshot::restore_for_test::<VmClock>(&vm, &state, vm.guest_memory()).unwrap();
 
         let guest_data_new: vmclock_abi = mem.read_obj(VMCLOCK_TEST_GUEST_ADDR).unwrap();
         assert_ne!(guest_data_new, vmclock.inner);

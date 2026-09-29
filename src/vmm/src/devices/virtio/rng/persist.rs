@@ -18,11 +18,6 @@ pub struct EntropyState {
     rate_limiter_state: RateLimiterState,
 }
 
-#[derive(Debug)]
-pub struct EntropyConstructorArgs {
-    pub mem: GuestMemoryMmap,
-}
-
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum EntropyPersistError {
     /// Create entropy: {0}
@@ -33,9 +28,10 @@ pub enum EntropyPersistError {
     RestoreRateLimiter(#[from] std::io::Error),
 }
 
-impl Persist<'_> for Entropy {
+impl<'a> Persist<'a> for Entropy {
     type State = EntropyState;
-    type ConstructorArgs = EntropyConstructorArgs;
+    type ConstructorArgs = ();
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = EntropyPersistError;
 
     fn save(&self) -> Self::State {
@@ -45,27 +41,16 @@ impl Persist<'_> for Entropy {
         }
     }
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
-        let mut entropy = Self::create((), state)?;
-        entropy.restore_in_place(state, &constructor_args.mem)?;
-        Ok(entropy)
-    }
-}
-
-impl Entropy {
-    pub fn create(_: (), _state: &EntropyState) -> Result<Self, EntropyPersistError> {
+    fn create(_: Self::ConstructorArgs, _state: &Self::State) -> Result<Self, Self::Error> {
         Ok(Entropy::new(RateLimiter::default())?)
     }
 
     /// Keeps the eventfds and the rate limiter timer.
-    pub fn restore_in_place(
+    fn restore_in_place(
         &mut self,
-        state: &EntropyState,
+        state: &Self::State,
         mem: &GuestMemoryMmap,
-    ) -> Result<(), EntropyPersistError> {
+    ) -> Result<(), Self::Error> {
         state.virtio_state.apply_to(self, mem)?;
         self.rate_limiter
             .restore_in_place(&state.rate_limiter_state, ())?;
@@ -89,8 +74,7 @@ mod tests {
         let mem = default_mem();
         let data = bitcode::serialize(&entropy.save()).unwrap();
         let state = bitcode::deserialize(&data).unwrap();
-        let args = EntropyConstructorArgs { mem: mem.clone() };
-        let mut restored = Entropy::restore(args, &state).unwrap();
+        let mut restored = crate::snapshot::restore_for_test::<Entropy>((), &state, &mem).unwrap();
         assert_eq!(restored.acked_features(), entropy.acked_features());
 
         let fds = |dev: &Entropy| {

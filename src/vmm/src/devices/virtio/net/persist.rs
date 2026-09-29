@@ -47,8 +47,6 @@ pub struct NetState {
 /// Auxiliary structure for creating a device when resuming from a snapshot.
 #[derive(Debug)]
 pub struct NetConstructorArgs {
-    /// Pointer to guest memory.
-    pub mem: GuestMemoryMmap,
     /// Pointer to the MMDS data store.
     pub mmds: Option<Arc<Mutex<Mmds>>>,
 }
@@ -68,9 +66,10 @@ pub enum NetPersistError {
     TapSetOffload(TapError),
 }
 
-impl Persist<'_> for Net {
+impl<'a> Persist<'a> for Net {
     type State = NetState;
     type ConstructorArgs = NetConstructorArgs;
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = NetPersistError;
 
     fn save(&self) -> Self::State {
@@ -88,22 +87,10 @@ impl Persist<'_> for Net {
         }
     }
 
-    fn restore(
+    fn create(
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        let NetConstructorArgs { mem, mmds } = constructor_args;
-        let mut net = Self::create(mmds, state)?;
-        net.restore_in_place(state, &mem)?;
-        Ok(net)
-    }
-}
-
-impl Net {
-    pub fn create(
-        mmds: Option<Arc<Mutex<Mmds>>>,
-        state: &NetState,
-    ) -> Result<Self, NetPersistError> {
         let mut net = Net::new(
             state.id.clone(),
             &state.tap_if_name,
@@ -116,8 +103,13 @@ impl Net {
         // The manager supplies a shared datastore for devices with an MMDS stack.
         if let Some(mmds_state) = &state.mmds_ns {
             net.mmds_ns = Some(
-                MmdsNetworkStack::create(mmds.ok_or(NetPersistError::NoMmdsDataStore)?, mmds_state)
-                    .unwrap(),
+                MmdsNetworkStack::create(
+                    constructor_args
+                        .mmds
+                        .ok_or(NetPersistError::NoMmdsDataStore)?,
+                    mmds_state,
+                )
+                .unwrap(),
             );
         }
 
@@ -125,11 +117,11 @@ impl Net {
     }
 
     /// Keeps the TAP, eventfds and rate limiter timers, and the MMDS datastore.
-    pub fn restore_in_place(
+    fn restore_in_place(
         &mut self,
-        state: &NetState,
+        state: &Self::State,
         mem: &GuestMemoryMmap,
-    ) -> Result<(), NetPersistError> {
+    ) -> Result<(), Self::Error> {
         state.virtio_state.apply_to(self, mem)?;
         self.avail_features = state.virtio_state.avail_features;
         self.rx_rate_limiter
@@ -191,12 +183,10 @@ mod tests {
         {
             // Deserialize and restore the net device.
             let restored_state = bitcode::deserialize(&serialized_data).unwrap();
-            match Net::restore(
-                NetConstructorArgs {
-                    mem: guest_mem,
-                    mmds: mmds_ds,
-                },
+            match crate::snapshot::restore_for_test::<Net>(
+                NetConstructorArgs { mmds: mmds_ds },
                 &restored_state,
+                &guest_mem,
             ) {
                 Ok(restored_net) => {
                     // Test that virtio specific fields are the same.
