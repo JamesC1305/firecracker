@@ -6,7 +6,6 @@ use acpi_tables::{Aml, aml};
 
 use crate::devices::acpi::vmclock::{VmClock, VmClockError};
 use crate::devices::acpi::vmgenid::{VmGenId, VmGenIdError};
-use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vm::KvmVm;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -26,9 +25,9 @@ pub enum ACPIDeviceError {
 #[derive(Debug, Default)]
 pub struct ACPIDeviceManager {
     /// VMGenID device
-    vmgenid: Option<VmGenId>,
+    pub(super) vmgenid: Option<VmGenId>,
     /// VMclock device
-    vmclock: Option<VmClock>,
+    pub(super) vmclock: Option<VmClock>,
 }
 
 impl ACPIDeviceManager {
@@ -67,33 +66,6 @@ impl ACPIDeviceManager {
     pub fn activate_vmclock(&self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
         vm.register_irq(&self.vmclock().interrupt_evt, self.vmclock().gsi)?;
         self.vmclock().activate(vm.guest_memory())?;
-        Ok(())
-    }
-
-    pub fn replay_gsi_allocations(&self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
-        let mut resource_allocator = vm.resource_allocator();
-        resource_allocator
-            .gsi_legacy_allocator
-            .allocate_id_at(self.vmgenid().gsi)?;
-        resource_allocator
-            .gsi_legacy_allocator
-            .allocate_id_at(self.vmclock().gsi)?;
-        Ok(())
-    }
-
-    pub fn do_post_restore_vmgenid(&self) -> Result<(), ACPIDeviceError> {
-        self.vmgenid().do_post_restore()?;
-        Ok(())
-    }
-
-    pub fn do_post_restore_vmclock(
-        &mut self,
-        mem: &GuestMemoryMmap,
-    ) -> Result<(), ACPIDeviceError> {
-        self.vmclock
-            .as_mut()
-            .expect("Missing VMClock device")
-            .do_post_restore(mem)?;
         Ok(())
     }
 }
@@ -149,5 +121,69 @@ impl Aml for ACPIDeviceManager {
             ],
         )
         .append_aml_bytes(v)
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_arch = "x86_64")]
+mod tests {
+    use std::os::fd::AsRawFd;
+
+    use vm_memory::{ByteValued, Bytes};
+
+    use super::*;
+    use crate::snapshot::Persist;
+    use crate::utils::mib_to_bytes;
+    use crate::vstate::resources::ResourceAllocator;
+    use crate::vstate::vm::tests::setup_vm_with_memory;
+
+    #[test]
+    fn test_reset_republishes_generation_state() {
+        let mut resource_allocator = ResourceAllocator::new();
+        let mut state = ACPIDeviceManager::new(
+            VmGenId::new(&mut resource_allocator).unwrap(),
+            VmClock::new(&mut resource_allocator).unwrap(),
+        )
+        .save();
+        state.vmclock.inner.seq_count = 14;
+        state.vmclock.inner.disruption_marker = 7;
+        state.vmclock.inner.vm_generation_counter = 7;
+
+        let vm = setup_vm_with_memory(mib_to_bytes(1));
+        vm.setup_irqchip().unwrap();
+        let mut acpi = ACPIDeviceManager::restore(&vm, &state).unwrap();
+        let genid_fd = acpi.vmgenid().interrupt_evt.as_raw_fd();
+        let clock_fd = acpi.vmclock().interrupt_evt.as_raw_fd();
+        let mem = vm.guest_memory();
+        let clock = acpi.vmclock().save().inner;
+        let clock_len = clock.as_slice().len();
+        assert_eq!(clock.seq_count, 16);
+        assert_eq!(clock.disruption_marker, 8);
+        assert_eq!(clock.vm_generation_counter, 8);
+
+        for generation in 9..=10 {
+            let old_genid = acpi.vmgenid().gen_id;
+            // Memory reversion can leave old or empty contents in both device pages.
+            mem.write_slice(&[0; 16], acpi.vmgenid().guest_address)
+                .unwrap();
+            mem.write_slice(&vec![0; clock_len], acpi.vmclock().guest_address)
+                .unwrap();
+            acpi.restore_in_place(&state, mem).unwrap();
+
+            let genid: u128 = mem.read_obj(acpi.vmgenid().guest_address).unwrap();
+            assert_ne!(genid, old_genid);
+            assert_eq!(genid, acpi.vmgenid().gen_id);
+            // The guest sees the whole VMClock page again, with one more generation.
+            let clock = acpi.vmclock().save().inner;
+            let mut page = vec![0; clock_len];
+            mem.read_slice(&mut page, acpi.vmclock().guest_address)
+                .unwrap();
+            assert_eq!(page, clock.as_slice());
+            assert_eq!(u64::from(clock.seq_count), generation * 2);
+            assert_eq!(clock.disruption_marker, generation);
+            assert_eq!(clock.vm_generation_counter, generation);
+            assert_eq!(acpi.vmgenid().interrupt_evt.as_raw_fd(), genid_fd);
+            assert_eq!(acpi.vmclock().interrupt_evt.as_raw_fd(), clock_fd);
+        }
     }
 }

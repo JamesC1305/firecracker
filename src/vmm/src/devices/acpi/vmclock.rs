@@ -20,6 +20,7 @@ use crate::logger::debug;
 use crate::snapshot::Persist;
 use crate::vstate::memory::{GuestMemoryExtension, GuestMemoryMmap};
 use crate::vstate::resources::ResourceAllocator;
+use crate::vstate::vm::KvmVm;
 
 // SAFETY: `vmclock_abi` is a POD
 unsafe impl ByteValued for vmclock_abi {}
@@ -45,6 +46,8 @@ macro_rules! write_vmclock_field {
 pub enum VmClockError {
     /// Could not create EventFd: {0}
     CreateEventFd(std::io::Error),
+    /// Could not register IRQ with KVM: {0}
+    RegisterIrq(#[from] kvm_ioctls::Error),
     /// Could not allocate GSI: {0}
     AllocateGsi(vm_allocator::Error),
     /// Could not allocate guest memory: {0}
@@ -117,9 +120,65 @@ impl VmClock {
         mem.write_slice(self.inner.as_slice(), self.guest_address)?;
         Ok(())
     }
+}
 
-    /// Bump the VM generation counter and notify guest after snapshot restore
-    pub fn do_post_restore(&mut self, mem: &GuestMemoryMmap) -> Result<(), VmClockError> {
+/// (De)serialize-able state of the [`VmClock`]
+///
+/// We could avoid this and reuse [`VmClock`] itself if `GuestAddress` was `Serialize`/`Deserialize`
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct VmClockState {
+    /// Guest address in which we write the [`VmClock`] info
+    pub guest_address: u64,
+    /// GSI used for notifying the guest about device changes
+    pub gsi: u32,
+    /// Data we expose to the guest
+    pub inner: vmclock_abi,
+}
+
+impl<'a> Persist<'a> for VmClock {
+    type State = VmClockState;
+    type ConstructorArgs = &'a KvmVm;
+    type Error = VmClockError;
+
+    fn save(&self) -> Self::State {
+        VmClockState {
+            guest_address: self.guest_address.0,
+            gsi: self.gsi,
+            inner: self.inner,
+        }
+    }
+
+    fn restore(vm: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
+        let mut device = Self::create(vm, state)?;
+        device.restore_in_place(state, vm.guest_memory())?;
+        Ok(device)
+    }
+}
+
+impl VmClock {
+    pub fn create(vm: &KvmVm, state: &VmClockState) -> Result<Self, VmClockError> {
+        let interrupt_evt = EventFdTrigger::new(
+            EventFd::new(libc::EFD_NONBLOCK).map_err(VmClockError::CreateEventFd)?,
+        );
+        let device = VmClock {
+            guest_address: GuestAddress(state.guest_address),
+            interrupt_evt,
+            gsi: state.gsi,
+            // restore_in_place() advances these counters from the saved values on load and
+            // from the live values on reset.
+            inner: state.inner,
+        };
+        vm.register_irq(&device.interrupt_evt, device.gsi)?;
+        Ok(device)
+    }
+
+    /// Advances the live counters rather than reapplying the saved generation.
+    pub fn restore_in_place(
+        &mut self,
+        _state: &VmClockState,
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), VmClockError> {
+        self.activate(mem)?;
         write_vmclock_field!(self, mem, seq_count, self.inner.seq_count | 1);
 
         // This fence ensures guest sees all previous writes. It is matched to a
@@ -150,45 +209,6 @@ impl VmClock {
             .map_err(VmClockError::NotifyGuest)?;
         debug!("vmclock: notifying guest about VMClock updates");
         Ok(())
-    }
-}
-
-/// (De)serialize-able state of the [`VmClock`]
-///
-/// We could avoid this and reuse [`VmClock`] itself if `GuestAddress` was `Serialize`/`Deserialize`
-#[derive(Default, Debug, Clone, Serialize, Deserialize)]
-pub struct VmClockState {
-    /// Guest address in which we write the [`VmClock`] info
-    pub guest_address: u64,
-    /// GSI used for notifying the guest about device changes
-    pub gsi: u32,
-    /// Data we expose to the guest
-    pub inner: vmclock_abi,
-}
-
-impl<'a> Persist<'a> for VmClock {
-    type State = VmClockState;
-    type ConstructorArgs = ();
-    type Error = VmClockError;
-
-    fn save(&self) -> Self::State {
-        VmClockState {
-            guest_address: self.guest_address.0,
-            gsi: self.gsi,
-            inner: self.inner,
-        }
-    }
-
-    fn restore(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let interrupt_evt = EventFdTrigger::new(
-            EventFd::new(libc::EFD_NONBLOCK).map_err(VmClockError::CreateEventFd)?,
-        );
-        Ok(VmClock {
-            guest_address: GuestAddress(state.guest_address),
-            interrupt_evt,
-            gsi: state.gsi,
-            inner: state.inner,
-        })
     }
 }
 
@@ -232,6 +252,7 @@ mod tests {
     use crate::test_utils::single_region_mem;
     use crate::utils::u64_to_usize;
     use crate::vstate::resources::ResourceAllocator;
+    use crate::vstate::vm::tests::setup_vm_with_memory;
 
     // We are allocating memory from the end of the system memory portion
     const VMCLOCK_TEST_GUEST_ADDR: GuestAddress =
@@ -263,15 +284,21 @@ mod tests {
         let vmclock = default_vmclock();
         // We're using memory inside the system memory portion of the guest RAM. So we need a
         // memory region that includes it.
-        let mem = single_region_mem(
+        let vm = setup_vm_with_memory(
             u64_to_usize(arch::SYSTEM_MEM_START) + u64_to_usize(arch::SYSTEM_MEM_SIZE),
         );
+        #[cfg(target_arch = "aarch64")]
+        let mut vm = vm;
+        #[cfg(target_arch = "x86_64")]
+        vm.setup_irqchip().unwrap();
+        #[cfg(target_arch = "aarch64")]
+        vm.setup_irqchip(1).unwrap();
+        let mem = vm.guest_memory();
 
-        vmclock.activate(&mem).unwrap();
+        vmclock.activate(mem).unwrap();
 
         let state = vmclock.save();
-        let mut vmclock_new = VmClock::restore((), &state).unwrap();
-        vmclock_new.do_post_restore(&mem).unwrap();
+        let vmclock_new = VmClock::restore(&vm, &state).unwrap();
 
         let guest_data_new: vmclock_abi = mem.read_obj(VMCLOCK_TEST_GUEST_ADDR).unwrap();
         assert_ne!(guest_data_new, vmclock.inner);

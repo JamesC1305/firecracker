@@ -171,8 +171,8 @@ impl fmt::Debug for MMIODevManagerConstructorArgs<'_> {
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct ACPIDeviceManagerState {
-    vmgenid: VMGenIDState,
-    vmclock: VmClockState,
+    pub(super) vmgenid: VMGenIDState,
+    pub(super) vmclock: VmClockState,
 }
 
 /// Holds the states of the non-virtio (platform) devices connected over the MMIO transport.
@@ -199,20 +199,45 @@ impl<'a> Persist<'a> for ACPIDeviceManager {
     }
 
     fn restore(vm: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let mut acpi_devices = ACPIDeviceManager::new(
-            VmGenId::restore((), &state.vmgenid)?,
-            VmClock::restore((), &state.vmclock)?,
-        );
-
-        acpi_devices.replay_gsi_allocations(vm)?;
-
-        acpi_devices.activate_vmgenid(vm)?;
-        acpi_devices.do_post_restore_vmgenid()?;
-
-        acpi_devices.activate_vmclock(vm)?;
-        acpi_devices.do_post_restore_vmclock(vm.guest_memory())?;
-
+        let mut acpi_devices = Self::create(vm, state)?;
+        acpi_devices.restore_in_place(state, vm.guest_memory())?;
         Ok(acpi_devices)
+    }
+}
+
+impl ACPIDeviceManager {
+    pub fn create(vm: &KvmVm, state: &ACPIDeviceManagerState) -> Result<Self, ACPIDeviceError> {
+        let ACPIDeviceManagerState { vmgenid, vmclock } = state;
+        {
+            let mut resource_allocator = vm.resource_allocator();
+            resource_allocator
+                .gsi_legacy_allocator
+                .allocate_id_at(vmgenid.gsi)?;
+            resource_allocator
+                .gsi_legacy_allocator
+                .allocate_id_at(vmclock.gsi)?;
+        }
+
+        let vmgenid = VmGenId::create(vm, vmgenid)?;
+        let vmclock = VmClock::create(vm, vmclock)?;
+        Ok(ACPIDeviceManager::new(vmgenid, vmclock))
+    }
+
+    pub fn restore_in_place(
+        &mut self,
+        state: &ACPIDeviceManagerState,
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), ACPIDeviceError> {
+        let ACPIDeviceManagerState { vmgenid, vmclock } = state;
+        self.vmgenid
+            .as_mut()
+            .expect("Missing VMGenID device")
+            .restore_in_place(vmgenid, mem)?;
+        self.vmclock
+            .as_mut()
+            .expect("Missing VMClock device")
+            .restore_in_place(vmclock, mem)?;
+        Ok(())
     }
 }
 
