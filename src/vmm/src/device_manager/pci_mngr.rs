@@ -13,7 +13,7 @@ use crate::EventManager;
 use crate::device_manager::DevicePersistError;
 use crate::devices::pci::PciSegment;
 use crate::devices::virtio::balloon::Balloon;
-use crate::devices::virtio::balloon::persist::{BalloonConstructorArgs, BalloonState};
+use crate::devices::virtio::balloon::persist::BalloonState;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
@@ -513,9 +513,9 @@ impl<'a> Provision<'a> for PciDevices {
 
         if let Some(balloon_state) = &state.balloon_device {
             let device = Arc::new(Mutex::new(restore::<Balloon>(
-                BalloonConstructorArgs { mem: mem.clone() },
-                &balloon_state.device_state,
                 (),
+                &balloon_state.device_state,
+                mem,
                 &mut load,
             )?));
 

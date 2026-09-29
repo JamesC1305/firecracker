@@ -18,7 +18,7 @@ use crate::devices::acpi::vmgenid::{VMGenIDState, VmGenId};
 #[cfg(target_arch = "aarch64")]
 use crate::devices::legacy::{PL061Device, PL061State, RTCDevice};
 use crate::devices::virtio::balloon::Balloon;
-use crate::devices::virtio::balloon::persist::{BalloonConstructorArgs, BalloonState};
+use crate::devices::virtio::balloon::persist::BalloonState;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
@@ -500,9 +500,9 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
 
         if let Some(balloon_state) = &state.balloon_device {
             let device = Arc::new(Mutex::new(restore::<Balloon>(
-                BalloonConstructorArgs { mem: mem.clone() },
-                &balloon_state.device_state,
                 (),
+                &balloon_state.device_state,
+                mem,
                 &mut load,
             )?));
 

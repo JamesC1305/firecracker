@@ -3,15 +3,11 @@
 
 //! Defines the structures needed for saving/restoring balloon devices.
 
-use std::time::Duration;
-
 use serde::{Deserialize, Serialize};
 
 use super::*;
 use crate::devices::virtio::balloon::device::{BalloonStats, ConfigSpace, HintingState};
-use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::persist::VirtioDeviceState;
-use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
 use crate::snapshot::{Persist, Provision};
 use crate::vstate::memory::GuestMemoryMmap;
 
@@ -105,16 +101,9 @@ pub struct BalloonState {
     pub virtio_state: VirtioDeviceState,
 }
 
-/// Auxiliary structure for creating a device when resuming from a snapshot.
-#[derive(Debug)]
-pub struct BalloonConstructorArgs {
-    /// Pointer to guest memory.
-    pub mem: GuestMemoryMmap,
-}
-
-impl Persist<'_> for Balloon {
+impl<'a> Persist<'a> for Balloon {
     type State = BalloonState;
-    type ApplyArgs = ();
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = super::BalloonError;
 
     fn save(&self) -> Self::State {
@@ -130,122 +119,124 @@ impl Persist<'_> for Balloon {
             virtio_state: VirtioDeviceState::from_device(self),
         }
     }
-}
 
-impl Provision<'_> for Balloon {
-    type ProvisionArgs = BalloonConstructorArgs;
-
-    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let free_page_hinting =
-            state.virtio_state.avail_features & (1u64 << VIRTIO_BALLOON_F_FREE_PAGE_HINTING) != 0;
-
-        let free_page_reporting =
-            state.virtio_state.avail_features & (1u64 << VIRTIO_BALLOON_F_FREE_PAGE_REPORTING) != 0;
-
-        // We can safely create the balloon with arbitrary flags and
-        // num_pages because we will overwrite them after.
-        let mut balloon = Balloon::new(
-            0,
-            false,
-            state.stats_polling_interval_s,
-            free_page_hinting,
-            free_page_reporting,
-        )?;
-
-        let mut num_queues = BALLOON_MIN_NUM_QUEUES;
-        // As per the virtio 1.1 specification, the statistics queue
-        // should not exist if the statistics are not enabled.
-        if state.stats_polling_interval_s > 0 {
-            num_queues += 1;
-        }
-
-        if free_page_hinting {
-            num_queues += 1;
-        }
-
-        if free_page_reporting {
-            num_queues += 1;
-        }
-
-        balloon.queues = state
+    /// Applies saved state while keeping the eventfds and stats timer.
+    fn apply_state(
+        &mut self,
+        state: &Self::State,
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), Self::Error> {
+        state
             .virtio_state
-            .build_queues_checked(
-                &args.mem,
-                VirtioDeviceType::Balloon,
-                num_queues,
-                FIRECRACKER_MAX_QUEUE_SIZE,
-            )
+            .apply_to(self, mem)
             .map_err(|_| Self::Error::QueueRestoreError)?;
-        balloon.avail_features = state.virtio_state.avail_features;
-        balloon.acked_features = state.virtio_state.acked_features;
-        balloon.latest_stats = state.latest_stats.create_stats();
-        balloon.config_space = ConfigSpace {
+        self.avail_features = state.virtio_state.avail_features;
+        self.stats_polling_interval_s = state.stats_polling_interval_s;
+        self.latest_stats = state.latest_stats.create_stats();
+        self.config_space = ConfigSpace {
             num_pages: state.config_space.num_pages,
             actual_pages: state.config_space.actual_pages,
             // On restore allow the guest to reclaim pages
             free_page_hint_cmd_id: FREE_PAGE_HINT_DONE,
         };
-        balloon.hinting_state = state.hinting_state;
+        self.hinting_state = state.hinting_state;
 
-        if state.virtio_state.activated && balloon.stats_enabled() {
-            // Restore the stats descriptor.
-            balloon.set_stats_desc_index(state.stats_desc_index);
-
-            // Restart timer if needed.
-            let duration = Duration::from_secs(state.stats_polling_interval_s as u64);
-            balloon.stats_timer.arm(duration, Some(duration));
+        if state.virtio_state.activated && self.stats_enabled() {
+            self.set_stats_desc_index(state.stats_desc_index);
+            self.update_timer_state();
         }
 
-        Ok(balloon)
+        Ok(())
+    }
+}
+
+impl Provision<'_> for Balloon {
+    type ProvisionArgs = ();
+
+    fn provision(_: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
+        let free_page_hinting =
+            state.virtio_state.avail_features & (1u64 << VIRTIO_BALLOON_F_FREE_PAGE_HINTING) != 0;
+        let free_page_reporting =
+            state.virtio_state.avail_features & (1u64 << VIRTIO_BALLOON_F_FREE_PAGE_REPORTING) != 0;
+        Balloon::new(
+            0,
+            false,
+            state.stats_polling_interval_s,
+            free_page_hinting,
+            free_page_reporting,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
+
     use super::*;
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::test_utils::default_mem;
+    use crate::devices::virtio::test_utils::test::VirtioTestHelper;
 
     #[test]
     fn test_persistence() {
         let guest_mem = default_mem();
+        let balloon = Balloon::new(0x42, false, 2, true, true).unwrap();
+        let max_size = balloon.queues[0].max_size;
+        let mut th = VirtioTestHelper::new(&guest_mem, balloon);
+        for queue in &mut th.device().queues {
+            queue.max_size = max_size;
+        }
+        th.activate_device(&guest_mem);
+        let mut balloon = th.device();
+        balloon.stats_desc_index = Some(7);
+        balloon.config_space.actual_pages = 17;
+        balloon.latest_stats = BalloonStats {
+            swap_in: Some(1),
+            swap_out: Some(2),
+            major_faults: Some(3),
+            minor_faults: Some(4),
+            free_memory: Some(0x1234),
+            total_memory: Some(6),
+            available_memory: Some(7),
+            disk_caches: Some(8),
+            hugetlb_allocations: Some(9),
+            hugetlb_failures: Some(10),
+            oom_kill: Some(11),
+            alloc_stall: Some(12),
+            async_scan: Some(13),
+            direct_scan: Some(14),
+            async_reclaim: Some(15),
+            direct_reclaim: Some(16),
+            ..Default::default()
+        };
+        balloon.hinting_state = HintingState {
+            host_cmd: 37,
+            last_cmd_id: 35,
+            guest_cmd: Some(36),
+            acknowledge_on_finish: true,
+        };
+        let state = bitcode::deserialize(&bitcode::serialize(&balloon.save()).unwrap()).unwrap();
 
-        // Create and save the balloon device.
-        let balloon = Balloon::new(0x42, false, 2, false, false).unwrap();
-
-        let balloon_state = balloon.save();
-        let serialized_data = bitcode::serialize(&balloon_state).unwrap();
-
-        // Deserialize and restore the balloon device.
-        let restored_state = bitcode::deserialize(&serialized_data).unwrap();
-        let restored_balloon =
-            Balloon::provision(BalloonConstructorArgs { mem: guest_mem }, &restored_state).unwrap();
-
-        assert_eq!(restored_balloon.device_type(), VirtioDeviceType::Balloon);
-
-        assert_eq!(restored_balloon.acked_features, balloon.acked_features);
-        assert_eq!(restored_balloon.avail_features, balloon.avail_features);
+        let mut balloon = Balloon::provision((), &state).unwrap();
+        let timer_fd = balloon.stats_timer.as_raw_fd();
+        let queue_fd = balloon.queue_evts[0].as_raw_fd();
+        let activate_fd = balloon.activate_evt.as_raw_fd();
+        balloon.apply_state(&state, &guest_mem).unwrap();
+        // Activation is deferred to load; every other saved field must round-trip.
+        assert!(!balloon.is_activated());
+        let mut saved = balloon.save();
+        saved.virtio_state.activated = state.virtio_state.activated;
         assert_eq!(
-            restored_balloon.config_space.num_pages,
-            balloon.config_space.num_pages
+            bitcode::serialize(&saved).unwrap(),
+            bitcode::serialize(&state).unwrap()
         );
         assert_eq!(
-            restored_balloon.config_space.actual_pages,
-            balloon.config_space.actual_pages
-        );
-        assert_eq!(
-            restored_balloon.config_space.free_page_hint_cmd_id,
+            balloon.config_space.free_page_hint_cmd_id,
             FREE_PAGE_HINT_DONE
         );
-        assert_eq!(restored_balloon.queues(), balloon.queues());
-        assert!(!restored_balloon.is_activated());
-        assert!(!balloon.is_activated());
-
-        assert_eq!(
-            restored_balloon.stats_polling_interval_s,
-            balloon.stats_polling_interval_s
-        );
-        assert_eq!(restored_balloon.stats_desc_index, balloon.stats_desc_index);
-        assert_eq!(restored_balloon.latest_stats, balloon.latest_stats);
+        assert!(balloon.stats_timer.is_armed());
+        assert_eq!(balloon.stats_timer.as_raw_fd(), timer_fd);
+        assert_eq!(balloon.queue_evts[0].as_raw_fd(), queue_fd);
+        assert_eq!(balloon.activate_evt.as_raw_fd(), activate_fd);
     }
 }
