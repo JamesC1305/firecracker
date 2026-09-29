@@ -250,7 +250,7 @@ impl<'a> Persist<'a> for MMIOPlatformDevices {
             gpio_pl061_state: self
                 .gpio_pl061
                 .as_ref()
-                .map(|device| device.inner.lock().expect("Poisoned lock").state()),
+                .map(|device| device.inner.lock().expect("Poisoned lock").save()),
         }
     }
 }
@@ -290,10 +290,11 @@ impl<'a> Provision<'a> for MMIOPlatformDevices {
             }
 
             if let Some(device_info) = state.gpio_pl061 {
-                let gpio_pl061 = Arc::new(Mutex::new(match &state.gpio_pl061_state {
-                    Some(saved) => PL061Device::from_state(saved)?,
-                    None => PL061Device::new()?,
-                }));
+                let mut gpio = PL061Device::new()?;
+                if let Some(saved) = &state.gpio_pl061_state {
+                    gpio.apply_state(saved, ())?;
+                }
+                let gpio_pl061 = Arc::new(Mutex::new(gpio));
                 platform_devices.register_mmio_gpio_pl061(
                     constructor_args.vm,
                     gpio_pl061,
@@ -786,7 +787,7 @@ mod tests {
             let mut gpio = gpio.lock().unwrap();
             gpio.bus_write(0x40c, &1u32.to_le_bytes()); // interrupt event (IEV)
             gpio.bus_write(0x410, &1u32.to_le_bytes()); // interrupt mask (IE)
-            gpio.state()
+            gpio.save()
         };
 
         let state = device_manager.mmio_platform_devices.save();
@@ -832,7 +833,7 @@ mod tests {
             .inner
             .lock()
             .unwrap()
-            .state();
+            .save();
         assert_eq!(restored_gpio_state, saved_gpio_state);
 
         // Restoring must replay the GSI reservations, otherwise the allocator still believes
