@@ -623,6 +623,19 @@
             },
             {
                 "syscall": "ioctl",
+                "comment": "Needed to clear unsaved GICv2 line levels during snapshot reset",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074310753,
+                        "comment": "KVM_IRQ_LINE"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
                 "args": [
                     {
                         "index": 1,
@@ -660,7 +673,7 @@
             },
             {
                 "syscall": "ioctl",
-                "comment": "Needed for unregistering irqfds during device hot-unplug and VM teardown (called from MsixVectorGroup::drop)",
+                "comment": "Needed for PCI reset IRQFD reconciliation, device hot-unplug and VM teardown",
                 "args": [
                     {
                         "index": 1,
@@ -668,6 +681,39 @@
                         "op": "eq",
                         "val": 1075883638,
                         "comment": "KVM_IRQFD"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for restoring MSI-X routing on the VMM thread",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 44547,
+                        "comment": "KVM_CHECK_EXTENSION"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 131,
+                        "comment": "KVM_CAP_MSI_DEVID"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for restoring MSI-X routing on the VMM thread",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074310762,
+                        "comment": "KVM_SET_GSI_ROUTING"
                     }
                 ]
             },
@@ -1373,6 +1419,45 @@
                         "op": "eq",
                         "val": 3221794480,
                         "comment": "KVM_GET_REG_LIST"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed to reset initialized vCPUs during snapshot reset",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1075883694,
+                        "comment": "KVM_ARM_VCPU_INIT"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed to restore saved vCPU registers during snapshot reset",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074835116,
+                        "comment": "KVM_SET_ONE_REG"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed to restore saved vCPU power state during snapshot reset",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074048665,
+                        "comment": "KVM_SET_MP_STATE"
                     }
                 ]
             },

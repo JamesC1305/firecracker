@@ -623,6 +623,45 @@
             },
             {
                 "syscall": "ioctl",
+                "comment": "Needed for in-place VM reset (KVM_SET_* at runtime)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 2181607011,
+                        "comment": "KVM_SET_IRQCHIP"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for in-place VM reset (KVM_SET_* at runtime)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1076932219,
+                        "comment": "KVM_SET_CLOCK"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for in-place VM reset (KVM_SET_* at runtime)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1081126560,
+                        "comment": "KVM_SET_PIT2"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
                 "args": [
                     {
                         "index": 1,
@@ -672,7 +711,7 @@
             },
             {
                 "syscall": "ioctl",
-                "comment": "Needed for unregistering irqfds during device hot-unplug and VM teardown (called from MsixVectorGroup::drop)",
+                "comment": "Needed for PCI reset IRQFD reconciliation, device hot-unplug and VM teardown",
                 "args": [
                     {
                         "index": 1,
@@ -680,6 +719,39 @@
                         "op": "eq",
                         "val": 1075883638,
                         "comment": "KVM_IRQFD"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for restoring MSI-X routing on the VMM thread",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 44547,
+                        "comment": "KVM_CHECK_EXTENSION"
+                    },
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 131,
+                        "comment": "KVM_CAP_MSI_DEVID"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for restoring MSI-X routing on the VMM thread",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074310762,
+                        "comment": "KVM_SET_GSI_ROUTING"
                     }
                 ]
             },
@@ -1373,6 +1445,136 @@
                         "op": "eq",
                         "val": 2151722655,
                         "comment": "KVM_GET_VCPU_EVENTS"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for in-place VM reset (KVM_SET_* at runtime)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074310800,
+                        "comment": "KVM_SET_CPUID2"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for in-place VM reset (KVM_SET_* at runtime)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074048665,
+                        "comment": "KVM_SET_MP_STATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for in-place VM reset (KVM_SET_* at runtime)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1083223682,
+                        "comment": "KVM_SET_REGS"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for in-place VM reset (KVM_SET_* at runtime)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1094233732,
+                        "comment": "KVM_SET_SREGS"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for in-place VM reset (KVM_SET_* at runtime)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1342221989,
+                        "comment": "KVM_SET_XSAVE"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for in-place VM reset (KVM_SET_* at runtime)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1099476647,
+                        "comment": "KVM_SET_XCRS"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for in-place VM reset (KVM_SET_* at runtime)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1082175138,
+                        "comment": "KVM_SET_DEBUGREGS"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for in-place VM reset (KVM_SET_* at runtime)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1140895375,
+                        "comment": "KVM_SET_LAPIC"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for in-place VM reset (KVM_SET_* at runtime)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074310793,
+                        "comment": "KVM_SET_MSRS"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "Needed for in-place VM reset (KVM_SET_* at runtime)",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1077980832,
+                        "comment": "KVM_SET_VCPU_EVENTS"
                     }
                 ]
             },
