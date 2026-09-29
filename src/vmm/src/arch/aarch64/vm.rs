@@ -12,7 +12,6 @@ use vmm_sys_util::ioctl_iow_nr;
 use crate::Kvm;
 use crate::arch::aarch64::gic::GicState;
 use crate::logger::warn;
-use crate::snapshot::Persist;
 use crate::vstate::memory::{GuestMemoryExtension, GuestMemoryState};
 use crate::vstate::resources::{ResourceAllocator, ResourceAllocatorState};
 use crate::vstate::vm::{VmCommon, VmError};
@@ -142,7 +141,7 @@ impl KvmVm {
             .restore_device(mpidrs, &state.gic)
             .map_err(KvmVmError::RestoreGic)?;
         self.common.resource_allocator =
-            Mutex::new(ResourceAllocator::restore((), &state.resource_allocator)?);
+            Mutex::new(ResourceAllocator::from_state(&state.resource_allocator)?);
 
         Ok(())
     }

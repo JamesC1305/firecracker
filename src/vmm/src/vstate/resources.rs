@@ -7,7 +7,6 @@ use vm_allocator::AddressAllocator;
 pub use vm_allocator::AllocPolicy;
 
 use crate::arch;
-use crate::snapshot::Persist;
 
 /// Helper function to allocate many ids from an id allocator
 fn allocate_many_ids(
@@ -39,6 +38,8 @@ fn allocate_many_ids(
 /// * GSIs for legacy x86_64 devices
 /// * GSIs for MMIO devicecs
 /// * Memory allocations in the MMIO address space
+///
+/// Snapshot load reconstructs this bookkeeping. Reset keeps the live allocator and its allocations.
 #[derive(Debug, Clone)]
 pub struct ResourceAllocator {
     /// Allocator for legacy device interrupt lines
@@ -131,12 +132,9 @@ impl Default for ResourceAllocatorState {
     }
 }
 
-impl<'a> Persist<'a> for ResourceAllocator {
-    type State = ResourceAllocatorState;
-    type ConstructorArgs = ();
-    type Error = vm_allocator::Error;
-
-    fn save(&self) -> Self::State {
+impl ResourceAllocator {
+    /// Saves memory allocation bookkeeping for snapshot load.
+    pub fn save(&self) -> ResourceAllocatorState {
         ResourceAllocatorState {
             mmio32_memory: self.mmio32_memory.clone(),
             mmio64_memory: self.mmio64_memory.clone(),
@@ -145,10 +143,8 @@ impl<'a> Persist<'a> for ResourceAllocator {
         }
     }
 
-    fn restore(
-        _constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
+    /// Creates memory allocators from saved state and empty GSI allocators for device replay.
+    pub fn from_state(state: &ResourceAllocatorState) -> Result<Self, vm_allocator::Error> {
         Ok(ResourceAllocator {
             gsi_legacy_allocator: IdAllocator::new(arch::GSI_LEGACY_START, arch::GSI_LEGACY_END)?,
             gsi_msi_allocator: IdAllocator::new(arch::GSI_MSI_START, arch::GSI_MSI_END)?,
@@ -266,7 +262,6 @@ mod tests {
     mod resource_allocator {
         use super::super::{AllocPolicy, ResourceAllocator};
         use crate::arch::{self, GSI_LEGACY_NUM, GSI_MSI_NUM};
-        use crate::snapshot::Persist;
 
         #[test]
         fn test_allocate_irq() {
@@ -367,7 +362,7 @@ mod tests {
                 .unwrap();
 
             let state = allocator.save();
-            let mut restored = ResourceAllocator::restore((), &state).unwrap();
+            let mut restored = ResourceAllocator::from_state(&state).unwrap();
 
             // GSI allocators are intentionally omitted from ResourceAllocatorState and replayed by
             // the restored devices, so they start empty after restore.

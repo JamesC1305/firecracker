@@ -818,7 +818,7 @@ mod tests {
         // Restore the source allocator's state so the restored devices' GSIs match what their
         // `MsixVectorGroup::Drop` will try to free at end-of-test.
         *vmm.vm.as_kvm().unwrap().resource_allocator() =
-            ResourceAllocator::restore((), &saved_allocator).unwrap();
+            ResourceAllocator::from_state(&saved_allocator).unwrap();
 
         let device_manager_state: device_manager::DevicesState =
             bitcode::deserialize(&serialized_data).unwrap();

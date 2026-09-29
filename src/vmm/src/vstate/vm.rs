@@ -1256,7 +1256,7 @@ pub(crate) mod tests {
         // On the real restore path the allocator state omits MSI GSIs before devices replay
         // their allocations. Mimic that here so `restore` can re-claim the saved GSIs.
         let allocator_state = vm.resource_allocator().save();
-        *vm.resource_allocator() = ResourceAllocator::restore((), &allocator_state).unwrap();
+        *vm.resource_allocator() = ResourceAllocator::from_state(&allocator_state).unwrap();
         let restored_group = MsixVectorGroup::restore(vm.clone(), &state).unwrap();
 
         assert_eq!(msix_group.num_vectors(), restored_group.num_vectors());
