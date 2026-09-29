@@ -33,7 +33,7 @@ use crate::devices::legacy::I8042Device;
 #[cfg(target_arch = "aarch64")]
 use crate::devices::legacy::RTCDevice;
 use crate::devices::legacy::SerialDevice;
-use crate::devices::legacy::serial::{SerialOut, SerialOutInner};
+use crate::devices::legacy::serial::{RawIOError, SerialOut, SerialOutInner};
 use crate::devices::pseudo::BootTimer;
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::balloon::BalloonError;
@@ -170,7 +170,16 @@ impl DeviceManager {
             }
         };
 
-        let serial = Arc::new(Mutex::new(SerialDevice::new(serial_in, serial_out, state)?));
+        let mut serial = SerialDevice::new(serial_in, serial_out)?;
+        if let Some(state) = state {
+            serial
+                .restore_in_place(state, ())
+                .map_err(|RawIOError::Serial(err)| match err {
+                    serial::Error::Trigger(e) | serial::Error::IOError(e) => e,
+                    serial::Error::FullFifo => std::io::Error::other("FIFO buffer too large"),
+                })?;
+        }
+        let serial = Arc::new(Mutex::new(serial));
         event_manager.add_subscriber(serial.clone());
         Ok(serial)
     }
@@ -180,7 +189,7 @@ impl DeviceManager {
         {
             self.mmio_platform_devices.serial.as_ref().map(|device| {
                 let locked = device.inner.lock().expect("Poisoned lock");
-                locked.serial.state().into()
+                locked.save().into()
             })
         }
 
@@ -191,8 +200,7 @@ impl DeviceManager {
                     .stdio_serial
                     .lock()
                     .expect("Poisoned lock")
-                    .serial
-                    .state()
+                    .save()
                     .into()
             })
         }
@@ -803,7 +811,7 @@ pub(crate) mod tests {
         #[cfg(target_arch = "x86_64")]
         let legacy_devices = PortIODeviceManager {
             stdio_serial: Arc::new(Mutex::new(
-                SerialDevice::new(None, SerialOut::new(SerialOutInner::Sink, None), None).unwrap(),
+                SerialDevice::new(None, SerialOut::new(SerialOutInner::Sink, None)).unwrap(),
             )),
             i8042: Arc::new(Mutex::new(
                 I8042Device::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()).unwrap(),

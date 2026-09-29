@@ -133,6 +133,19 @@ impl I8042Device {
         })
     }
 
+    /// Returns the guest-visible state to the values that [`Self::new`] sets, keeping the
+    /// reset and keyboard eventfds. Snapshots do not save i8042 state, so this matches the
+    /// device that snapshot load creates.
+    pub fn reset_to_fresh(&mut self) {
+        self.status = SB_KBD_ENABLED;
+        self.control = CB_POST_OK | CB_KBD_INT;
+        self.outp = 0;
+        self.cmd = 0;
+        self.buf = [0; BUF_SIZE];
+        self.bhead = Wrapping(0);
+        self.btail = Wrapping(0);
+    }
+
     /// Signal a ctrl-alt-del (reset) event.
     #[inline]
     pub fn trigger_ctrl_alt_del(&mut self) -> Result<(), I8042Error> {
@@ -386,6 +399,55 @@ mod tests {
         let data = [CMD_RESET_CPU; 2];
         i8042.write(0x0, 1, &data);
         assert_eq!(METRICS.missed_write_count.count(), before + 3);
+    }
+
+    #[test]
+    fn test_reset_to_fresh() {
+        use std::os::fd::AsRawFd;
+
+        fn write_byte(device: &mut I8042Device, offset: u64, value: u8) {
+            device.write(0, offset, &[value]);
+        }
+
+        fn read_byte(device: &mut I8042Device, offset: u64) -> u8 {
+            let mut value = [0];
+            device.read(0, offset, &mut value);
+            value[0]
+        }
+
+        let mut live = I8042Device::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()).unwrap();
+        let reset_fd = live.reset_evt.as_raw_fd();
+        let interrupt_fd = live.kbd_interrupt_evt.as_raw_fd();
+        write_byte(&mut live, OFS_STATUS, CMD_WRITE_CTR);
+        write_byte(&mut live, OFS_DATA, 0x52);
+        write_byte(&mut live, OFS_STATUS, CMD_WRITE_OUTP);
+        write_byte(&mut live, OFS_DATA, 0xa7);
+        write_byte(&mut live, OFS_DATA, 0x99);
+        write_byte(&mut live, OFS_STATUS, CMD_WRITE_OUTP);
+
+        live.reset_to_fresh();
+        let mut fresh = I8042Device::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()).unwrap();
+        assert_eq!(
+            read_byte(&mut live, OFS_STATUS),
+            read_byte(&mut fresh, OFS_STATUS)
+        );
+        // The pending write-output command and buffered acknowledgement were discarded.
+        write_byte(&mut live, OFS_DATA, 0x99);
+        write_byte(&mut fresh, OFS_DATA, 0x99);
+        assert_eq!(
+            read_byte(&mut live, OFS_DATA),
+            read_byte(&mut fresh, OFS_DATA)
+        );
+        for command in [CMD_READ_CTR, CMD_READ_OUTP] {
+            write_byte(&mut live, OFS_STATUS, command);
+            write_byte(&mut fresh, OFS_STATUS, command);
+            assert_eq!(
+                read_byte(&mut live, OFS_DATA),
+                read_byte(&mut fresh, OFS_DATA)
+            );
+        }
+        assert_eq!(live.reset_evt.as_raw_fd(), reset_fd);
+        assert_eq!(live.kbd_interrupt_evt.as_raw_fd(), interrupt_fd);
     }
 
     #[test]

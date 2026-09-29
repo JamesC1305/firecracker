@@ -72,6 +72,13 @@ impl RTCDevice {
     pub fn new() -> RTCDevice {
         Default::default()
     }
+
+    /// Returns the guest-visible state to the values that [`Self::new`] sets, keeping
+    /// the metrics backend. Snapshots do not save RTC state, so this matches snapshot
+    /// load: the counter follows current host time without the guest's previous offset.
+    pub fn reset_to_fresh(&mut self) {
+        self.0 = Rtc::with_events(*self.0.events());
+    }
 }
 
 impl std::ops::Deref for RTCDevice {
@@ -160,6 +167,54 @@ mod tests {
         let error_count_after = TEST_RTC_DEVICE_METRICS.error_count.count();
         assert_eq!(invalid_writes_after - invalid_writes_before, 1);
         assert_eq!(error_count_after - error_count_before, 1);
+    }
+
+    #[test]
+    fn test_reset_to_fresh() {
+        use vm_superio::rtc_pl031::RtcState;
+
+        let mut live = RTCDevice(Rtc::from_state(
+            &RtcState {
+                lr: 123,
+                offset: -456,
+                mr: 789,
+                imsc: 1,
+                ris: 1,
+            },
+            &METRICS,
+        ));
+        let mut fresh = RTCDevice::new();
+
+        live.reset_to_fresh();
+
+        // Compare the counter offset rather than RTCDR, which advances with host time.
+        assert_eq!(live.state(), fresh.state());
+        for offset in [0x004, 0x008, 0x00c, 0x010, 0x014, 0x018] {
+            let mut live_value = [0; 4];
+            let mut fresh_value = [0; 4];
+            live.bus_read(offset, &mut live_value);
+            fresh.bus_read(offset, &mut fresh_value);
+            assert_eq!(live_value, fresh_value, "RTC register {offset:#x}");
+        }
+    }
+
+    #[test]
+    fn test_reset_to_fresh_preserves_metrics() {
+        static TEST_RESET_METRICS: RTCDeviceMetrics = RTCDeviceMetrics::new();
+        let mut rtc = RTCDevice(Rtc::with_events(&TEST_RESET_METRICS));
+        rtc.bus_write(0x000, &[0; 4]);
+        rtc.bus_read(0x01c, &mut [0; 4]);
+        assert_eq!(TEST_RESET_METRICS.error_count.count(), 2);
+
+        rtc.reset_to_fresh();
+
+        assert!(std::ptr::eq(*rtc.events(), &TEST_RESET_METRICS));
+        assert_eq!(TEST_RESET_METRICS.error_count.count(), 2);
+        rtc.bus_write(0x000, &[0; 4]);
+        rtc.bus_read(0x01c, &mut [0; 4]);
+        assert_eq!(TEST_RESET_METRICS.missed_write_count.count(), 2);
+        assert_eq!(TEST_RESET_METRICS.missed_read_count.count(), 2);
+        assert_eq!(TEST_RESET_METRICS.error_count.count(), 4);
     }
 
     #[test]

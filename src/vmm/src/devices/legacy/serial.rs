@@ -261,33 +261,54 @@ impl<I: Read + AsRawFd + Send + Debug> SerialWrapper<EventFdTrigger, SerialEvent
     }
 }
 
+impl<I: Read + AsRawFd + Send + Debug> SerialWrapper<EventFdTrigger, SerialEventsWrapper, I> {
+    pub fn save(&self) -> SerialState {
+        self.serial.state()
+    }
+
+    /// Restores UART registers and input buffers while retaining the live eventfds,
+    /// input source and output sink, including its rate limiter.
+    pub fn restore_in_place(&mut self, state: &SerialState, _: ()) -> Result<(), RawIOError> {
+        // vm-superio applies a state only by building a new `Serial`, and cannot hand back the
+        // eventfds of the old one. KVM and the event loop watch those descriptors, so the new
+        // `Serial` shares them instead of getting new ones.
+        let interrupt_evt = self.serial.interrupt_evt().shared_clone();
+        let events = SerialEventsWrapper {
+            buffer_ready_event_fd: self
+                .serial
+                .events()
+                .buffer_ready_event_fd
+                .as_ref()
+                .map(EventFdTrigger::shared_clone),
+        };
+
+        // Keep the live output in the old UART if signaling a pending interrupt fails.
+        let mut restored = Serial::from_state(
+            state,
+            interrupt_evt,
+            events,
+            SerialOut::new(SerialOutInner::Sink, None),
+        )
+        .map_err(RawIOError::Serial)?;
+        std::mem::swap(restored.writer_mut(), self.serial.writer_mut());
+        self.serial = restored;
+        Ok(())
+    }
+}
+
 /// Type for representing a serial device.
 pub type SerialDevice = SerialWrapper<EventFdTrigger, SerialEventsWrapper, Stdin>;
 
 impl SerialDevice {
-    pub fn new(
-        serial_in: Option<Stdin>,
-        serial_out: SerialOut,
-        state: Option<&SerialState>,
-    ) -> Result<Self, std::io::Error> {
+    pub fn new(serial_in: Option<Stdin>, serial_out: SerialOut) -> Result<Self, std::io::Error> {
         let interrupt_evt = EventFdTrigger::new(EventFd::new(EFD_NONBLOCK)?);
         let buffer_read_event_fd = EventFdTrigger::new(EventFd::new(EFD_NONBLOCK)?);
         let events = SerialEventsWrapper {
             buffer_ready_event_fd: Some(buffer_read_event_fd),
         };
 
-        let serial =
-            match state {
-                Some(state) => Serial::from_state(state, interrupt_evt, events, serial_out)
-                    .map_err(|err| match err {
-                        SerialError::Trigger(e) | SerialError::IOError(e) => e,
-                        SerialError::FullFifo => std::io::Error::other("FIFO buffer too large"),
-                    })?,
-                None => Serial::with_events(interrupt_evt, events, serial_out),
-            };
-
         Ok(SerialDevice {
-            serial,
+            serial: Serial::with_events(interrupt_evt, events, serial_out),
             input: serial_in,
         })
     }
@@ -485,11 +506,12 @@ mod tests {
 
     #[test]
     fn test_restore_from_state() {
-        let mut serial = SerialDevice::new(None, test_serial_out_sink(), None).unwrap();
+        let mut serial = SerialDevice::new(None, test_serial_out_sink()).unwrap();
         serial.serial.raw_input(b"abc").unwrap();
 
-        let state = serial.serial.state();
-        let mut restored = SerialDevice::new(None, test_serial_out_sink(), Some(&state)).unwrap();
+        let state = serial.save();
+        let mut restored = SerialDevice::new(None, test_serial_out_sink()).unwrap();
+        restored.restore_in_place(&state, ()).unwrap();
 
         // Make sure we read back what we previously injected
         let mut buf = [0u8; 1];
@@ -499,6 +521,73 @@ mod tests {
         assert_eq!(buf[0], b'b');
         restored.read(0, 0, &mut buf);
         assert_eq!(buf[0], b'c');
+    }
+
+    #[test]
+    fn test_apply_keeps_host_resources() {
+        let mut base = SerialDevice::new(None, test_serial_out_sink()).unwrap();
+        base.write(0, 3, &[0x80]);
+        base.write(0, 0, &[0x34]);
+        base.write(0, 1, &[0x12]);
+        base.write(0, 3, &[0x03]);
+        base.write(0, 1, &[0x03]);
+        base.write(0, 4, &[0x08]);
+        base.write(0, 7, &[0xa5]);
+        base.serial.raw_input(b"base input").unwrap();
+        let state = base.save();
+
+        let output_file = vmm_sys_util::tempfile::TempFile::new().unwrap().into_file();
+        let mut live = SerialDevice::new(
+            Some(std::io::stdin()),
+            SerialOut::new(SerialOutInner::File(output_file), None),
+        )
+        .unwrap();
+        live.write(0, 3, &[0x80]);
+        live.write(0, 0, &[0xfe]);
+        live.write(0, 1, &[0xca]);
+        live.write(0, 3, &[0x1f]);
+        live.write(0, 1, &[0x00]);
+        live.write(0, 4, &[0x10]);
+        live.write(0, 7, &[0x5a]);
+        live.serial.raw_input(b"mutated").unwrap();
+
+        let interrupt_evt = Arc::clone(&live.serial.interrupt_evt().0);
+        let buffer_ready_evt = Arc::clone(
+            &live
+                .serial
+                .events()
+                .buffer_ready_event_fd
+                .as_ref()
+                .unwrap()
+                .0,
+        );
+        let input_fd = live.input.as_ref().unwrap().as_raw_fd();
+        let output_fd = match &live.serial.writer().inner {
+            SerialOutInner::File(file) => file.as_raw_fd(),
+            _ => unreachable!(),
+        };
+
+        live.restore_in_place(&state, ()).unwrap();
+        assert_eq!(live.save(), state);
+        assert!(Arc::ptr_eq(&interrupt_evt, &live.serial.interrupt_evt().0));
+        assert!(Arc::ptr_eq(
+            &buffer_ready_evt,
+            &live
+                .serial
+                .events()
+                .buffer_ready_event_fd
+                .as_ref()
+                .unwrap()
+                .0
+        ));
+        assert_eq!(live.input.as_ref().unwrap().as_raw_fd(), input_fd);
+        match &live.serial.writer().inner {
+            SerialOutInner::File(file) => assert_eq!(file.as_raw_fd(), output_fd),
+            _ => panic!("serial output sink was replaced"),
+        }
+        let mut input = [0];
+        live.read(0, 0, &mut input);
+        assert_eq!(input[0], b'b');
     }
 
     #[test]

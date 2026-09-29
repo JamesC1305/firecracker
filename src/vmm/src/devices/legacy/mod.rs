@@ -13,6 +13,7 @@ pub mod serial;
 
 use std::io;
 use std::ops::Deref;
+use std::sync::Arc;
 
 use serde::Serializer;
 use serde::ser::SerializeMap;
@@ -28,7 +29,7 @@ pub use self::serial::{SerialDevice, SerialEventsWrapper, SerialWrapper};
 ///
 /// The trigger is used for handling events in the legacy devices.
 #[derive(Debug)]
-pub struct EventFdTrigger(EventFd);
+pub struct EventFdTrigger(Arc<EventFd>);
 
 impl Trigger for EventFdTrigger {
     type E = io::Error;
@@ -46,14 +47,19 @@ impl Deref for EventFdTrigger {
 }
 
 impl EventFdTrigger {
-    /// Clone an `EventFdTrigger`.
+    /// Clone an `EventFdTrigger` with a duplicated file descriptor.
     pub fn try_clone(&self) -> io::Result<Self> {
-        Ok(EventFdTrigger((**self).try_clone()?))
+        Ok(EventFdTrigger::new((**self).try_clone()?))
+    }
+
+    /// Share the same file descriptor, preserving its event-loop registrations.
+    pub fn shared_clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
     }
 
     /// Create an `EventFdTrigger`.
     pub fn new(evt: EventFd) -> Self {
-        Self(evt)
+        Self(Arc::new(evt))
     }
 
     /// Get the associated event fd out of an `EventFdTrigger`.
