@@ -647,13 +647,13 @@ impl MmdsMetrics {
 }
 
 /// Performance metrics related for the moment only to snapshots.
-// These store the duration of creating/loading a snapshot and of
+// These store the duration of creating/loading/resetting a snapshot and of
 // pausing/resuming the microVM.
 // If there are more than one `/snapshot/create` request in a minute
 // (until the metrics are flushed), only the duration of the last
 // snapshot creation is stored in the metric. If the user is interested
 // in all the durations, a `FlushMetrics` request should be sent after
-// each `create` request.
+// each `create` request. The same holds for the other requests.
 #[derive(Debug, Default, Serialize)]
 pub struct PerformanceMetrics {
     /// Measures the snapshot full create time, at the API (user) level, in microseconds.
@@ -662,6 +662,8 @@ pub struct PerformanceMetrics {
     pub diff_create_snapshot: SharedStoreMetric,
     /// Measures the snapshot load time, at the API (user) level, in microseconds.
     pub load_snapshot: SharedStoreMetric,
+    /// Measures the snapshot reset time, at the API (user) level, in microseconds.
+    pub reset_snapshot: SharedStoreMetric,
     /// Measures the microVM pausing duration, at the API (user) level, in microseconds.
     pub pause_vm: SharedStoreMetric,
     /// Measures the microVM resuming duration, at the API (user) level, in microseconds.
@@ -672,6 +674,8 @@ pub struct PerformanceMetrics {
     pub vmm_diff_create_snapshot: SharedStoreMetric,
     /// Measures the snapshot load time, at the VMM level, in microseconds.
     pub vmm_load_snapshot: SharedStoreMetric,
+    /// Measures the snapshot reset time, at the VMM level, in microseconds.
+    pub vmm_reset_snapshot: SharedStoreMetric,
     /// Measures the microVM pausing duration, at the VMM level, in microseconds.
     pub vmm_pause_vm: SharedStoreMetric,
     /// Measures the microVM resuming duration, at the VMM level, in microseconds.
@@ -684,11 +688,13 @@ impl PerformanceMetrics {
             full_create_snapshot: SharedStoreMetric::new(),
             diff_create_snapshot: SharedStoreMetric::new(),
             load_snapshot: SharedStoreMetric::new(),
+            reset_snapshot: SharedStoreMetric::new(),
             pause_vm: SharedStoreMetric::new(),
             resume_vm: SharedStoreMetric::new(),
             vmm_full_create_snapshot: SharedStoreMetric::new(),
             vmm_diff_create_snapshot: SharedStoreMetric::new(),
             vmm_load_snapshot: SharedStoreMetric::new(),
+            vmm_reset_snapshot: SharedStoreMetric::new(),
             vmm_pause_vm: SharedStoreMetric::new(),
             vmm_resume_vm: SharedStoreMetric::new(),
         }

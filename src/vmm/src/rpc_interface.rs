@@ -8,7 +8,7 @@ use serde_json::Value;
 use utils::time::{ClockType, get_time_us};
 
 use super::builder::build_and_boot_microvm;
-use super::persist::{create_snapshot, restore_from_snapshot};
+use super::persist::{create_snapshot, reset_to_snapshot, restore_from_snapshot};
 use super::resources::VmResources;
 use super::{Vmm, VmmError};
 use crate::EventManager;
@@ -20,7 +20,7 @@ use crate::devices::virtio::device::VirtioDeviceId;
 use crate::devices::virtio::mem::VirtioMemStatus;
 use crate::logger::{LoggerConfig, info, warn, *};
 use crate::mmds::data_store::{self, Mmds, MmdsDatastoreError};
-use crate::persist::{CreateSnapshotError, RestoreFromSnapshotError, VmInfo};
+use crate::persist::{CreateSnapshotError, ResetSnapshotError, RestoreFromSnapshotError, VmInfo};
 use crate::resources::VmmConfig;
 use crate::seccomp::BpfThreadMap;
 use crate::vmm_config::HotplugDeviceConfig;
@@ -107,6 +107,8 @@ pub enum VmmAction {
     PutMMDS(Value),
     /// Configure the guest vCPU features.
     PutCpuConfiguration(CustomCpuTemplate),
+    /// Reset a paused microVM to the snapshot from which it was loaded.
+    ResetSnapshot,
     /// Resume the guest, by resuming the microVM VCPUs.
     Resume,
     /// Set the balloon device or update the one that already exists using the
@@ -207,6 +209,8 @@ pub enum VmmActionError {
     OperationNotSupportedPostBoot,
     /// The requested operation is not supported before starting the microVM.
     OperationNotSupportedPreBoot,
+    /// Reset snapshot error: {0}
+    ResetSnapshot(#[from] ResetSnapshotError),
     /// Start microvm error: {0}
     StartMicrovm(#[from] StartMicrovmError),
     /// Vsock config error: {0}
@@ -506,6 +510,7 @@ impl<'a> PrebootApiController<'a> {
             CreateSnapshot(_)
             | FlushMetrics
             | Pause
+            | ResetSnapshot
             | Resume
             | GetBalloonStats
             | GetMemoryHotplugStatus
@@ -799,6 +804,7 @@ impl RuntimeApiController {
                     .expect("Poisoned lock"),
                 value,
             ),
+            ResetSnapshot => self.reset_to_snapshot(),
             Resume => self.resume(),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => self.send_ctrl_alt_del(),
@@ -959,6 +965,17 @@ impl RuntimeApiController {
                 );
             }
         }
+        Ok(VmmData::Empty)
+    }
+
+    fn reset_to_snapshot(&mut self) -> Result<VmmData, VmmActionError> {
+        let reset_start_us = get_time_us(ClockType::Monotonic);
+        reset_to_snapshot(&mut self.vmm.lock().expect("Poisoned lock"))?;
+        let elapsed_time_us = update_metric_with_elapsed_time(
+            &METRICS.latencies_us.vmm_reset_snapshot,
+            reset_start_us,
+        );
+        info!("'reset snapshot' VMM action took {} us.", elapsed_time_us);
         Ok(VmmData::Empty)
     }
 
@@ -1251,6 +1268,7 @@ mod tests {
                 sync_snapshot_files: true,
             },
         )));
+        check_unsupported(preboot_request(VmmAction::ResetSnapshot));
         #[cfg(target_arch = "x86_64")]
         check_unsupported(preboot_request(VmmAction::SendCtrlAltDel));
         check_unsupported(preboot_request(VmmAction::UpdateMemoryHotplugSize(
@@ -1265,6 +1283,14 @@ mod tests {
         let mut runtime = RuntimeApiController::new(vmm.clone());
         let mut event_manager = EventManager::new().unwrap();
         runtime.handle_request(request, &mut event_manager)
+    }
+
+    #[test]
+    fn test_runtime_reset_snapshot() {
+        assert!(matches!(
+            runtime_request(VmmAction::ResetSnapshot),
+            Err(VmmActionError::ResetSnapshot(ResetSnapshotError::NotPaused))
+        ));
     }
 
     #[test]

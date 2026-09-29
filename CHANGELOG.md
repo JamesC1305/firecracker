@@ -10,6 +10,10 @@ and this project adheres to
 
 ### Added
 
+- Added `PUT /snapshot/reset` to reset a paused microVM in place to the snapshot
+  from which it was loaded. It takes no parameters and requires file-backed
+  memory with dirty-page tracking on x86_64 or aarch64.
+
 ### Changed
 
 - [#6201](https://github.com/firecracker-microvm/firecracker/pull/6201):

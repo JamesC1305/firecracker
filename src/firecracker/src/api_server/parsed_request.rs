@@ -109,6 +109,9 @@ impl TryFrom<&Request> for ParsedRequest {
                 parse_put_net(body, path_tokens.next())
             }
             (Method::Put, "snapshot", Some(body)) => parse_put_snapshot(body, path_tokens.next()),
+            (Method::Put, "snapshot", None) if path_tokens.next() == Some("reset") => {
+                Ok(ParsedRequest::new_sync(VmmAction::ResetSnapshot))
+            }
             (Method::Put, "vsock", Some(body)) => parse_put_vsock(body),
             (Method::Put, "entropy", Some(body)) => parse_put_entropy(body),
             (Method::Put, "hotplug", Some(body)) if path_tokens.next() == Some("memory") => {
@@ -417,6 +420,18 @@ pub mod tests {
             );
 
             format!("{}{}", header, content)
+        }
+    }
+
+    #[test]
+    fn test_snapshot_reset_without_body() {
+        for headers in ["", "Content-Length: 0\r\n"] {
+            let bytes = format!("PUT /snapshot/reset HTTP/1.1\r\n{headers}\r\n");
+            let request = Request::try_from(bytes.as_bytes(), None).unwrap();
+            assert_eq!(
+                vmm_action_from_request(ParsedRequest::try_from(&request).unwrap()),
+                VmmAction::ResetSnapshot
+            );
         }
     }
 

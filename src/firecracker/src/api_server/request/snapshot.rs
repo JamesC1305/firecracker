@@ -31,6 +31,7 @@ pub(crate) fn parse_put_snapshot(
         Some(request_type) => match request_type {
             "create" => parse_put_snapshot_create(body),
             "load" => parse_put_snapshot_load(body),
+            "reset" => parse_put_snapshot_reset(body),
             _ => Err(RequestError::InvalidPathMethod(
                 format!("/snapshot/{}", request_type),
                 Method::Put,
@@ -57,6 +58,19 @@ fn parse_put_snapshot_create(body: &Body) -> Result<ParsedRequest, RequestError>
     Ok(ParsedRequest::new_sync(VmmAction::CreateSnapshot(
         snapshot_config,
     )))
+}
+
+fn parse_put_snapshot_reset(body: &Body) -> Result<ParsedRequest, RequestError> {
+    if !body.raw().is_empty() {
+        let params =
+            serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(body.raw())?;
+        if !params.is_empty() {
+            return Err(RequestError::SerdeJson(serde_json::Error::custom(
+                "snapshot reset takes no parameters",
+            )));
+        }
+    }
+    Ok(ParsedRequest::new_sync(VmmAction::ResetSnapshot))
 }
 
 fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
@@ -453,6 +467,21 @@ mod tests {
         );
         parse_put_snapshot(&Body::new(body), Some("invalid")).unwrap_err();
         parse_put_snapshot(&Body::new(body), None).unwrap_err();
+    }
+
+    #[test]
+    fn test_parse_put_snapshot_reset() {
+        for body in ["", "{}"] {
+            assert_eq!(
+                vmm_action_from_request(
+                    parse_put_snapshot(&Body::new(body), Some("reset")).unwrap()
+                ),
+                VmmAction::ResetSnapshot
+            );
+        }
+        for body in [r#"{"snapshot_path":"other"}"#, "[]", "null", "{"] {
+            parse_put_snapshot(&Body::new(body), Some("reset")).unwrap_err();
+        }
     }
 
     #[test]

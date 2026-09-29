@@ -815,6 +815,37 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /snapshot/reset:
+    put:
+      summary: Resets a paused microVM to its loaded snapshot. Post-boot only.
+      description:
+        Resets the microVM state and memory to the snapshot from which it was loaded.
+        Requires a File memory backend, dirty-page tracking and a paused microVM.
+        The microVM remains paused after a successful reset. A failure after state
+        mutation prevents further resets, snapshot creation or resumption.
+      operationId: resetSnapshot
+      parameters:
+        - name: body
+          in: body
+          description:
+            No parameters. Omit the body or send an empty JSON object.
+            The reset target is the load-time snapshot.
+          required: false
+          schema:
+            type: object
+            additionalProperties: false
+      responses:
+        204:
+          description: Snapshot reset completed
+        400:
+          description: Snapshot cannot be reset due to bad input or incompatible VM state
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /version:
     get:
       summary: Gets the Firecracker version.

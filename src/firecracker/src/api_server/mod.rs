@@ -163,6 +163,9 @@ impl ApiServer {
             VmmAction::LoadSnapshot(_) => {
                 Some((&METRICS.latencies_us.load_snapshot, "load snapshot"))
             }
+            VmmAction::ResetSnapshot => {
+                Some((&METRICS.latencies_us.reset_snapshot, "reset snapshot"))
+            }
             VmmAction::Pause => Some((&METRICS.latencies_us.pause_vm, "pause vm")),
             VmmAction::Resume => Some((&METRICS.latencies_us.resume_vm, "resume vm")),
             _ => None,
