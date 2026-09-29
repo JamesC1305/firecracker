@@ -622,8 +622,6 @@ pub enum DevicePersistError {
     Block(#[from] BlockError),
     /// MMIO Device manager: {0}
     MmioDeviceManager(#[from] mmio::MmioError),
-    /// Mmio transport
-    MmioTransport,
     /// PCI Device manager: {0}
     PciDeviceManager(#[from] PciManagerError),
     /// Bus error: {0}
