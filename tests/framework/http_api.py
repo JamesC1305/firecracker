@@ -195,6 +195,7 @@ class Api:
         self.vsock = Resource(self, "/vsock")
         self.snapshot_create = Resource(self, "/snapshot/create")
         self.snapshot_load = Resource(self, "/snapshot/load")
+        self.snapshot_reset = Resource(self, "/snapshot/reset")
         self.cpu_config = Resource(self, "/cpu-config")
         self.entropy = Resource(self, "/entropy")
         self.pmem = Resource(self, "/pmem", "id")
