@@ -101,19 +101,25 @@ impl VsockUnixBackend {
     }
 }
 
-impl<B> Persist<'_> for Vsock<B>
+impl<'a, B> Persist<'a> for Vsock<B>
 where
-    B: VsockBackend + 'static + Debug,
+    B: VsockBackend
+        + Persist<'a, State = VsockBackendState, Error = VsockUnixBackendError>
+        + 'static
+        + Debug,
 {
-    type State = VsockFrontendState;
+    type State = VsockState;
     type ConstructorArgs = VsockConstructorArgs<B>;
     type Error = VsockError;
 
     fn save(&self) -> Self::State {
-        VsockFrontendState {
-            cid: self.cid(),
-            virtio_state: VirtioDeviceState::from_device(self),
-            pending_event_ack: self.pending_event_ack,
+        VsockState {
+            backend: self.backend().save(),
+            frontend: VsockFrontendState {
+                cid: self.cid(),
+                virtio_state: VirtioDeviceState::from_device(self),
+                pending_event_ack: self.pending_event_ack,
+            },
         }
     }
 
@@ -132,25 +138,26 @@ impl<B> Vsock<B>
 where
     B: VsockBackend + 'static + Debug,
 {
-    pub fn create(backend: B, state: &VsockFrontendState) -> Result<Self, VsockError> {
-        Self::new(state.cid, backend)
+    pub fn create(backend: B, state: &VsockState) -> Result<Self, VsockError> {
+        Self::new(state.frontend.cid, backend)
     }
 
     /// Keeps the host socket, eventfds and event loop registrations.
     pub fn restore_in_place(
         &mut self,
-        state: &VsockFrontendState,
+        state: &VsockState,
         mem: &GuestMemoryMmap,
     ) -> Result<(), VsockError> {
         state
+            .frontend
             .virtio_state
             .apply_to(self, mem)
             .map_err(VsockError::VirtioState)?;
-        self.avail_features = state.virtio_state.avail_features;
+        self.avail_features = state.frontend.virtio_state.avail_features;
         // Drop the packets parsed from the old queues.
         self.rx_packet.clear();
         self.tx_packet.clear();
-        self.pending_event_ack = state.pending_event_ack;
+        self.pending_event_ack = state.frontend.pending_event_ack;
         Ok(())
     }
 }
@@ -208,7 +215,7 @@ pub(crate) mod tests {
         for armed in [false, true] {
             ctx.device.pending_event_ack = armed;
             let state = ctx.device.save();
-            assert_eq!(state.pending_event_ack, armed);
+            assert_eq!(state.frontend.pending_event_ack, armed);
 
             let restored = Vsock::restore(
                 VsockConstructorArgs {
@@ -241,11 +248,7 @@ pub(crate) mod tests {
         ];
 
         // Test serialization
-        // Save backend and device state separately.
-        let state = VsockState {
-            backend: ctx.device.backend().save(),
-            frontend: ctx.device.save(),
-        };
+        let state = ctx.device.save();
 
         let serialized_data = bitcode::serialize(&state).unwrap();
 
@@ -259,7 +262,7 @@ pub(crate) mod tests {
                     TestBackend::new()
                 },
             },
-            &restored_state.frontend,
+            &restored_state,
         )
         .unwrap();
 
@@ -305,7 +308,10 @@ pub(crate) mod tests {
 
         device.restore_in_place(&state, &ctx.mem).unwrap();
 
-        assert_eq!(VirtioDeviceState::from_device(device), state.virtio_state);
+        assert_eq!(
+            VirtioDeviceState::from_device(device),
+            state.frontend.virtio_state
+        );
         assert_eq!(fds(device), original_fds);
     }
 }

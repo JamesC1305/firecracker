@@ -447,10 +447,7 @@ impl<'a> Persist<'a> for PciDevices {
 
                     // Save state after potential notification to the guest. This
                     // way we save changes to the queue the notification can cause.
-                    let vsock_state = VsockState {
-                        backend: vsock_dev.backend().save(),
-                        frontend: vsock_dev.save(),
-                    };
+                    let vsock_state = vsock_dev.save();
 
                     state.vsock_device = Some(VirtioDeviceState {
                         device_id: vsock_dev.id().to_string(),
@@ -613,7 +610,7 @@ impl<'a> Persist<'a> for PciDevices {
                     mem: mem.clone(),
                     backend,
                 },
-                &vsock_state.device_state.frontend,
+                &vsock_state.device_state,
             )?));
 
             constructor_args
