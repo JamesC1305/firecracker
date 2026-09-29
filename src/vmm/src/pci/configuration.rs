@@ -349,16 +349,18 @@ impl PciConfiguration {
     }
 
     /// Create a type 0 PCI configuration from snapshot state
-    pub fn type0_from_state(state: PciConfigurationState) -> Result<Self, PciConfigurationError> {
+    pub fn type0_from_state(state: &PciConfigurationState) -> Result<Self, PciConfigurationError> {
         let reg_len = state.registers.len();
         let registers = state
             .registers
+            .as_slice()
             .try_into()
             .map_err(|_| PciConfigurationError::InvalidRegistersLength(reg_len))?;
 
         let wb_len = state.writable_bits.len();
         let writable_bits = state
             .writable_bits
+            .as_slice()
             .try_into()
             .map_err(|_| PciConfigurationError::InvalidWritableBitsLength(wb_len))?;
 

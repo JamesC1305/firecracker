@@ -37,7 +37,7 @@ use crate::resources::VmResources;
 use crate::snapshot::Persist;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::bus::BusError;
-use crate::vstate::interrupts::InterruptError;
+use crate::vstate::interrupts::{InterruptError, MsixVectorGroup};
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vm::KvmVm;
 
@@ -230,12 +230,30 @@ impl PciDevices {
     ) -> Result<(), PciManagerError> {
         let device_type = device.lock().expect("Poisoned lock").device_type();
 
-        let virtio_device = Arc::new(Mutex::new(VirtioPciDevice::new_from_state(
+        let gsis = transport_state
+            .msix_state
+            .checked_gsis()
+            .map_err(VirtioPciDeviceError::from)?;
+        let expected_num_vectors = device.lock().expect("Poisoned lock").queues().len() + 1;
+        if gsis.len() != expected_num_vectors {
+            return Err(VirtioPciDeviceError::UnexpectedMsixVectorCount(
+                gsis.len(),
+                expected_num_vectors,
+            )
+            .into());
+        }
+        let vectors = Arc::new(
+            MsixVectorGroup::from_gsis(vm.clone(), gsis).map_err(VirtioPciDeviceError::from)?,
+        );
+        let mut virtio_device = VirtioPciDevice::new(
             device_id.to_string(),
             vm,
-            device.clone(),
-            transport_state.clone(),
-        )?));
+            device,
+            vectors,
+            transport_state.sbdf,
+        );
+        virtio_device.restore_in_place(transport_state, ())?;
+        let virtio_device = Arc::new(Mutex::new(virtio_device));
 
         self.attach_common(
             vm,
@@ -359,7 +377,7 @@ impl<'a> Persist<'a> for PciDevices {
             // an interrupt to the guest, this is correctly captured in the saved transport state.
             let mut locked_virtio_dev = virtio_dev.lock().expect("Poisoned lock");
             locked_virtio_dev.prepare_save();
-            let transport_state = locked_pci_dev.state();
+            let transport_state = locked_pci_dev.save();
 
             let sbdf = transport_state.sbdf;
 

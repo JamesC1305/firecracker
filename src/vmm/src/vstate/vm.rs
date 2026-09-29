@@ -910,7 +910,6 @@ pub(crate) mod tests {
     use crate::arch;
     use crate::pci::PciSBDF;
     use crate::pci::msix::MsixTableEntry;
-    use crate::snapshot::Persist;
     use crate::test_utils::single_region_mem_raw;
     use crate::utils::mib_to_bytes;
     use crate::vmm_config::machine_config::HugePageConfig;
@@ -1253,11 +1252,11 @@ pub(crate) mod tests {
         enable_all_vectors(&msix_group);
         let state = msix_group.save();
 
-        // On the real restore path the allocator state omits MSI GSIs before devices replay
-        // their allocations. Mimic that here so `restore` can re-claim the saved GSIs.
+        // On the real load path the allocator state omits MSI GSIs before devices replay
+        // their allocations. Mimic that here so the new group can claim the saved GSIs.
         let allocator_state = vm.resource_allocator().save();
         *vm.resource_allocator() = ResourceAllocator::from_state(&allocator_state).unwrap();
-        let restored_group = MsixVectorGroup::restore(vm.clone(), &state).unwrap();
+        let restored_group = MsixVectorGroup::from_gsis(vm.clone(), &state).unwrap();
 
         assert_eq!(msix_group.num_vectors(), restored_group.num_vectors());
         // Even if an MSI group is enabled, we don't save it as such. During restoration, the PCI
@@ -1283,7 +1282,7 @@ pub(crate) mod tests {
         // A snapshot with a GSI outside the managed MSI range must be rejected rather than panic
         // when the GSI is later freed on drop.
         let tampered_state = vec![arch::GSI_MSI_END + 1];
-        MsixVectorGroup::restore(vm.clone(), &tampered_state).unwrap_err();
+        MsixVectorGroup::from_gsis(vm.clone(), &tampered_state).unwrap_err();
     }
 
     #[test]
