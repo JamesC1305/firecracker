@@ -649,12 +649,9 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
 
         for pmem_state in &state.pmem_devices {
             let device = Arc::new(Mutex::new(restore::<Pmem>(
-                PmemProvisionArgs {
-                    mem,
-                    vm: vm.clone(),
-                },
+                PmemProvisionArgs { vm: vm.clone() },
                 &pmem_state.device_state,
-                (),
+                mem,
                 &mut load,
             )?));
 

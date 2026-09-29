@@ -662,11 +662,10 @@ impl<'a> Provision<'a> for PciDevices {
         for pmem_state in &state.pmem_devices {
             let device = Arc::new(Mutex::new(restore::<Pmem>(
                 PmemProvisionArgs {
-                    mem,
                     vm: constructor_args.vm.clone(),
                 },
                 &pmem_state.device_state,
-                (),
+                mem,
                 &mut load,
             )?));
 
