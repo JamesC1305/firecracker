@@ -63,6 +63,14 @@ pub enum MmdsDatastoreError {
     UnsupportedValueType,
 }
 
+/// The data of an MMDS datastore and whether it was initialized. The host policy (version,
+/// IMDS compatibility, size limit) and the token key are not part of it.
+#[derive(Debug, Default)]
+pub struct MmdsData {
+    data_store: Value,
+    is_initialized: bool,
+}
+
 // Used for ease of use in tests.
 impl Default for Mmds {
     fn default() -> Self {
@@ -81,6 +89,34 @@ impl Mmds {
             data_store_limit,
             imds_compat: false,
         })
+    }
+
+    /// Saves the data, so that reset can restore it.
+    pub fn save_data(&self) -> MmdsData {
+        MmdsData {
+            data_store: self.data_store.clone(),
+            is_initialized: self.is_initialized,
+        }
+    }
+
+    /// Creates a token authority with a new key. Reset creates it before it changes the
+    /// microVM, so that a failure leaves the microVM unchanged.
+    pub fn new_token_authority() -> Result<TokenAuthority, MmdsDatastoreError> {
+        Ok(TokenAuthority::try_new()?)
+    }
+
+    /// Restores `data` and installs `authority`, bound to `instance_id`, so that tokens from
+    /// before stop working. The version, IMDS compatibility and size limit stay as they are.
+    pub fn restore_data(
+        &mut self,
+        data: &MmdsData,
+        mut authority: TokenAuthority,
+        instance_id: &str,
+    ) {
+        self.data_store = data.data_store.clone();
+        self.is_initialized = data.is_initialized;
+        authority.set_aad(instance_id);
+        self.token_authority = authority;
     }
 
     /// This method is needed to check if data store is initialized.
@@ -572,5 +608,49 @@ mod tests {
         );
 
         assert_eq!(mmds.get_data_str().len(), 2);
+    }
+
+    #[test]
+    fn test_restore_data_reverts_data_and_rotates_tokens() {
+        let mut mmds = Mmds::default();
+        mmds.set_aad("instance-base");
+        let empty = mmds.save_data();
+        let base = serde_json::json!({"role": "base"});
+        mmds.put_data(base.clone()).unwrap();
+        let saved = mmds.save_data();
+        mmds.patch_data(serde_json::json!({"credentials": "later-run"}))
+            .unwrap();
+        let old_token = mmds.generate_token(60).unwrap();
+        assert!(mmds.is_valid_token(&old_token));
+        mmds.set_version(MmdsVersion::V2);
+        mmds.set_imds_compat(true);
+        mmds.set_data_store_limit(64);
+
+        mmds.restore_data(
+            &saved,
+            Mmds::new_token_authority().unwrap(),
+            "instance-base",
+        );
+        assert_eq!(mmds.data_store_value(), base);
+        assert!(!mmds.is_valid_token(&old_token));
+        let token = mmds.generate_token(60).unwrap();
+        assert!(mmds.is_valid_token(&token));
+        assert_eq!(mmds.version(), MmdsVersion::V2);
+        assert!(mmds.imds_compat());
+        assert!(matches!(
+            mmds.put_data(serde_json::json!({"data": "x".repeat(100)})),
+            Err(MmdsDatastoreError::DataStoreLimitExceeded)
+        ));
+
+        mmds.restore_data(
+            &empty,
+            Mmds::new_token_authority().unwrap(),
+            "instance-base",
+        );
+        assert!(!mmds.is_valid_token(&token));
+        assert!(matches!(
+            mmds.patch_data(serde_json::json!({"fresh": true})),
+            Err(MmdsDatastoreError::NotInitialized)
+        ));
     }
 }
