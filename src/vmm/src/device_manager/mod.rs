@@ -812,6 +812,23 @@ impl<'a> Persist<'a> for DeviceManager {
         }
         Ok(())
     }
+
+    fn check_reset(&self, state: &Self::State) -> Result<(), crate::snapshot::ResetUnsupported> {
+        self.mmio_platform_devices
+            .check_reset(&state.mmio_platform_state)?;
+        self.acpi_devices.check_reset(&state.acpi_state)?;
+        match (&self.virtio_devices, &state.virtio_state) {
+            (VirtioDevices::Mmio(devices), VirtioDevicesState::Mmio(state)) => {
+                devices.check_reset(state)
+            }
+            (VirtioDevices::Pci(devices), VirtioDevicesState::Pci(state)) => {
+                devices.check_reset(state)
+            }
+            _ => Err(crate::snapshot::ResetUnsupported(
+                "virtio transport changes",
+            )),
+        }
+    }
 }
 
 #[cfg(test)]

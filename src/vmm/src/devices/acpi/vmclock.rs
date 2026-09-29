@@ -203,6 +203,10 @@ impl<'a> Persist<'a> for VmClock {
         debug!("vmclock: notifying guest about VMClock updates");
         Ok(())
     }
+
+    fn check_reset(&self, _state: &Self::State) -> Result<(), crate::snapshot::ResetUnsupported> {
+        Ok(())
+    }
 }
 
 impl Aml for VmClock {

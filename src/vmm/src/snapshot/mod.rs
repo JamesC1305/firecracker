@@ -36,7 +36,7 @@ use crate::persist::SNAPSHOT_VERSION;
 use crate::snapshot::crc::CRC64Writer;
 #[cfg(test)]
 pub(crate) use crate::snapshot::persist::restore_for_test;
-pub use crate::snapshot::persist::{LoadContext, Persist, restore};
+pub use crate::snapshot::persist::{LoadContext, Persist, ResetUnsupported, restore};
 use crate::utils::Version;
 
 #[cfg(target_arch = "x86_64")]

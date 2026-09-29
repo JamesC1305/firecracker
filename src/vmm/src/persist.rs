@@ -35,7 +35,7 @@ use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Snapshot;
 use crate::utils::u64_to_usize;
 use crate::vmm_config::boot_source::BootSourceConfig;
-use crate::vmm_config::instance_info::InstanceInfo;
+use crate::vmm_config::instance_info::{InstanceInfo, VmState as InstanceState};
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
 use crate::vstate::kvm::KvmState;
@@ -117,6 +117,9 @@ pub struct ResetContext {
     pub clock_realtime: bool,
     /// Pages written since load whose dirty bits snapshot creation cleared.
     pub dirty_pages: DirtyBitmap,
+    /// A reset failed part way. The microVM state is inconsistent, so it must not run, be
+    /// snapshotted or be reset again.
+    pub poisoned: bool,
 }
 
 /// This describes the mapping between Firecracker base virtual address and
@@ -166,6 +169,8 @@ pub enum MicrovmStateError {
 #[rustfmt::skip]
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum CreateSnapshotError {
+    /// A reset failed part way, so the microVM state is inconsistent.
+    ResetPoisoned,
     /// Cannot get dirty bitmap: {0}
     DirtyBitmap(#[from] VmError),
     /// Cannot write memory file: {0}
@@ -180,6 +185,32 @@ pub enum CreateSnapshotError {
     SnapshotBackingFile(&'static str, io::Error),
 }
 
+/// Errors associated with resetting a live microVM to its load-time snapshot.
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum ResetSnapshotError {
+    /// Reset requires the microVM to be paused.
+    NotPaused,
+    /// The microVM was not loaded from a snapshot with a file memory backend and dirty page
+    /// tracking.
+    NoResetContext,
+    /// A previous reset failed part way, so the microVM state is inconsistent.
+    Poisoned,
+    /// Reset does not support {0}.
+    Unsupported(&'static str),
+    /// Failed to complete pending vCPU I/O: {0}
+    CompleteVcpuIo(crate::vstate::vm::RestoreVcpuStatesError),
+    /// Failed to get the dirty bitmap: {0}
+    DirtyBitmap(#[from] VmError),
+    /// Failed to revert guest memory: {0}
+    RevertMemory(#[from] MemoryError),
+    /// Failed to restore vCPU state: {0}
+    RestoreVcpus(#[from] crate::vstate::vm::RestoreVcpuStatesError),
+    /// Failed to restore VM state: {0}
+    RestoreVm(#[from] crate::vstate::vm::KvmVmError),
+    /// Failed to restore devices: {0}
+    RestoreDevices(#[from] crate::device_manager::DeviceManagerPersistError),
+}
+
 /// Snapshot version
 pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
 
@@ -189,6 +220,9 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
+    if vmm.reset_poisoned() {
+        return Err(CreateSnapshotError::ResetPoisoned);
+    }
     let microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
@@ -219,6 +253,79 @@ pub fn create_snapshot(
     vmm.device_manager
         .mark_virtio_queue_memory_dirty(kvm_vm.guest_memory());
 
+    Ok(())
+}
+
+/// Resets a paused microVM to the snapshot from which it was loaded, keeping its host
+/// resources. The microVM stays paused.
+///
+/// An I/O-completion or preflight error leaves the original microVM usable. An error while
+/// applying the snapshot poisons it: it cannot resume, be snapshotted or be reset again.
+pub fn reset_to_snapshot(vmm: &mut Vmm) -> Result<(), ResetSnapshotError> {
+    use crate::snapshot::Persist;
+
+    // I/O completion refuses running vCPUs, and reversion must not race guest memory writes.
+    if vmm.instance_info.state != InstanceState::Paused {
+        return Err(ResetSnapshotError::NotPaused);
+    }
+    let context = vmm
+        .reset_context
+        .as_mut()
+        .ok_or(ResetSnapshotError::NoResetContext)?;
+    if context.poisoned {
+        return Err(ResetSnapshotError::Poisoned);
+    }
+
+    let kvm_vm = vmm
+        .vm
+        .as_kvm()
+        .ok_or(ResetSnapshotError::Unsupported("non-KVM VMs"))?;
+    // A completed I/O instruction can write RAM or change a device without guest entry.
+    // Finish it before checking device state and before reverting memory.
+    kvm_vm
+        .complete_vcpu_io()
+        .map_err(ResetSnapshotError::CompleteVcpuIo)?;
+    vmm.device_manager
+        .check_reset(&context.device_states)
+        .map_err(|error| ResetSnapshotError::Unsupported(error.0))?;
+
+    // A failure from here on can leave the microVM partly reset, which poisons it.
+    let result = apply_reset(kvm_vm, &mut vmm.device_manager, context);
+    context.poisoned = result.is_err();
+    result
+}
+
+/// Returns guest memory, the vCPUs, the in-kernel VM state and the devices to the state in
+/// `context`.
+fn apply_reset(
+    kvm_vm: &crate::vstate::vm::KvmVm,
+    device_manager: &mut crate::device_manager::DeviceManager,
+    context: &mut ResetContext,
+) -> Result<(), ResetSnapshotError> {
+    use crate::snapshot::Persist;
+    revert_memory(kvm_vm, &mut context.dirty_pages)?;
+    kvm_vm.restore_vcpu_states(&context.vcpu_states)?;
+    #[cfg(target_arch = "x86_64")]
+    kvm_vm.restore_kvm_state(&context.vm_state, context.clock_realtime)?;
+    #[cfg(target_arch = "aarch64")]
+    kvm_vm.restore_kvm_state(&context.mpidrs, &context.vm_state)?;
+    device_manager.restore_in_place(&context.device_states, kvm_vm)?;
+    Ok(())
+}
+
+/// Reverts the pages written since load to their contents in the snapshot file: the pages
+/// that `dirty_since_load` or the dirty logs mark. Clears both afterwards.
+fn revert_memory(
+    kvm_vm: &crate::vstate::vm::KvmVm,
+    dirty_since_load: &mut DirtyBitmap,
+) -> Result<(), ResetSnapshotError> {
+    let memory = kvm_vm.guest_memory();
+    memory.accumulate_dirty(&kvm_vm.get_dirty_bitmap()?, dirty_since_load);
+    memory.revert_to_file(dirty_since_load)?;
+    memory.reset_dirty();
+    dirty_since_load
+        .values_mut()
+        .for_each(|bitmap| bitmap.fill(0));
     Ok(())
 }
 
@@ -545,6 +652,7 @@ pub fn restore_from_snapshot(
             device_states: microvm_state.device_states,
             clock_realtime: params.clock_realtime,
             dirty_pages,
+            poisoned: false,
         });
     }
     Ok(vmm)
@@ -802,8 +910,15 @@ mod tests {
         vmm
     }
 
-    /// Loads a Full snapshot of an unbooted microVM that has no virtio devices.
     fn snapshot_load_fixture(track_dirty_pages: bool) -> (Arc<Mutex<Vmm>>, EventManager) {
+        snapshot_load_fixture_with(track_dirty_pages, false)
+    }
+
+    /// Loads a Full snapshot of an unbooted microVM that has no virtio devices.
+    fn snapshot_load_fixture_with(
+        track_dirty_pages: bool,
+        pci_enabled: bool,
+    ) -> (Arc<Mutex<Vmm>>, EventManager) {
         use crate::builder::build_microvm_for_boot;
         use crate::seccomp::get_empty_filters;
         use crate::test_utils::mock_resources::{MockBootSourceConfig, MockVmResources};
@@ -813,6 +928,7 @@ mod tests {
         let boot_source = MockBootSourceConfig::new().with_default_boot_args().into();
         let mut resources: VmResources =
             MockVmResources::new().with_boot_source(boot_source).into();
+        resources.pci_enabled = pci_enabled;
         // Test builds give the resources a balloon by default, and reset rejects balloons.
         resources.balloon = BalloonBuilder::new();
         let mut source_events = EventManager::new().unwrap();
@@ -866,6 +982,15 @@ mod tests {
         (vmm, event_manager)
     }
 
+    /// Returns a guest RAM address that the boot setup of the fixture leaves unused.
+    fn scratch_address(memory: &crate::vstate::memory::GuestMemoryMmap) -> vm_memory::GuestAddress {
+        use vm_memory::{Address, GuestMemoryBackend, GuestMemoryRegion};
+
+        // 64 MiB into RAM lies past the kernel and boot data on both architectures.
+        let ram_start = memory.iter().next().unwrap().start_addr();
+        ram_start.unchecked_add(crate::utils::usize_to_u64(crate::utils::mib_to_bytes(64)))
+    }
+
     #[test]
     fn test_snapshot_load_reset_eligibility() {
         for track_dirty_pages in [false, true] {
@@ -875,6 +1000,316 @@ mod tests {
                 track_dirty_pages
             );
         }
+    }
+
+    #[test]
+    fn test_reset_restores_loaded_state_repeatedly() {
+        use vm_memory::{ByteValued, Bytes};
+
+        use crate::snapshot::Persist;
+        use crate::vmm_config::snapshot::SnapshotType;
+        #[cfg(target_arch = "x86_64")]
+        use crate::vstate::bus::BusDevice;
+
+        let (vmm, _events) = snapshot_load_fixture(true);
+        let mut vmm = vmm.lock().unwrap();
+        let kvm = vmm.vm.as_kvm().unwrap().clone();
+        let vm_fd = kvm.fd().as_raw_fd();
+        #[cfg(target_arch = "x86_64")]
+        let baseline_regs = vmm.reset_context.as_ref().unwrap().vcpu_states[0].regs;
+        #[cfg(target_arch = "aarch64")]
+        let baseline_pc = vmm.reset_context.as_ref().unwrap().vcpu_states[0]
+            .regs
+            .iter()
+            .find(|reg| reg.id == crate::arch::aarch64::regs::PC)
+            .unwrap()
+            .value::<u64, 8>();
+        // ARM has no serial device here, because the fixture's boot arguments have no console.
+        #[cfg(target_arch = "x86_64")]
+        let serial = vmm
+            .device_manager
+            .legacy_devices
+            .as_ref()
+            .unwrap()
+            .stdio_serial
+            .clone();
+        let dirty_address = scratch_address(kvm.guest_memory());
+        let baseline: u8 = kvm.guest_memory().read_obj(dirty_address).unwrap();
+        let vmclock = |vmm: &Vmm| vmm.device_manager.acpi_devices.vmclock().save().inner;
+        let initial_generation = vmclock(&vmm).vm_generation_counter;
+
+        for generation in 1..=2 {
+            kvm.guest_memory()
+                .write_slice(&[!baseline], dirty_address)
+                .unwrap();
+            #[cfg(target_arch = "x86_64")]
+            kvm.vcpus_handles()[0]
+                .vcpu_fd
+                .set_regs(&kvm_bindings::kvm_regs {
+                    rax: 0x1234,
+                    ..baseline_regs
+                })
+                .unwrap();
+            #[cfg(target_arch = "aarch64")]
+            kvm.vcpus_handles()[0]
+                .vcpu_fd
+                .set_one_reg(
+                    crate::arch::aarch64::regs::PC,
+                    &baseline_pc.wrapping_add(generation * 4).to_le_bytes(),
+                )
+                .unwrap();
+            let old_genid = vmm.device_manager.acpi_devices.vmgenid().gen_id;
+            #[cfg(target_arch = "x86_64")]
+            {
+                serial.lock().unwrap().write(0, 7, &[0xa5]);
+                let legacy = vmm.device_manager.legacy_devices.as_ref().unwrap();
+                let mut i8042 = legacy.i8042.lock().unwrap();
+                i8042.write(0, 4, &[0x60]);
+                i8042.write(0, 0, &[0]);
+            }
+            #[cfg(target_arch = "aarch64")]
+            vmm.device_manager
+                .mmio_platform_devices
+                .rtc
+                .as_ref()
+                .unwrap()
+                .inner
+                .lock()
+                .unwrap()
+                .bus_write(0x008, &123_u32.to_le_bytes());
+
+            // Snapshot creation clears current dirty logs but must retain reset dirt.
+            let snapshot = TempFile::new().unwrap();
+            let memory = TempFile::new().unwrap();
+            let info = VmInfo::from(&*vmm);
+            create_snapshot(
+                &mut vmm,
+                &info,
+                &CreateSnapshotParams {
+                    snapshot_type: SnapshotType::Diff,
+                    snapshot_path: snapshot.as_path().to_path_buf(),
+                    mem_file_path: memory.as_path().to_path_buf(),
+                    sync_snapshot_files: false,
+                },
+            )
+            .unwrap();
+            reset_to_snapshot(&mut vmm).unwrap();
+
+            assert_eq!(
+                kvm.guest_memory().read_obj::<u8>(dirty_address).unwrap(),
+                baseline
+            );
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(
+                kvm.vcpus_handles()[0].vcpu_fd.get_regs().unwrap(),
+                baseline_regs
+            );
+            #[cfg(target_arch = "aarch64")]
+            {
+                let mut pc = [0_u8; 8];
+                kvm.vcpus_handles()[0]
+                    .vcpu_fd
+                    .get_one_reg(crate::arch::aarch64::regs::PC, &mut pc)
+                    .unwrap();
+                assert_eq!(u64::from_le_bytes(pc), baseline_pc);
+                let mut rtc_load = [0_u8; 4];
+                vmm.device_manager
+                    .mmio_platform_devices
+                    .rtc
+                    .as_ref()
+                    .unwrap()
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .bus_read(0x008, &mut rtc_load);
+                assert_eq!(u32::from_le_bytes(rtc_load), 0);
+            }
+            assert_eq!(vmm.vm.as_kvm().unwrap().fd().as_raw_fd(), vm_fd);
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut scratch = [0];
+                serial.lock().unwrap().read(0, 7, &mut scratch);
+                assert_eq!(scratch, [0]);
+                vmm.send_ctrl_alt_del().unwrap();
+            }
+            let acpi = &vmm.device_manager.acpi_devices;
+            let genid: u128 = kvm
+                .guest_memory()
+                .read_obj(acpi.vmgenid().guest_address)
+                .unwrap();
+            assert_ne!(genid, old_genid);
+            assert_eq!(genid, acpi.vmgenid().gen_id);
+            // The guest sees the whole VMClock page again, with one more generation.
+            let clock = vmclock(&vmm);
+            let mut page = vec![0; clock.as_slice().len()];
+            kvm.guest_memory()
+                .read_slice(&mut page, acpi.vmclock().guest_address)
+                .unwrap();
+            assert_eq!(page, clock.as_slice());
+            assert_eq!(clock.vm_generation_counter, initial_generation + generation);
+            assert_eq!(vmm.instance_info.state, InstanceState::Paused);
+            assert!(!vmm.reset_poisoned());
+            let dirty_since_load = &vmm.reset_context.as_ref().unwrap().dirty_pages;
+            assert!(dirty_since_load.values().flatten().all(|&bits| bits == 0));
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_reset_reverts_ram_written_by_pending_mmio() {
+        use kvm_ioctls::VcpuExit;
+        use vm_memory::{Address, Bytes, GuestMemoryBackend};
+
+        let (vmm, _events) = snapshot_load_fixture(true);
+        let mut vmm = vmm.lock().unwrap();
+        let kvm = vmm.vm.as_kvm().unwrap().clone();
+        let code = scratch_address(kvm.guest_memory());
+        let destination = code.unchecked_add(0x1000);
+        // The boot setup identity maps the first 1 GiB, and RAM ends below that, so a read
+        // just past RAM exits to the VMM as MMIO.
+        let source = kvm.guest_memory().last_addr().unchecked_add(1);
+        let baseline: u8 = kvm.guest_memory().read_obj(destination).unwrap();
+
+        for _ in 0..2 {
+            // movsb reads from RSI at an unmapped address and writes to RDI in RAM.
+            // Its MMIO completion can write RAM even when immediate_exit prevents entry.
+            kvm.guest_memory().write_slice(&[0xa4], code).unwrap();
+            {
+                let mut handles = kvm.vcpus_handles();
+                let fd = &mut handles[0].vcpu_fd;
+                let mut regs = fd.get_regs().unwrap();
+                regs.rip = code.raw_value();
+                regs.rsi = source.raw_value();
+                regs.rdi = destination.raw_value();
+                regs.rflags = 2;
+                fd.set_regs(&regs).unwrap();
+                fd.set_kvm_immediate_exit(0);
+                match fd.run().unwrap() {
+                    VcpuExit::MmioRead(address, data) => {
+                        assert_eq!(address, source.raw_value());
+                        assert_eq!(data.len(), 1);
+                        data[0] = !baseline;
+                    }
+                    exit => panic!("Expected movsb MMIO read, got {exit:?}"),
+                }
+                // Leave the handled exit pending, as a Pause arriving before re-entry can.
+                fd.set_kvm_immediate_exit(1);
+            }
+            assert_eq!(
+                kvm.guest_memory().read_obj::<u8>(destination).unwrap(),
+                baseline
+            );
+
+            reset_to_snapshot(&mut vmm).unwrap();
+
+            assert_eq!(
+                kvm.guest_memory().read_obj::<u8>(destination).unwrap(),
+                baseline
+            );
+            assert_eq!(vmm.instance_info.state, InstanceState::Paused);
+            assert!(!vmm.reset_poisoned());
+        }
+    }
+
+    #[test]
+    fn test_reset_prerequisites() {
+        let mut vmm = default_vmm();
+        assert!(matches!(
+            reset_to_snapshot(&mut vmm),
+            Err(ResetSnapshotError::NotPaused)
+        ));
+        vmm.instance_info.state = InstanceState::Paused;
+        assert!(matches!(
+            reset_to_snapshot(&mut vmm),
+            Err(ResetSnapshotError::NoResetContext)
+        ));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_reset_rejects_virtio_before_poison() {
+        use crate::builder::tests::insert_entropy_device;
+
+        let (vmm, mut events) = snapshot_load_fixture(true);
+        let mut vmm = vmm.lock().unwrap();
+        insert_entropy_device(
+            &mut vmm,
+            &mut default_kernel_cmdline(),
+            &mut events,
+            Default::default(),
+        );
+        assert!(matches!(
+            reset_to_snapshot(&mut vmm),
+            Err(ResetSnapshotError::Unsupported("virtio devices"))
+        ));
+        assert!(!vmm.reset_poisoned());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_reset_rejects_pci_before_poison() {
+        let (vmm, _events) = snapshot_load_fixture_with(true, true);
+        let mut vmm = vmm.lock().unwrap();
+        assert!(matches!(
+            reset_to_snapshot(&mut vmm),
+            Err(ResetSnapshotError::Unsupported("the PCI transport"))
+        ));
+        assert!(!vmm.reset_poisoned());
+    }
+
+    #[test]
+    fn test_reset_failure_poison_blocks_state_operations() {
+        use vm_memory::Bytes;
+
+        let (vmm, _events) = snapshot_load_fixture(true);
+        let mut vmm = vmm.lock().unwrap();
+        let kvm = vmm.vm.as_kvm().unwrap().clone();
+        let dirty_address = scratch_address(kvm.guest_memory());
+        let baseline: u8 = kvm.guest_memory().read_obj(dirty_address).unwrap();
+        kvm.guest_memory()
+            .write_slice(&[!baseline], dirty_address)
+            .unwrap();
+        let vcpu_state = &mut vmm.reset_context.as_mut().unwrap().vcpu_states[0];
+        // Make the vCPU restore fail after reset has begun. x86 KVM checks the MP state only
+        // since Linux 6.0, but every supported kernel rejects an XCR0 without x87 state.
+        #[cfg(target_arch = "x86_64")]
+        {
+            vcpu_state.xcrs.nr_xcrs = 1;
+            vcpu_state.xcrs.xcrs[0].xcr = 0;
+            vcpu_state.xcrs.xcrs[0].value = 0;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            vcpu_state.mp_state.mp_state = u32::MAX;
+        }
+        assert!(matches!(
+            reset_to_snapshot(&mut vmm),
+            Err(ResetSnapshotError::RestoreVcpus(_))
+        ));
+        assert_eq!(
+            kvm.guest_memory().read_obj::<u8>(dirty_address).unwrap(),
+            baseline
+        );
+        assert!(vmm.reset_poisoned());
+        assert!(matches!(vmm.resume_vm(), Err(crate::VmmError::ResetFailed)));
+        assert!(matches!(
+            reset_to_snapshot(&mut vmm),
+            Err(ResetSnapshotError::Poisoned)
+        ));
+
+        let directory = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let params = CreateSnapshotParams {
+            snapshot_type: crate::vmm_config::snapshot::SnapshotType::Full,
+            snapshot_path: directory.as_path().join("vmstate"),
+            mem_file_path: directory.as_path().join("memory"),
+            sync_snapshot_files: false,
+        };
+        assert!(matches!(
+            create_snapshot(&mut vmm, &VmInfo::default(), &params),
+            Err(CreateSnapshotError::ResetPoisoned)
+        ));
+        assert!(!params.snapshot_path.exists());
+        assert!(!params.mem_file_path.exists());
     }
 
     #[test]

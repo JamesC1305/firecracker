@@ -253,6 +253,8 @@ pub enum VmmError {
     VcpuResume,
     /// Failed to message the vCPUs.
     VcpuMessage,
+    /// A reset failed part way, so the microVM state is inconsistent and it cannot resume.
+    ResetFailed,
     /// Operation not supported on {0} VMs.
     NotSupportedOnVmType(&'static str),
     /// Cannot spawn Vcpu thread: {0}
@@ -461,8 +463,18 @@ impl Vmm {
         }
     }
 
+    /// Whether a reset failed part way and left the microVM state inconsistent.
+    pub fn reset_poisoned(&self) -> bool {
+        self.reset_context
+            .as_ref()
+            .is_some_and(|context| context.poisoned)
+    }
+
     /// Sends a resume command to the vCPUs.
     pub fn resume_vm(&mut self) -> Result<(), VmmError> {
+        if self.reset_poisoned() {
+            return Err(VmmError::ResetFailed);
+        }
         let kvm_vm = self
             .vm
             .as_kvm()

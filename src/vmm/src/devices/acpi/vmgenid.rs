@@ -156,6 +156,10 @@ impl<'a> Persist<'a> for VmGenId {
         debug!("vmgenid: notifying guest about new generation ID");
         Ok(())
     }
+
+    fn check_reset(&self, _state: &Self::State) -> Result<(), crate::snapshot::ResetUnsupported> {
+        Ok(())
+    }
 }
 
 impl Aml for VmGenId {

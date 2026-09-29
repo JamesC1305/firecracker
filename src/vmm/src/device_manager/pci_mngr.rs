@@ -34,7 +34,7 @@ use crate::logger::{debug, warn};
 use crate::pci::PciSBDF;
 use crate::pci::bus::PciBusError;
 use crate::resources::VmResources;
-use crate::snapshot::{LoadContext, Persist};
+use crate::snapshot::{LoadContext, Persist, ResetUnsupported};
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::bus::BusError;
 use crate::vstate::interrupts::{InterruptError, MsixVectorGroup};
@@ -736,6 +736,10 @@ impl<'a> Persist<'a> for PciDevices {
         self.post_restore_devices::<Pmem>(state.pmem_devices.as_slice(), load)?;
         self.post_restore_devices::<VirtioMem>(state.memory_device.as_slice(), load)?;
         Ok(())
+    }
+
+    fn check_reset(&self, _state: &Self::State) -> Result<(), ResetUnsupported> {
+        Err(ResetUnsupported("the PCI transport"))
     }
 }
 

@@ -17,6 +17,11 @@ impl std::fmt::Debug for LoadContext<'_> {
     }
 }
 
+/// A component cannot return to its saved state without replacing host resources.
+#[derive(Debug, thiserror::Error)]
+#[error("Reset does not support {0}.")]
+pub struct ResetUnsupported(pub &'static str);
+
 /// The snapshot lifecycle of a device or a component made of devices.
 pub trait Persist<'a>: Sized {
     /// The type of the object representing the state of the component.
@@ -49,6 +54,11 @@ pub trait Persist<'a>: Sized {
         _load: &mut LoadContext<'_>,
     ) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    /// Checks reset eligibility without changing the live component. Defaults to rejection.
+    fn check_reset(&self, _state: &Self::State) -> Result<(), ResetUnsupported> {
+        Err(ResetUnsupported("this component"))
     }
 }
 

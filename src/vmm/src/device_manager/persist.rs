@@ -35,7 +35,7 @@ use crate::devices::virtio::vsock::persist::{VsockConstructorArgs, VsockState};
 use crate::devices::virtio::vsock::{Vsock, VsockError, VsockUnixBackend};
 use crate::mmds::data_store::MmdsVersion;
 use crate::resources::VmResources;
-use crate::snapshot::{LoadContext, Persist};
+use crate::snapshot::{LoadContext, Persist, ResetUnsupported};
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vm::KvmVm;
@@ -239,6 +239,17 @@ impl<'a> Persist<'a> for ACPIDeviceManager {
             .post_restore(&state.vmclock, load)?;
         Ok(())
     }
+
+    fn check_reset(&self, state: &Self::State) -> Result<(), ResetUnsupported> {
+        self.vmgenid
+            .as_ref()
+            .ok_or(ResetUnsupported("missing VMGenID"))?
+            .check_reset(&state.vmgenid)?;
+        self.vmclock
+            .as_ref()
+            .ok_or(ResetUnsupported("missing VMClock"))?
+            .check_reset(&state.vmclock)
+    }
 }
 
 impl<'a> Persist<'a> for MMIOPlatformDevices {
@@ -323,6 +334,10 @@ impl<'a> Persist<'a> for MMIOPlatformDevices {
             use event_manager::SubscriberOps;
             _load.event_manager.add_subscriber(serial.inner.clone());
         }
+        Ok(())
+    }
+
+    fn check_reset(&self, _state: &Self::State) -> Result<(), ResetUnsupported> {
         Ok(())
     }
 }
@@ -641,6 +656,14 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
             s.virtio_state.activated
         })?;
         Ok(())
+    }
+
+    fn check_reset(&self, _state: &Self::State) -> Result<(), ResetUnsupported> {
+        if self.virtio_devices.is_empty() {
+            Ok(())
+        } else {
+            Err(ResetUnsupported("virtio devices"))
+        }
     }
 }
 
