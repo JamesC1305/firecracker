@@ -6,6 +6,8 @@
 use std::fmt::{self, Debug};
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_arch = "aarch64")]
+use event_manager::SubscriberOps;
 use serde::{Deserialize, Serialize};
 
 use super::acpi::ACPIDeviceManager;
@@ -266,11 +268,13 @@ impl<'a> Persist<'a> for MMIOPlatformDevices {
             if let Some(device_info) = state.serial {
                 let serial_state = constructor_args.serial_state.map(Into::into);
                 let serial = crate::DeviceManager::setup_serial_device(
-                    constructor_args.event_manager,
                     constructor_args.vm_resources.serial_out_path.as_ref(),
                     serial_state.as_ref(),
                     constructor_args.vm_resources.serial_rate_limiter(),
                 )?;
+                constructor_args
+                    .event_manager
+                    .add_subscriber(serial.clone());
 
                 platform_devices.register_mmio_serial(
                     constructor_args.vm,
@@ -448,7 +452,7 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
                 .gsi_legacy_allocator
                 .allocate_id_at(device_info.gsi.ok_or(MmioError::InvalidIrqConfig)?)?;
 
-            dev_manager.register_mmio_virtio(
+            let registered_device = dev_manager.register_mmio_virtio(
                 vm,
                 id.clone(),
                 MMIODevice {
@@ -456,8 +460,8 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
                     inner: mmio_transport,
                     sub_id: None,
                 },
-                event_manager,
             )?;
+            Self::subscribe_device(registered_device, event_manager);
 
             if activated {
                 device

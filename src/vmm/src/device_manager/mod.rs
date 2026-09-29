@@ -147,7 +147,6 @@ impl DeviceManager {
 
     /// Sets up the serial device.
     fn setup_serial_device(
-        event_manager: &mut EventManager,
         output: Option<&PathBuf>,
         state: Option<&serial::SerialState>,
         rate_limiter: Option<TokenBucket>,
@@ -179,9 +178,7 @@ impl DeviceManager {
                     serial::Error::FullFifo => std::io::Error::other("FIFO buffer too large"),
                 })?;
         }
-        let serial = Arc::new(Mutex::new(serial));
-        event_manager.add_subscriber(serial.clone());
-        Ok(serial)
+        Ok(Arc::new(Mutex::new(serial)))
     }
 
     fn serial_state(&self) -> Option<persist::SerialState> {
@@ -216,12 +213,8 @@ impl DeviceManager {
         serial_rate_limiter: Option<TokenBucket>,
     ) -> Result<PortIODeviceManager, DeviceManagerCreateError> {
         // Create serial device
-        let serial = Self::setup_serial_device(
-            event_manager,
-            serial_output,
-            serial_state,
-            serial_rate_limiter,
-        )?;
+        let serial = Self::setup_serial_device(serial_output, serial_state, serial_rate_limiter)?;
+        event_manager.add_subscriber(serial.clone());
         let reset_evt = vcpus_exit_evt
             .try_clone()
             .map_err(DeviceManagerCreateError::EventFd)?;
@@ -372,12 +365,8 @@ impl DeviceManager {
             .contains("console=");
 
         if cmdline_contains_console {
-            let serial = Self::setup_serial_device(
-                event_manager,
-                serial_out_path,
-                None,
-                serial_rate_limiter,
-            )?;
+            let serial = Self::setup_serial_device(serial_out_path, None, serial_rate_limiter)?;
+            event_manager.add_subscriber(serial.clone());
             self.mmio_platform_devices
                 .register_mmio_serial(vm, serial, None)?;
             self.mmio_platform_devices
