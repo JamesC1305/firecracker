@@ -39,6 +39,7 @@ use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::balloon::BalloonError;
 use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
+use crate::devices::virtio::block::virtio::VirtioBlockError;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
 use crate::devices::virtio::mem::persist::VirtioMemPersistError;
 use crate::devices::virtio::net::Net;
@@ -427,6 +428,20 @@ impl DeviceManager {
             devices.insert((device_type, device.id().to_owned()), device.is_activated());
         });
         devices
+    }
+
+    /// Waits for the in-flight I/O of the virtio block devices and completes it.
+    pub fn drain_block_io(&self) -> Result<(), VirtioBlockError> {
+        let mut result = Ok(());
+        self.for_each_virtio_device_mut(|device_type, device| {
+            if device_type == VirtioDeviceType::Block
+                && result.is_ok()
+                && let Some(Block::Virtio(block)) = device.as_mut_any().downcast_mut::<Block>()
+            {
+                result = block.drain_io();
+            }
+        });
+        result
     }
 
     fn for_each_virtio_device_mut(

@@ -211,6 +211,8 @@ pub enum ResetSnapshotError {
     MmdsTokenKey(#[from] crate::mmds::data_store::MmdsDatastoreError),
     /// Failed to complete pending vCPU I/O: {0}
     CompleteVcpuIo(crate::vstate::vm::RestoreVcpuStatesError),
+    /// Failed to complete in-flight block I/O: {0}
+    DrainBlockIo(#[from] crate::devices::virtio::block::virtio::VirtioBlockError),
     /// Failed to get the dirty bitmap: {0}
     DirtyBitmap(#[from] VmError),
     /// Failed to revert guest memory: {0}
@@ -311,6 +313,10 @@ pub fn reset_to_snapshot(vmm: &mut Vmm) -> Result<(), ResetSnapshotError> {
         .as_ref()
         .map(|_| crate::mmds::data_store::Mmds::new_token_authority())
         .transpose()?;
+
+    // In-flight asynchronous block I/O can write guest memory, so complete it before the
+    // revert. Completing it changes nothing that the resumed microVM would not also see.
+    vmm.device_manager.drain_block_io()?;
 
     // A failure from here on can leave the microVM partly reset, which poisons it.
     let result = apply_reset(kvm_vm, &mut vmm.device_manager, context);

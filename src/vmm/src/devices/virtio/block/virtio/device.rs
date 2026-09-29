@@ -753,6 +753,26 @@ impl VirtioBlock {
             self.process_async_completion_queue();
         }
     }
+
+    /// Waits for the in-flight asynchronous I/O and completes it, so that it cannot write
+    /// guest memory after snapshot reset reverted it. Unlike [`Self::prepare_save`], this does
+    /// not flush the disk.
+    pub fn drain_io(&mut self) -> Result<(), VirtioBlockError> {
+        if !self.is_activated() {
+            return Ok(());
+        }
+        let FileEngine::Async(engine) = &mut self.disk.file_engine else {
+            return Ok(());
+        };
+        engine
+            .drain(false)
+            .map_err(|err| VirtioBlockError::FileEngine(block_io::BlockIoError::Async(err)))?;
+        // Reset restores the queues next, so do not submit the requests that throttling held
+        // back. Completing the drained requests marks the pages they wrote as dirty.
+        self.is_io_engine_throttled = false;
+        self.process_async_completion_queue();
+        Ok(())
+    }
 }
 
 impl VirtioDevice for VirtioBlock {
@@ -1988,6 +2008,22 @@ mod tests {
             // Check that all the pending flush requests were processed during `prepare_save()`.
             check_flush_requests_batch(5, &vq);
         }
+    }
+
+    #[test]
+    fn test_drain_io() {
+        let mut block = default_block(FileEngineType::Async);
+        let mem = default_mem();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        block.queues[0] = vq.create_queue();
+        block.activate(mem.clone(), default_interrupt()).unwrap();
+        add_flush_requests_batch(&mut block, &vq, 5);
+        simulate_queue_event(&mut block, None);
+
+        block.drain_io().unwrap();
+
+        // Each request completed and reached the used ring.
+        check_flush_requests_batch(5, &vq);
     }
 
     #[test]
