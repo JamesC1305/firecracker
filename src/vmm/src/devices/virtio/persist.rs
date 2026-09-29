@@ -135,54 +135,6 @@ impl VirtioDeviceState {
         }
     }
 
-    /// Does sanity checking on the `self` state against expected values
-    /// and builds queues from state.
-    pub fn build_queues_checked(
-        &self,
-        mem: &GuestMemoryMmap,
-        expected_device_type: VirtioDeviceType,
-        expected_num_queues: usize,
-        expected_queue_max_size: u16,
-    ) -> Result<Vec<Queue>, PersistError> {
-        // Sanity check:
-        // - right device type,
-        // - acked features is a subset of available ones,
-        // - right number of queues,
-        if self.device_type != expected_device_type
-            || (self.acked_features & !self.avail_features) != 0
-            || self.queues.len() != expected_num_queues
-        {
-            return Err(PersistError::InvalidInput);
-        }
-
-        let uses_notif_suppression = (self.acked_features & (1u64 << VIRTIO_RING_F_EVENT_IDX)) != 0;
-        let queues: Vec<Queue> = self
-            .queues
-            .iter()
-            .map(|queue_state| {
-                let mut queue = Queue::new(queue_state.max_size);
-                queue.restore_in_place(queue_state, ()).unwrap();
-                if self.activated {
-                    queue
-                        .initialize(mem)
-                        .map_err(PersistError::QueueConstruction)?;
-                }
-                if uses_notif_suppression {
-                    queue.enable_notif_suppression();
-                }
-                Ok(queue)
-            })
-            .collect::<Result<_, PersistError>>()?;
-
-        for q in &queues {
-            // Sanity check queue size and queue max size.
-            if q.max_size != expected_queue_max_size {
-                return Err(PersistError::InvalidInput);
-            }
-        }
-        Ok(queues)
-    }
-
     /// Checks and applies saved features and queues without changing the device's activation.
     /// All queues must have the device's maximum size. Rings are resolved and marked dirty
     /// only when the saved state is activated.

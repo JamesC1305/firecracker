@@ -486,10 +486,6 @@ impl VirtioMem {
         self.avail_features = features;
     }
 
-    pub(crate) fn set_acked_features(&mut self, features: u64) {
-        self.acked_features = features;
-    }
-
     pub(crate) fn activate_event(&self) -> &EventFd {
         &self.activate_event
     }

@@ -316,6 +316,7 @@ mod tests {
 
     use super::*;
     use crate::dumbo::pdu::tcp::{Flags as TcpFlags, TcpSegment};
+    use crate::snapshot::Persist;
 
     // We use LOCALHOST here because const new() is not stable yet, so just reuse this const, since
     // all we're interested in is having some address different from the MMDS one.
@@ -525,6 +526,30 @@ mod tests {
 
         // Nothing else to send.
         assert!(ns.write_next_frame(buf.as_mut()).is_none());
+
+        let state = ns.save();
+        let mmds = Arc::clone(&ns.mmds);
+        assert!(matches!(
+            ns.tcp_handler.next_segment_status(),
+            NextSegmentStatus::Timeout(_)
+        ));
+        let len = ns.write_arp_request(buf.as_mut(), true);
+        assert!(ns.detour_frame(&buf[..len]));
+        ns.set_ipv4_addr(bad_mmds_addr);
+
+        ns.restore_in_place(&state, ()).unwrap();
+
+        // Snapshot replay discards outstanding ARP replies and TCP retransmissions.
+        assert_eq!(ns.ipv4_addr, mmds_addr);
+        assert_eq!(ns.tcp_handler.local_ipv4_addr(), mmds_addr);
+        assert_eq!(ns.remote_mac_addr, ns.mac_addr);
+        assert_eq!(ns.pending_arp_reply_dest, None);
+        assert_eq!(
+            ns.tcp_handler.next_segment_status(),
+            NextSegmentStatus::Nothing
+        );
+        assert!(ns.write_next_frame(buf.as_mut()).is_none());
+        assert!(Arc::ptr_eq(&ns.mmds, &mmds));
     }
 
     #[test]

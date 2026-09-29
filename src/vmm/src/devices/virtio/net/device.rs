@@ -31,7 +31,7 @@ use crate::devices::virtio::iovec::{
 use crate::devices::virtio::net::metrics::{NetDeviceMetrics, NetMetricsPerDevice};
 use crate::devices::virtio::net::tap::Tap;
 use crate::devices::virtio::net::{
-    MAX_BUFFER_SIZE, NET_QUEUE_SIZES, NetError, NetQueue, RX_INDEX, TX_INDEX, generated,
+    MAX_BUFFER_SIZE, NET_QUEUE_SIZES, NetError, NetQueue, RX_INDEX, TX_INDEX, TapError, generated,
 };
 use crate::devices::virtio::queue::{DescriptorChain, InvalidAvailIdx, Queue};
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
@@ -487,6 +487,14 @@ impl Net {
         } else {
             vnet_hdr_len().try_into().unwrap()
         }
+    }
+
+    /// Configures the TAP offloads and the minimum RX buffer size for the negotiated features.
+    pub(crate) fn apply_acked_features(&mut self) -> Result<(), TapError> {
+        self.tap
+            .set_offload(Net::build_tap_offload_features(self.acked_features))?;
+        self.rx_buffer.min_buffer_size = self.minimum_rx_buffer_size();
+        Ok(())
     }
 
     /// Parse available RX `DescriptorChains` from the queue
@@ -1061,12 +1069,8 @@ impl VirtioDevice for Net {
             }
         }
 
-        let supported_flags: u32 = Net::build_tap_offload_features(self.acked_features);
-        self.tap
-            .set_offload(supported_flags)
+        self.apply_acked_features()
             .map_err(super::super::ActivateError::TapSetOffload)?;
-
-        self.rx_buffer.min_buffer_size = self.minimum_rx_buffer_size();
 
         if self.activate_evt.write(1).is_err() {
             self.metrics.activate_fails.inc();
@@ -1143,6 +1147,7 @@ pub mod tests {
     use crate::dumbo::pdu::ethernet::ETHERTYPE_ARP;
     use crate::logger::IncMetric;
     use crate::rate_limiter::{BucketUpdate, RateLimiter, TokenBucket, TokenType};
+    use crate::snapshot::Persist;
     use crate::test_utils::single_region_mem;
     use crate::utils::net::mac::{MAC_ADDR_LEN, MacAddr};
     use crate::vstate::memory::Address;
@@ -1422,6 +1427,22 @@ pub mod tests {
         // VIRTIO_NET_F_MRG_RXBUF is not enabled by default
         th.net().acked_features = 1 << VIRTIO_NET_F_MRG_RXBUF;
         rx_short_descriptor(th);
+    }
+
+    #[test]
+    fn test_rx_short_descriptor_after_restore_in_place() {
+        let mem = single_region_mem(2 * MAX_BUFFER_SIZE);
+        let mut th = TestHelper::get_default(&mem);
+        th.activate_net();
+        let state = th.net().save();
+        th.net().restore_in_place(&state, &mem).unwrap();
+
+        // Restoring drops the parsed RX buffers but keeps the minimum RX buffer size.
+        th.add_desc_chain(NetQueue::Rx, 0, &[(0, 10, VIRTQ_DESC_F_WRITE)]);
+        let mut frame = th.check_rx_discarded_buffer(1000);
+        th.rxq.check_used_elem(0, 0, 0);
+        header_set_num_buffers(frame.as_mut_slice(), 1);
+        th.check_rx_queue_resume(&frame);
     }
 
     fn rx_invalid_descriptor(mut th: TestHelper) {

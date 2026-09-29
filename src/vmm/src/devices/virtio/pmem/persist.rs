@@ -6,10 +6,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::device::{ConfigSpace, Pmem, PmemError};
-use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
-use crate::devices::virtio::pmem::{PMEM_NUM_QUEUES, PMEM_QUEUE_SIZE};
-use crate::rate_limiter::RateLimiter;
+use crate::devices::virtio::pmem::PMEM_QUEUE_SIZE;
+use crate::devices::virtio::queue::Queue;
 use crate::rate_limiter::persist::RateLimiterState;
 use crate::snapshot::Persist;
 use crate::vmm_config::pmem::PmemConfig;
@@ -60,82 +59,89 @@ impl<'a> Persist<'a> for Pmem {
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        let queues = state.virtio_state.build_queues_checked(
-            constructor_args.mem,
-            VirtioDeviceType::Pmem,
-            PMEM_NUM_QUEUES,
-            PMEM_QUEUE_SIZE,
-        )?;
+        let mem = constructor_args.mem;
+        let mut pmem = Self::create(constructor_args, state)?;
+        pmem.restore_in_place(state, mem)?;
+        Ok(pmem)
+    }
+}
 
-        let mut pmem = Pmem::new_with_queues(
+impl Pmem {
+    pub fn create(
+        constructor_args: PmemConstructorArgs<'_>,
+        state: &PmemState,
+    ) -> Result<Self, PmemPersistError> {
+        Ok(Pmem::new_with_queues(
             constructor_args.vm,
             state.config.clone(),
-            queues,
-            state.virtio_state.acked_features,
+            vec![Queue::new(PMEM_QUEUE_SIZE)],
+            0,
             Some(state.config_space),
-        )?;
-        pmem.rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)
-            .map_err(PmemPersistError::RateLimiter)?;
+        )?)
+    }
 
-        Ok(pmem)
+    /// Keeps the backing-file mapping, KVM memory slot, eventfds and rate limiter timer.
+    /// This does not revert backing-file contents; reset rejects writable pmem before applying
+    /// state, while snapshot load supports both read-only and writable devices.
+    pub fn restore_in_place(
+        &mut self,
+        state: &PmemState,
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), PmemPersistError> {
+        state.virtio_state.apply_to(self, mem)?;
+        self.rate_limiter
+            .restore_in_place(&state.rate_limiter_state, ())
+            .map_err(PmemPersistError::RateLimiter)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
+    use std::os::fd::AsRawFd;
+
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::test_utils::default_mem;
+    use crate::vstate::memory::ByteValued;
     use crate::vstate::vm::tests::setup_vm;
 
     #[test]
     fn test_persistence() {
-        // We create the backing file here so that it exists for the whole lifetime of the test.
-        let dummy_file = TempFile::new().unwrap();
-        dummy_file.as_file().set_len(0x20_0000).unwrap();
-        let dummy_path = dummy_file.as_path().to_str().unwrap().to_string();
+        let file = TempFile::new().unwrap();
+        file.as_file().set_len(0x20_0000).unwrap();
         let config = PmemConfig {
-            id: "1".into(),
-            path_on_host: dummy_path,
-            root_device: true,
-            read_only: false,
+            path_on_host: file.as_path().to_str().unwrap().to_string(),
+            read_only: true,
             ..Default::default()
         };
-        let guest_mem = default_mem();
+        let mem = default_mem();
         let vm = Arc::new(setup_vm());
-        let pmem = Pmem::new(vm.clone(), config).unwrap();
-
-        // Save the block device.
-        let pmem_state = pmem.save();
-        let serialized_data = bitcode::serialize(&pmem_state).unwrap();
+        let mut pmem = Pmem::new(vm.clone(), config).unwrap();
+        pmem.set_acked_features(pmem.avail_features());
+        let data = bitcode::serialize(&pmem.save()).unwrap();
         drop(pmem);
+        let state: PmemState = bitcode::deserialize(&data).unwrap();
+        let mut restored = Pmem::restore(PmemConstructorArgs { mem: &mem, vm }, &state).unwrap();
+        assert_eq!(restored.config, state.config);
+        assert_eq!(restored.config_as_bytes(), state.config_space.as_slice());
+        assert_eq!(restored.acked_features(), state.virtio_state.acked_features);
 
-        // Restore the block device.
-        let restored_state = bitcode::deserialize(&serialized_data).unwrap();
-        let restored_pmem = Pmem::restore(
-            PmemConstructorArgs {
-                mem: &guest_mem,
-                vm: vm.clone(),
-            },
-            &restored_state,
-        )
-        .unwrap();
-
-        // Test that virtio specific fields are the same.
-        assert_eq!(restored_pmem.device_type(), VirtioDeviceType::Pmem);
-        assert_eq!(
-            restored_pmem.avail_features(),
-            pmem_state.virtio_state.avail_features
-        );
-        assert_eq!(
-            restored_pmem.acked_features(),
-            pmem_state.virtio_state.acked_features
-        );
-        assert!(!restored_pmem.is_activated());
-        assert_eq!(restored_pmem.config, pmem_state.config);
+        let resources = |dev: &Pmem| {
+            (
+                dev.mmap.mmap_ptr,
+                dev.queue_events[0].as_raw_fd(),
+                dev.activate_event.as_raw_fd(),
+                dev.rate_limiter.as_raw_fd(),
+            )
+        };
+        let before = resources(&restored);
+        restored.set_acked_features(0);
+        restored.restore_in_place(&state, &mem).unwrap();
+        assert_eq!(restored.acked_features(), state.virtio_state.acked_features);
+        assert_eq!(resources(&restored), before);
     }
 
     #[test]

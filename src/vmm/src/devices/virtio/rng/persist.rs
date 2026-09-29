@@ -5,10 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
-use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
-use crate::devices::virtio::rng::{Entropy, EntropyError, RNG_NUM_QUEUES};
+use crate::devices::virtio::rng::{Entropy, EntropyError};
 use crate::rate_limiter::RateLimiter;
 use crate::rate_limiter::persist::RateLimiterState;
 use crate::snapshot::Persist;
@@ -51,47 +49,61 @@ impl Persist<'_> for Entropy {
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        let queues = state.virtio_state.build_queues_checked(
-            &constructor_args.mem,
-            VirtioDeviceType::Rng,
-            RNG_NUM_QUEUES,
-            FIRECRACKER_MAX_QUEUE_SIZE,
-        )?;
-
-        let rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)?;
-        let mut entropy = Entropy::new_with_queues(queues, rate_limiter)?;
-        entropy.set_avail_features(state.virtio_state.avail_features);
-        entropy.set_acked_features(state.virtio_state.acked_features);
-
+        let mut entropy = Self::create((), state)?;
+        entropy.restore_in_place(state, &constructor_args.mem)?;
         Ok(entropy)
+    }
+}
+
+impl Entropy {
+    pub fn create(_: (), _state: &EntropyState) -> Result<Self, EntropyPersistError> {
+        Ok(Entropy::new(RateLimiter::default())?)
+    }
+
+    /// Keeps the eventfds and the rate limiter timer.
+    pub fn restore_in_place(
+        &mut self,
+        state: &EntropyState,
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), EntropyPersistError> {
+        state.virtio_state.apply_to(self, mem)?;
+        self.rate_limiter
+            .restore_in_place(&state.rate_limiter_state, ())?;
+        self.set_avail_features(state.virtio_state.avail_features);
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
 
     use super::*;
     use crate::devices::virtio::device::VirtioDevice;
-    use crate::devices::virtio::rng::device::ENTROPY_DEV_ID;
-    use crate::devices::virtio::test_utils::test::create_virtio_mem;
+    use crate::devices::virtio::test_utils::default_mem;
 
     #[test]
     fn test_persistence() {
-        let entropy = Entropy::new(RateLimiter::default()).unwrap();
-
-        let entropy_state = entropy.save();
-        let serialized_data = bitcode::serialize(&entropy_state).unwrap();
-
-        let guest_mem = create_virtio_mem();
-        let restored_state = bitcode::deserialize(&serialized_data).unwrap();
-        let restored =
-            Entropy::restore(EntropyConstructorArgs { mem: guest_mem }, &restored_state).unwrap();
-
-        assert_eq!(restored.device_type(), VirtioDeviceType::Rng);
-        assert_eq!(restored.id(), ENTROPY_DEV_ID);
-        assert!(!restored.is_activated());
-        assert!(!entropy.is_activated());
-        assert_eq!(restored.avail_features(), entropy.avail_features());
+        let mut entropy = Entropy::new(RateLimiter::default()).unwrap();
+        entropy.set_acked_features(entropy.avail_features());
+        let mem = default_mem();
+        let data = bitcode::serialize(&entropy.save()).unwrap();
+        let state = bitcode::deserialize(&data).unwrap();
+        let args = EntropyConstructorArgs { mem: mem.clone() };
+        let mut restored = Entropy::restore(args, &state).unwrap();
         assert_eq!(restored.acked_features(), entropy.acked_features());
+
+        let fds = |dev: &Entropy| {
+            [
+                dev.queue_events()[0].as_raw_fd(),
+                dev.activate_event().as_raw_fd(),
+                dev.rate_limiter.as_raw_fd(),
+            ]
+        };
+        let before = fds(&restored);
+        restored.set_acked_features(0);
+        restored.restore_in_place(&state, &mem).unwrap();
+        assert_eq!(restored.acked_features(), entropy.acked_features());
+        assert_eq!(fds(&restored), before);
     }
 }

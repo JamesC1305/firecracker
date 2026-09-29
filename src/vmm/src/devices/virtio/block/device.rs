@@ -261,14 +261,37 @@ impl Persist<'_> for Block {
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
+        let mut block = Self::create((), state)?;
+        block.restore_in_place(state, &constructor_args.mem)?;
+        Ok(block)
+    }
+}
+
+impl Block {
+    pub fn create(constructor_args: (), state: &BlockState) -> Result<Self, BlockError> {
         match state {
-            BlockState::Virtio(s) => Ok(Self::Virtio(
-                VirtioBlock::restore(constructor_args, s).map_err(BlockError::VirtioBackend)?,
-            )),
-            BlockState::VhostUser(s) => Ok(Self::VhostUser(
-                VhostUserBlock::restore(constructor_args, s)
-                    .map_err(BlockError::VhostUserBackend)?,
-            )),
+            BlockState::Virtio(s) => VirtioBlock::create(constructor_args, s)
+                .map(Self::Virtio)
+                .map_err(BlockError::VirtioBackend),
+            BlockState::VhostUser(s) => VhostUserBlock::create(constructor_args, s)
+                .map(Self::VhostUser)
+                .map_err(BlockError::VhostUserBackend),
+        }
+    }
+
+    pub fn restore_in_place(
+        &mut self,
+        state: &BlockState,
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), BlockError> {
+        match (self, state) {
+            (Self::Virtio(block), BlockState::Virtio(state)) => block
+                .restore_in_place(state, mem)
+                .map_err(BlockError::VirtioBackend),
+            (Self::VhostUser(block), BlockState::VhostUser(state)) => block
+                .restore_in_place(state, mem)
+                .map_err(BlockError::VhostUserBackend),
+            _ => Err(BlockError::InvalidBlockBackend),
         }
     }
 }

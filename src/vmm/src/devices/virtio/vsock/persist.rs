@@ -8,9 +8,7 @@ use std::fmt::Debug;
 use serde::{Deserialize, Serialize};
 
 use super::*;
-use crate::devices::virtio::device::{DeviceState, VirtioDeviceType};
 use crate::devices::virtio::persist::VirtioDeviceState;
-use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
 use crate::snapshot::Persist;
 use crate::vstate::memory::GuestMemoryMmap;
 
@@ -45,12 +43,12 @@ pub struct VsockBackendState {
     pub local_port_last: u32,
 }
 
-/// A helper structure that holds the constructor arguments for VsockUnixBackend
+/// A helper structure that holds the constructor arguments for a vsock device
 #[derive(Debug)]
 pub struct VsockConstructorArgs<B> {
     /// Pointer to guest memory.
     pub mem: GuestMemoryMmap,
-    /// The vsock Unix Backend.
+    /// Backend with its host resources already created.
     pub backend: B,
 }
 
@@ -103,31 +101,47 @@ where
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        // Restore queues.
-        let queues = state
-            .virtio_state
-            .build_queues_checked(
-                &constructor_args.mem,
-                VirtioDeviceType::Vsock,
-                defs::VSOCK_NUM_QUEUES,
-                FIRECRACKER_MAX_QUEUE_SIZE,
-            )
-            .map_err(VsockError::VirtioState)?;
-        let mut vsock = Self::with_queues(state.cid, constructor_args.backend, queues)?;
-
-        vsock.acked_features = state.virtio_state.acked_features;
-        vsock.avail_features = state.virtio_state.avail_features;
-        vsock.device_state = DeviceState::Inactive;
-        vsock.pending_event_ack = state.pending_event_ack;
+        let VsockConstructorArgs { mem, backend } = constructor_args;
+        let mut vsock = Self::create(backend, state)?;
+        vsock.restore_in_place(state, &mem)?;
         Ok(vsock)
+    }
+}
+
+impl<B> Vsock<B>
+where
+    B: VsockBackend + 'static + Debug,
+{
+    pub fn create(backend: B, state: &VsockFrontendState) -> Result<Self, VsockError> {
+        Self::new(state.cid, backend)
+    }
+
+    /// Keeps the host socket, eventfds and event loop registrations.
+    pub fn restore_in_place(
+        &mut self,
+        state: &VsockFrontendState,
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), VsockError> {
+        state
+            .virtio_state
+            .apply_to(self, mem)
+            .map_err(VsockError::VirtioState)?;
+        self.avail_features = state.virtio_state.avail_features;
+        // Drop the packets parsed from the old queues.
+        self.rx_packet.clear();
+        self.tx_packet.clear();
+        self.pending_event_ack = state.pending_event_ack;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::os::fd::AsRawFd;
+
     use super::device::AVAIL_FEATURES;
     use super::*;
-    use crate::devices::virtio::device::VirtioDevice;
+    use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
     use crate::devices::virtio::vsock::test_utils::{TestBackend, TestContext};
     use crate::utils::byte_order;
 
@@ -168,6 +182,10 @@ pub(crate) mod tests {
             )
             .unwrap();
             assert_eq!(restored.pending_event_ack, armed);
+
+            ctx.device.pending_event_ack = !armed;
+            ctx.device.restore_in_place(&state, &ctx.mem).unwrap();
+            assert_eq!(ctx.device.pending_event_ack, armed);
         }
     }
 
@@ -226,5 +244,31 @@ pub(crate) mod tests {
         let config = restored_device.config_as_bytes();
         assert_eq!(config.len(), 8);
         assert_eq!(byte_order::read_le_u64(config), ctx.cid);
+    }
+
+    #[test]
+    fn test_restore_in_place() {
+        let ctx = TestContext::new();
+        let mut handler_ctx = ctx.create_event_handler_context();
+        handler_ctx.mock_activate(ctx.mem.clone(), ctx.interrupt.clone());
+        let device = &mut handler_ctx.device;
+        let fds = |device: &Vsock<TestBackend>| {
+            [
+                device.backend.as_raw_fd(),
+                device.activate_evt.as_raw_fd(),
+                device.queue_events[0].as_raw_fd(),
+                device.queue_events[1].as_raw_fd(),
+                device.queue_events[2].as_raw_fd(),
+            ]
+        };
+        let original_fds = fds(device);
+        device.acked_features = AVAIL_FEATURES;
+        let state = device.save();
+        device.acked_features = 0;
+
+        device.restore_in_place(&state, &ctx.mem).unwrap();
+
+        assert_eq!(VirtioDeviceState::from_device(device), state.virtio_state);
+        assert_eq!(fds(device), original_fds);
     }
 }

@@ -3,6 +3,7 @@
 
 //! Defines the structures needed for saving/restoring MmdsNetworkStack.
 
+use std::convert::Infallible;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
@@ -24,7 +25,7 @@ pub struct MmdsNetworkStackState {
 impl Persist<'_> for MmdsNetworkStack {
     type State = MmdsNetworkStackState;
     type ConstructorArgs = Arc<Mutex<Mmds>>;
-    type Error = ();
+    type Error = Infallible;
 
     fn save(&self) -> Self::State {
         let mut mac_addr = [0; MAC_ADDR_LEN as usize];
@@ -38,34 +39,70 @@ impl Persist<'_> for MmdsNetworkStack {
     }
 
     fn restore(mmds: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        Ok(MmdsNetworkStack::new(
+        let mut ns = Self::create(mmds, state)?;
+        ns.restore_in_place(state, ())?;
+        Ok(ns)
+    }
+}
+
+impl MmdsNetworkStack {
+    /// Creates host resources and fixed configuration, without applying runtime state.
+    pub fn create(
+        mmds: Arc<Mutex<Mmds>>,
+        state: &MmdsNetworkStackState,
+    ) -> Result<Self, Infallible> {
+        Ok(Self::new(
             MacAddr::from_bytes_unchecked(&state.mac_addr),
             Ipv4Addr::from(state.ipv4_addr),
             state.tcp_port,
             mmds,
         ))
     }
+
+    /// Applies all runtime state, retaining host resources on a live component.
+    pub fn restore_in_place(
+        &mut self,
+        state: &MmdsNetworkStackState,
+        _: (),
+    ) -> Result<(), Infallible> {
+        *self = Self::new(
+            MacAddr::from_bytes_unchecked(&state.mac_addr),
+            Ipv4Addr::from(state.ipv4_addr),
+            state.tcp_port,
+            Arc::clone(&self.mmds),
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
 
     use super::*;
+    use crate::mmds::data_store::Mmds;
 
     #[test]
     fn test_persistence() {
-        let ns = MmdsNetworkStack::new_with_defaults(None, Arc::new(Mutex::new(Mmds::default())));
+        let ns = MmdsNetworkStack::new(
+            MacAddr::from_bytes_unchecked(&[2, 0, 0, 0, 0, 1]),
+            Ipv4Addr::new(169, 254, 169, 123),
+            8080,
+            Arc::new(Mutex::new(Mmds::default())),
+        );
 
         let ns_state = ns.save();
         let serialized_data = bitcode::serialize(&ns_state).unwrap();
 
         let restored_state = bitcode::deserialize(&serialized_data).unwrap();
-        let restored_ns =
-            MmdsNetworkStack::restore(Arc::new(Mutex::new(Mmds::default())), &restored_state)
-                .unwrap();
+        let mmds = Arc::new(Mutex::new(Mmds::default()));
+        let mut restored_ns = MmdsNetworkStack::new_with_defaults(None, Arc::clone(&mmds));
+        restored_ns.restore_in_place(&restored_state, ()).unwrap();
 
         assert_eq!(restored_ns.mac_addr, ns.mac_addr);
         assert_eq!(restored_ns.ipv4_addr, ns.ipv4_addr);
+        assert_eq!(restored_ns.tcp_handler.local_ipv4_addr(), ns.ipv4_addr);
+        assert!(Arc::ptr_eq(&restored_ns.mmds, &mmds));
         assert_eq!(
             restored_ns.tcp_handler.local_port(),
             ns.tcp_handler.local_port()

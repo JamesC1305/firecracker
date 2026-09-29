@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use super::TapError;
 use super::device::Net;
-use super::{NET_NUM_QUEUES, NET_QUEUE_MAX_SIZE, TapError};
-use crate::devices::virtio::device::VirtioDeviceType;
+use crate::devices::virtio::device::VirtioDevice;
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
 use crate::mmds::data_store::Mmds;
 use crate::mmds::ns::MmdsNetworkStack;
@@ -92,53 +92,73 @@ impl Persist<'_> for Net {
         constructor_args: Self::ConstructorArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        // RateLimiter::restore() can fail at creating a timerfd.
-        let rx_rate_limiter = RateLimiter::restore((), &state.rx_rate_limiter_state)?;
-        let tx_rate_limiter = RateLimiter::restore((), &state.tx_rate_limiter_state)?;
+        let NetConstructorArgs { mem, mmds } = constructor_args;
+        let mut net = Self::create(mmds, state)?;
+        net.restore_in_place(state, &mem)?;
+        Ok(net)
+    }
+}
+
+impl Net {
+    pub fn create(
+        mmds: Option<Arc<Mutex<Mmds>>>,
+        state: &NetState,
+    ) -> Result<Self, NetPersistError> {
         let mut net = Net::new(
             state.id.clone(),
             &state.tap_if_name,
             state.config_space.guest_mac,
-            rx_rate_limiter,
-            tx_rate_limiter,
+            RateLimiter::default(),
+            RateLimiter::default(),
             state.config_space.mtu,
         )?;
 
-        // We trust the MMIOVirtioDevices::restore to pass us an MMDS data store reference if
-        // there is at least one net device having the MMDS NS present and/or the mmds version was
-        // persisted in the snapshot.
-        if let Some(mmds_ns) = &state.mmds_ns {
-            // We're safe calling unwrap() to discard the error, as MmdsNetworkStack::restore()
-            // always returns Ok.
+        // The manager supplies a shared datastore for devices with an MMDS stack.
+        if let Some(mmds_state) = &state.mmds_ns {
             net.mmds_ns = Some(
-                MmdsNetworkStack::restore(
-                    constructor_args
-                        .mmds
-                        .map_or_else(|| Err(NetPersistError::NoMmdsDataStore), Ok)?,
-                    mmds_ns,
-                )
-                .unwrap(),
+                MmdsNetworkStack::create(mmds.ok_or(NetPersistError::NoMmdsDataStore)?, mmds_state)
+                    .unwrap(),
             );
         }
 
-        net.queues = state.virtio_state.build_queues_checked(
-            &constructor_args.mem,
-            VirtioDeviceType::Net,
-            NET_NUM_QUEUES,
-            NET_QUEUE_MAX_SIZE,
-        )?;
-        net.avail_features = state.virtio_state.avail_features;
-        net.acked_features = state.virtio_state.acked_features;
-
         Ok(net)
+    }
+
+    /// Keeps the TAP, eventfds and rate limiter timers, and the MMDS datastore.
+    pub fn restore_in_place(
+        &mut self,
+        state: &NetState,
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), NetPersistError> {
+        state.virtio_state.apply_to(self, mem)?;
+        self.avail_features = state.virtio_state.avail_features;
+        self.rx_rate_limiter
+            .restore_in_place(&state.rx_rate_limiter_state, ())?;
+        self.tx_rate_limiter
+            .restore_in_place(&state.tx_rate_limiter_state, ())?;
+        if let (Some(mmds_ns), Some(mmds_ns_state)) = (&mut self.mmds_ns, &state.mmds_ns) {
+            mmds_ns.restore_in_place(mmds_ns_state, ()).unwrap();
+        }
+        // Drop the descriptor chains parsed from the old queues, as a device reset does.
+        self._reset();
+        // The guest may have negotiated other features since load. Activation configures
+        // the TAP offloads of a device that load creates.
+        if self.is_activated() {
+            self.apply_acked_features()
+                .map_err(NetPersistError::TapSetOffload)?;
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+    use std::os::fd::AsRawFd;
 
     use super::*;
-    use crate::devices::virtio::device::VirtioDevice;
+    use crate::devices::virtio::device::VirtioDeviceType;
+    use crate::devices::virtio::net::test_utils::test::TestHelper;
     use crate::devices::virtio::net::test_utils::{default_net, default_net_no_mmds};
     use crate::devices::virtio::test_utils::default_mem;
 
@@ -214,5 +234,36 @@ mod tests {
         // Check what happens if MMIOVirtioDevices::restore does not give us the reference to the
         // MMDS data store. This will return an error.
         validate_save_and_restore(default_net(), None);
+    }
+
+    #[test]
+    fn test_restore_in_place() {
+        let mem = default_mem();
+        let mut th = TestHelper::get_default(&mem);
+        th.activate_net();
+        let mut net = th.net();
+        let fds = |net: &Net| {
+            [
+                net.tap.as_raw_fd(),
+                net.activate_evt.as_raw_fd(),
+                net.queue_evts[0].as_raw_fd(),
+                net.queue_evts[1].as_raw_fd(),
+                net.rx_rate_limiter.as_raw_fd(),
+                net.tx_rate_limiter.as_raw_fd(),
+            ]
+        };
+        let original_fds = fds(&net);
+        let mmds = Arc::clone(&net.mmds_ns.as_ref().unwrap().mmds);
+        let state = net.save();
+        net.avail_features = 0;
+        net.configure_mmds_network_stack(Ipv4Addr::LOCALHOST, Arc::clone(&mmds));
+
+        net.restore_in_place(&state, &mem).unwrap();
+
+        assert_eq!(VirtioDeviceState::from_device(&*net), state.virtio_state);
+        assert_eq!(fds(&net), original_fds);
+        let ns = net.mmds_ns.as_ref().unwrap();
+        assert_eq!(ns.ipv4_addr(), MmdsNetworkStack::default_ipv4_addr());
+        assert!(Arc::ptr_eq(&ns.mmds, &mmds));
     }
 }
