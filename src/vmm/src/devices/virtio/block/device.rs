@@ -7,10 +7,11 @@ use event_manager::{EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::BlockError;
-use super::persist::{BlockConstructorArgs, BlockState};
+use super::persist::BlockState;
 use super::vhost_user::device::{VhostUserBlock, VhostUserBlockConfig};
 use super::virtio::device::{VirtioBlock, VirtioBlockConfig};
 use crate::devices::virtio::ActivateError;
+use crate::devices::virtio::block::vhost_user::VhostUserBlockError;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::queue::{InvalidAvailIdx, Queue};
 use crate::devices::virtio::transport::VirtioInterrupt;
@@ -245,9 +246,9 @@ impl MutEventSubscriber for Block {
     }
 }
 
-impl Persist<'_> for Block {
+impl<'a> Persist<'a> for Block {
     type State = BlockState;
-    type ApplyArgs = ();
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = BlockError;
 
     fn save(&self) -> Self::State {
@@ -256,18 +257,34 @@ impl Persist<'_> for Block {
             Self::VhostUser(b) => BlockState::VhostUser(b.save()),
         }
     }
+
+    fn apply_state(
+        &mut self,
+        state: &Self::State,
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), Self::Error> {
+        match (self, state) {
+            (Self::Virtio(block), BlockState::Virtio(state)) => block
+                .apply_state(state, mem)
+                .map_err(BlockError::VirtioBackend),
+            (Self::VhostUser(block), BlockState::VhostUser(state)) => block
+                .apply_state(state, mem)
+                .map_err(BlockError::VhostUserBackend),
+            _ => Err(BlockError::InvalidBlockBackend),
+        }
+    }
 }
 
 impl Provision<'_> for Block {
-    type ProvisionArgs = BlockConstructorArgs;
+    type ProvisionArgs = ();
 
     fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
         match state {
-            BlockState::Virtio(s) => Ok(Self::Virtio(
-                VirtioBlock::provision(args, s).map_err(BlockError::VirtioBackend)?,
-            )),
-            BlockState::VhostUser(s) => Ok(Self::VhostUser(
-                VhostUserBlock::provision(args, s).map_err(BlockError::VhostUserBackend)?,
+            BlockState::Virtio(s) => VirtioBlock::provision(args, s)
+                .map(Self::Virtio)
+                .map_err(BlockError::VirtioBackend),
+            BlockState::VhostUser(_) => Err(BlockError::VhostUserBackend(
+                VhostUserBlockError::SnapshottingNotSupported,
             )),
         }
     }

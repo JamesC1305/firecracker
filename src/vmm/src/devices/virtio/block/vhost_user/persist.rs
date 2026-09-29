@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 use super::VhostUserBlockError;
 use super::device::VhostUserBlock;
 use crate::devices::virtio::block::CacheType;
-use crate::devices::virtio::block::persist::BlockConstructorArgs;
 use crate::devices::virtio::persist::VirtioDeviceState;
-use crate::snapshot::{Persist, Provision};
+use crate::snapshot::Persist;
+use crate::vstate::memory::GuestMemoryMmap;
 
 /// vhost-user block device state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,20 +25,20 @@ pub struct VhostUserBlockState {
     virtio_state: VirtioDeviceState,
 }
 
-impl Persist<'_> for VhostUserBlock {
+impl<'a> Persist<'a> for VhostUserBlock {
     type State = VhostUserBlockState;
-    type ApplyArgs = ();
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = VhostUserBlockError;
 
     fn save(&self) -> Self::State {
         unimplemented!("VhostUserBlock does not support snapshotting yet");
     }
-}
 
-impl Provision<'_> for VhostUserBlock {
-    type ProvisionArgs = BlockConstructorArgs;
-
-    fn provision(_args: Self::ProvisionArgs, _state: &Self::State) -> Result<Self, Self::Error> {
+    fn apply_state(
+        &mut self,
+        _state: &Self::State,
+        _mem: &GuestMemoryMmap,
+    ) -> Result<(), Self::Error> {
         Err(VhostUserBlockError::SnapshottingNotSupported)
     }
 }

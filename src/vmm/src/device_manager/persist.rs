@@ -20,7 +20,7 @@ use crate::devices::legacy::{PL061Device, PL061State, RTCDevice};
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::balloon::persist::BalloonState;
 use crate::devices::virtio::block::device::Block;
-use crate::devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
+use crate::devices::virtio::block::persist::BlockState;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::mem::VirtioMem;
 use crate::devices::virtio::mem::persist::{VirtioMemProvisionArgs, VirtioMemState};
@@ -524,9 +524,9 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
 
         for block_state in &state.block_devices {
             let device = Arc::new(Mutex::new(restore::<Block>(
-                BlockConstructorArgs { mem: mem.clone() },
-                &block_state.device_state,
                 (),
+                &block_state.device_state,
+                mem,
                 &mut load,
             )?));
 
