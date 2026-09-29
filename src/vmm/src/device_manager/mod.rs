@@ -430,6 +430,14 @@ impl DeviceManager {
         devices
     }
 
+    /// Returns where each PCI device maps its BAR, and nothing with the MMIO transport.
+    pub fn pci_bar_addresses(&self) -> HashMap<VirtioDeviceId, u64> {
+        match &self.virtio_devices {
+            VirtioDevices::Pci(pci_devices) => pci_devices.bar_addresses(),
+            VirtioDevices::Mmio(_) => HashMap::new(),
+        }
+    }
+
     /// Waits for the in-flight I/O of the virtio block devices and completes it.
     pub fn drain_block_io(&self) -> Result<(), VirtioBlockError> {
         let mut result = Ok(());
@@ -985,7 +993,11 @@ pub(crate) mod tests {
         );
     }
 
-    fn make_hotplug_block_cfg(drive_id: &str, f: &TempFile, is_root: bool) -> BlockDeviceConfig {
+    pub(crate) fn make_hotplug_block_cfg(
+        drive_id: &str,
+        f: &TempFile,
+        is_root: bool,
+    ) -> BlockDeviceConfig {
         BlockDeviceConfig {
             drive_id: drive_id.to_string(),
             partuuid: None,

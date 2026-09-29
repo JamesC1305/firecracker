@@ -122,6 +122,12 @@ impl PciBus {
         self.devices[device_id as usize] = None;
     }
 
+    /// Restores the unpersisted host bridge to its fresh-construction state.
+    /// Other PCI slots and their live devices remain unchanged.
+    pub fn reset_host_bridge(&mut self) {
+        self.devices[0] = Some(Arc::new(Mutex::new(PciHostBridge::new(None))));
+    }
+
     /// Get the next unused device ID.
     ///
     /// Note: this is non-reserving — repeated calls without an intervening `add_device` will
@@ -253,6 +259,11 @@ impl PciConfigIo {
             _ => return,
         };
         self.config_address = (self.config_address & !mask) | value;
+    }
+
+    /// Restores the unpersisted 0xCF8 address latch to its initial value.
+    pub fn reset_config_address(&mut self) {
+        self.config_address = 0;
     }
 }
 

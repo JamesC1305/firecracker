@@ -734,7 +734,9 @@ impl Vmm {
             .ok_or_else(|| VmmActionError::NotSupported("Operation requires KVM".to_string()))?
             .clone();
         self.device_manager
-            .hotplug_device(kvm_vm, config, event_manager)
+            .hotplug_device(kvm_vm, config, event_manager)?;
+        self.mark_devices_hotplugged();
+        Ok(())
     }
 
     /// Detaches a device after VM start
@@ -751,7 +753,17 @@ impl Vmm {
             .ok_or_else(|| VmmActionError::NotSupported("Operation requires KVM".to_string()))?
             .clone();
         self.device_manager
-            .hot_unplug_device(kvm_vm, device_id, event_manager)
+            .hot_unplug_device(kvm_vm, device_id, event_manager)?;
+        self.mark_devices_hotplugged();
+        Ok(())
+    }
+
+    /// Records in the reset context that the devices no longer are the ones that snapshot
+    /// load created, so that reset refuses to run.
+    fn mark_devices_hotplugged(&mut self) {
+        if let Some(context) = &mut self.reset_context {
+            context.devices_hotplugged = true;
+        }
     }
 }
 

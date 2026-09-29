@@ -310,6 +310,17 @@ impl PciDevices {
         }
     }
 
+    /// Returns where each device maps its BAR.
+    pub fn bar_addresses(&self) -> HashMap<VirtioDeviceId, u64> {
+        self.virtio_devices
+            .iter()
+            .map(|(id, device)| {
+                let bar_address = device.lock().expect("Poisoned lock").bar_address();
+                (id.clone(), bar_address)
+            })
+            .collect()
+    }
+
     /// Installs the GSI routes that restoring the devices staged, then enables the unmasked
     /// MSI-X vectors of every device. Installing the routes after enabling an irqfd can panic
     /// older AMD/SVM kernels (see kernel commit a80ced6ea514).
@@ -383,6 +394,31 @@ impl PciDevices {
                 .map_err(PciManagerError::from)?;
             // PCI init has always registered runtime watches after backend activation.
             Self::subscribe_device(&mut transport, load.event_manager);
+        }
+        Ok(())
+    }
+
+    fn check_devices_reset<'a, D>(
+        &self,
+        states: &[VirtioDeviceState<D::State>],
+    ) -> Result<(), ResetUnsupported>
+    where
+        D: VirtioDevice + Persist<'a> + 'static,
+    {
+        for state in states {
+            let device = self
+                .get_virtio_device(D::const_device_type(), &state.device_id)
+                .ok_or(ResetUnsupported("device topology changes"))?;
+            let transport = device.lock().expect("Poisoned lock");
+            transport
+                .virtio_device()
+                .lock()
+                .expect("Poisoned lock")
+                .as_any()
+                .downcast_ref::<D>()
+                .ok_or(ResetUnsupported("device type changes"))?
+                .check_reset(&state.device_state)?;
+            transport.check_reset(&state.transport_state)?;
         }
         Ok(())
     }
@@ -694,7 +730,7 @@ impl<'a> Persist<'a> for PciDevices {
     }
 
     /// Keeps bus mappings, ioeventfds and interrupt objects, then installs the restored routes
-    /// before enabling unmasked vectors.
+    /// before enabling unmasked vectors. Reset preflight rejects devices whose BARs moved.
     fn restore_in_place(
         &mut self,
         state: &Self::State,
@@ -712,6 +748,21 @@ impl<'a> Persist<'a> for PciDevices {
             pmem_devices,
             memory_device,
         } = state;
+        // Snapshots do not save the host bridge and the configuration address latch. Load
+        // starts from fresh ones, so this only changes them on reset.
+        self.pci_segment
+            .pci_bus
+            .lock()
+            .expect("Poisoned lock")
+            .reset_host_bridge();
+        #[cfg(target_arch = "x86_64")]
+        if let Some(config_io) = &self.pci_segment.pci_config_io {
+            config_io
+                .lock()
+                .expect("Poisoned lock")
+                .reset_config_address();
+        }
+
         self.restore_devices_in_place::<Balloon>(balloon_device.as_slice(), mem)?;
         self.restore_devices_in_place::<Block>(block_devices, mem)?;
         self.restore_devices_in_place::<Net>(net_devices, mem)?;
@@ -738,8 +789,25 @@ impl<'a> Persist<'a> for PciDevices {
         Ok(())
     }
 
-    fn check_reset(&self, _state: &Self::State) -> Result<(), ResetUnsupported> {
-        Err(ResetUnsupported("the PCI transport"))
+    fn check_reset(&self, state: &Self::State) -> Result<(), ResetUnsupported> {
+        let saved_count = state.block_devices.len()
+            + state.net_devices.len()
+            + state.pmem_devices.len()
+            + usize::from(state.balloon_device.is_some())
+            + usize::from(state.vsock_device.is_some())
+            + usize::from(state.entropy_device.is_some())
+            + usize::from(state.memory_device.is_some());
+        if self.virtio_devices.len() != saved_count {
+            return Err(ResetUnsupported("device topology changes"));
+        }
+        self.check_devices_reset::<Balloon>(state.balloon_device.as_slice())?;
+        self.check_devices_reset::<Block>(state.block_devices.as_slice())?;
+        self.check_devices_reset::<Net>(state.net_devices.as_slice())?;
+        self.check_devices_reset::<Vsock<VsockUnixBackend>>(state.vsock_device.as_slice())?;
+        self.check_devices_reset::<Entropy>(state.entropy_device.as_slice())?;
+        self.check_devices_reset::<Pmem>(state.pmem_devices.as_slice())?;
+        self.check_devices_reset::<VirtioMem>(state.memory_device.as_slice())?;
+        Ok(())
     }
 }
 

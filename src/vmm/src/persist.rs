@@ -119,6 +119,12 @@ pub struct ResetContext {
     /// Whether each virtio device was activated after load. In-place restore cannot add,
     /// remove, activate or deactivate a device, so reset requires the same devices here.
     pub virtio_devices: HashMap<VirtioDeviceId, bool>,
+    /// Where each PCI device mapped its BAR after load, and nothing with the MMIO transport.
+    /// A mapping cannot move back in place, so reset requires the same addresses here.
+    pub pci_bar_addresses: HashMap<VirtioDeviceId, u64>,
+    /// A device was hot-plugged or unplugged since load. Reset cannot tell whether a device
+    /// with the same ID is the one that load created.
+    pub devices_hotplugged: bool,
     /// MMDS data after load.
     pub mmds_data: MmdsData,
     /// Whether snapshot load applied wall-clock time to kvmclock.
@@ -205,7 +211,8 @@ pub enum ResetSnapshotError {
     Poisoned,
     /// Reset does not support {0}.
     Unsupported(&'static str),
-    /// Virtio devices were added, removed, activated or reset since the snapshot was loaded.
+    /// Virtio devices were added, removed, hot-plugged, unplugged, activated, reset or moved
+    /// since the snapshot was loaded.
     DevicesChanged,
     /// Failed to create a new MMDS token key: {0}
     MmdsTokenKey(#[from] crate::mmds::data_store::MmdsDatastoreError),
@@ -302,7 +309,10 @@ pub fn reset_to_snapshot(vmm: &mut Vmm) -> Result<(), ResetSnapshotError> {
         .map_err(ResetSnapshotError::CompleteVcpuIo)?;
     // The per-device checks pair each live device with its saved state, so a device added
     // since load reports the topology change rather than its kind.
-    if vmm.device_manager.virtio_device_activation() != context.virtio_devices {
+    if context.devices_hotplugged
+        || vmm.device_manager.virtio_device_activation() != context.virtio_devices
+        || vmm.device_manager.pci_bar_addresses() != context.pci_bar_addresses
+    {
         return Err(ResetSnapshotError::DevicesChanged);
     }
     vmm.device_manager
@@ -692,6 +702,8 @@ pub fn restore_from_snapshot(
             vcpu_states: microvm_state.vcpu_states,
             device_states: microvm_state.device_states,
             virtio_devices: locked_vmm.device_manager.virtio_device_activation(),
+            pci_bar_addresses: locked_vmm.device_manager.pci_bar_addresses(),
+            devices_hotplugged: false,
             mmds_data,
             clock_realtime: params.clock_realtime,
             dirty_pages,
@@ -1313,14 +1325,31 @@ mod tests {
         assert!(!vmm.reset_poisoned());
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
-    fn test_reset_rejects_pci_before_poison() {
-        let (vmm, _events) = snapshot_load_fixture_with(true, true);
+    fn test_reset_rejects_hotplug_before_poison() {
+        use crate::device_manager::tests::make_hotplug_block_cfg;
+        use crate::devices::virtio::device::VirtioDeviceType;
+        use crate::vmm_config::HotplugDeviceConfig;
+
+        let (vmm, mut events) = snapshot_load_fixture_with(true, true);
         let mut vmm = vmm.lock().unwrap();
+        let disk = TempFile::new().unwrap();
+        // The PCI microVM resets while its devices are the ones that load created.
+        reset_to_snapshot(&mut vmm).unwrap();
+
+        // After a device is plugged in and unplugged again, the devices look as after load. A
+        // device with the same ID could still be plugged in, which load did not create.
+        let config = make_hotplug_block_cfg("scratch", &disk, false);
+        vmm.hotplug_device(HotplugDeviceConfig::Block(config), &mut events)
+            .unwrap();
+        vmm.hot_unplug_device(
+            (VirtioDeviceType::Block, "scratch".to_string()),
+            &mut events,
+        )
+        .unwrap();
         assert!(matches!(
             reset_to_snapshot(&mut vmm),
-            Err(ResetSnapshotError::Unsupported("the PCI transport"))
+            Err(ResetSnapshotError::DevicesChanged)
         ));
         assert!(!vmm.reset_poisoned());
     }

@@ -880,6 +880,10 @@ impl<'a> Persist<'a> for VirtioPciDevice {
         }
         Ok(())
     }
+
+    fn check_reset(&self, _state: &Self::State) -> Result<(), crate::snapshot::ResetUnsupported> {
+        Ok(())
+    }
 }
 
 pub struct VirtioInterruptMsix {
