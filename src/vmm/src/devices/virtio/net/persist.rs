@@ -17,7 +17,7 @@ use crate::mmds::ns::MmdsNetworkStack;
 use crate::mmds::persist::MmdsNetworkStackState;
 use crate::rate_limiter::RateLimiter;
 use crate::rate_limiter::persist::RateLimiterState;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 use crate::utils::net::mac::MacAddr;
 use crate::vstate::memory::GuestMemoryMmap;
 
@@ -46,7 +46,7 @@ pub struct NetState {
 
 /// Auxiliary structure for creating a device when resuming from a snapshot.
 #[derive(Debug)]
-pub struct NetConstructorArgs {
+pub struct NetProvisionArgs {
     /// Pointer to guest memory.
     pub mem: GuestMemoryMmap,
     /// Pointer to the MMDS data store.
@@ -70,7 +70,6 @@ pub enum NetPersistError {
 
 impl Persist<'_> for Net {
     type State = NetState;
-    type ConstructorArgs = NetConstructorArgs;
     type Error = NetPersistError;
 
     fn save(&self) -> Self::State {
@@ -87,14 +86,15 @@ impl Persist<'_> for Net {
             virtio_state: VirtioDeviceState::from_device(self),
         }
     }
+}
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
-        // RateLimiter::restore() can fail at creating a timerfd.
-        let rx_rate_limiter = RateLimiter::restore((), &state.rx_rate_limiter_state)?;
-        let tx_rate_limiter = RateLimiter::restore((), &state.tx_rate_limiter_state)?;
+impl Provision<'_> for Net {
+    type ProvisionArgs = NetProvisionArgs;
+
+    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
+        // RateLimiter::provision() can fail at creating a timerfd.
+        let rx_rate_limiter = RateLimiter::provision((), &state.rx_rate_limiter_state)?;
+        let tx_rate_limiter = RateLimiter::provision((), &state.tx_rate_limiter_state)?;
         let mut net = Net::new(
             state.id.clone(),
             &state.tap_if_name,
@@ -104,16 +104,15 @@ impl Persist<'_> for Net {
             state.config_space.mtu,
         )?;
 
-        // We trust the MMIOVirtioDevices::restore to pass us an MMDS data store reference if
+        // We trust the MMIOVirtioDevices::provision to pass us an MMDS data store reference if
         // there is at least one net device having the MMDS NS present and/or the mmds version was
         // persisted in the snapshot.
         if let Some(mmds_ns) = &state.mmds_ns {
-            // We're safe calling unwrap() to discard the error, as MmdsNetworkStack::restore()
+            // We're safe calling unwrap() to discard the error, as MmdsNetworkStack::provision()
             // always returns Ok.
             net.mmds_ns = Some(
-                MmdsNetworkStack::restore(
-                    constructor_args
-                        .mmds
+                MmdsNetworkStack::provision(
+                    args.mmds
                         .map_or_else(|| Err(NetPersistError::NoMmdsDataStore), Ok)?,
                     mmds_ns,
                 )
@@ -122,7 +121,7 @@ impl Persist<'_> for Net {
         }
 
         net.queues = state.virtio_state.build_queues_checked(
-            &constructor_args.mem,
+            &args.mem,
             VirtioDeviceType::Net,
             NET_NUM_QUEUES,
             NET_QUEUE_MAX_SIZE,
@@ -171,8 +170,8 @@ mod tests {
         {
             // Deserialize and restore the net device.
             let restored_state = bitcode::deserialize(&serialized_data).unwrap();
-            match Net::restore(
-                NetConstructorArgs {
+            match Net::provision(
+                NetProvisionArgs {
                     mem: guest_mem,
                     mmds: mmds_ds,
                 },
@@ -206,13 +205,13 @@ mod tests {
         validate_save_and_restore(default_net(), mmds.as_ref().cloned());
         validate_save_and_restore(default_net_no_mmds(), None);
 
-        // Check what happens if MMIOVirtioDevices::restore gives us the reference to the MMDS
-        // data store even if this device does not have mmds ns configured.
+        // Check what happens if the device manager gives us the MMDS data store reference
+        // even if this device does not have mmds ns configured.
         // The restore should be conservative and not configure the mmds ns.
         validate_save_and_restore(default_net_no_mmds(), mmds);
 
-        // Check what happens if MMIOVirtioDevices::restore does not give us the reference to the
-        // MMDS data store. This will return an error.
+        // Check what happens if the device manager does not give us the MMDS data store
+        // reference. This will return an error.
         validate_save_and_restore(default_net(), None);
     }
 }

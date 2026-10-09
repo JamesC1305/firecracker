@@ -17,9 +17,9 @@ use event_manager::{MutEventSubscriber, SubscriberOps};
 use legacy::{LegacyDeviceError, PortIODeviceManager};
 use linux_loader::loader::Cmdline;
 use mmio::{MMIOPlatformDevices, MMIOVirtioDevices, MmioError};
-use pci_mngr::{PciDevices, PciDevicesConstructorArgs, PciManagerError};
+use pci_mngr::{PciDevices, PciDevicesProvisionArgs, PciManagerError};
 use persist::{
-    MMIODevManagerConstructorArgs, MMIOPlatformDevicesConstructorArgs, MMIOPlatformDevicesState,
+    MMIODevManagerProvisionArgs, MMIOPlatformDevicesProvisionArgs, MMIOPlatformDevicesState,
 };
 use serde::{Deserialize, Serialize};
 use utils::time::TimestampUs;
@@ -51,7 +51,7 @@ use crate::logger::{error, info};
 use crate::rate_limiter::TokenBucket;
 use crate::resources::VmResources;
 use crate::rpc_interface::VmmActionError;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 use crate::utils::open_file_nonblock;
 use crate::vmm_config::HotplugDeviceConfig;
 use crate::vmm_config::drive::{BlockDeviceConfig, DriveError};
@@ -688,7 +688,7 @@ pub enum DeviceManagerPersistError {
     DeviceManager(#[from] DeviceManagerCreateError),
 }
 
-pub struct DeviceRestoreArgs<'a> {
+pub struct DeviceProvisionArgs<'a> {
     pub mem: &'a GuestMemoryMmap,
     pub vm: &'a Arc<KvmVm>,
     pub event_manager: &'a mut EventManager,
@@ -697,9 +697,9 @@ pub struct DeviceRestoreArgs<'a> {
     pub instance_id: &'a str,
 }
 
-impl std::fmt::Debug for DeviceRestoreArgs<'_> {
+impl std::fmt::Debug for DeviceProvisionArgs<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeviceRestoreArgs")
+        f.debug_struct("DeviceProvisionArgs")
             .field("mem", &self.mem)
             .field("vm", &self.vm)
             .field("vm_resources", &self.vm_resources)
@@ -710,7 +710,6 @@ impl std::fmt::Debug for DeviceRestoreArgs<'_> {
 
 impl<'a> Persist<'a> for DeviceManager {
     type State = DevicesState;
-    type ConstructorArgs = DeviceRestoreArgs<'a>;
     type Error = DeviceManagerPersistError;
 
     fn save(&self) -> Self::State {
@@ -726,9 +725,13 @@ impl<'a> Persist<'a> for DeviceManager {
             serial_state: self.serial_state(),
         }
     }
+}
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
+impl<'a> Provision<'a> for DeviceManager {
+    type ProvisionArgs = DeviceProvisionArgs<'a>;
+
+    fn provision(
+        constructor_args: Self::ProvisionArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
         // Setup legacy devices in case of x86
@@ -746,41 +749,41 @@ impl<'a> Persist<'a> for DeviceManager {
         )?;
 
         // Restore MMIO platform devices
-        let platform_ctor_args = MMIOPlatformDevicesConstructorArgs {
+        let platform_ctor_args = MMIOPlatformDevicesProvisionArgs {
             vm: constructor_args.vm,
             event_manager: constructor_args.event_manager,
             vm_resources: constructor_args.vm_resources,
             serial_state: state.serial_state.as_ref(),
         };
         let mmio_platform_devices =
-            MMIOPlatformDevices::restore(platform_ctor_args, &state.mmio_platform_state)
+            MMIOPlatformDevices::provision(platform_ctor_args, &state.mmio_platform_state)
                 .map_err(DeviceManagerPersistError::MmioRestore)?;
 
         // Restore ACPI devices
-        let acpi_devices = ACPIDeviceManager::restore(constructor_args.vm, &state.acpi_state)?;
+        let acpi_devices = ACPIDeviceManager::provision(constructor_args.vm, &state.acpi_state)?;
 
         let virtio_devices = match &state.virtio_state {
             VirtioDevicesState::Pci(pci_state) => {
-                let pci_ctor_args = PciDevicesConstructorArgs {
+                let pci_ctor_args = PciDevicesProvisionArgs {
                     vm: constructor_args.vm,
                     mem: constructor_args.mem,
                     vm_resources: constructor_args.vm_resources,
                     instance_id: constructor_args.instance_id,
                     event_manager: constructor_args.event_manager,
                 };
-                let pci_devices = PciDevices::restore(pci_ctor_args, pci_state)
+                let pci_devices = PciDevices::provision(pci_ctor_args, pci_state)
                     .map_err(DeviceManagerPersistError::PciRestore)?;
                 VirtioDevices::Pci(pci_devices)
             }
             VirtioDevicesState::Mmio(mmio_state) => {
-                let mmio_ctor_args = MMIODevManagerConstructorArgs {
+                let mmio_ctor_args = MMIODevManagerProvisionArgs {
                     mem: constructor_args.mem,
                     vm: constructor_args.vm,
                     event_manager: constructor_args.event_manager,
                     vm_resources: constructor_args.vm_resources,
                     instance_id: constructor_args.instance_id,
                 };
-                let mmio_virtio_devices = MMIOVirtioDevices::restore(mmio_ctor_args, mmio_state)
+                let mmio_virtio_devices = MMIOVirtioDevices::provision(mmio_ctor_args, mmio_state)
                     .map_err(DeviceManagerPersistError::MmioRestore)?;
                 VirtioDevices::Mmio(mmio_virtio_devices)
             }

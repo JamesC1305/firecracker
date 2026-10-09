@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ns::MmdsNetworkStack;
 use crate::mmds::data_store::Mmds;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 use crate::utils::net::mac::{MAC_ADDR_LEN, MacAddr};
 
 /// State of a MmdsNetworkStack.
@@ -23,7 +23,6 @@ pub struct MmdsNetworkStackState {
 
 impl Persist<'_> for MmdsNetworkStack {
     type State = MmdsNetworkStackState;
-    type ConstructorArgs = Arc<Mutex<Mmds>>;
     type Error = ();
 
     fn save(&self) -> Self::State {
@@ -36,13 +35,17 @@ impl Persist<'_> for MmdsNetworkStack {
             tcp_port: self.tcp_handler.local_port(),
         }
     }
+}
 
-    fn restore(mmds: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
+impl Provision<'_> for MmdsNetworkStack {
+    type ProvisionArgs = Arc<Mutex<Mmds>>;
+
+    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
         Ok(MmdsNetworkStack::new(
             MacAddr::from_bytes_unchecked(&state.mac_addr),
             Ipv4Addr::from(state.ipv4_addr),
             state.tcp_port,
-            mmds,
+            args,
         ))
     }
 }
@@ -61,7 +64,7 @@ mod tests {
 
         let restored_state = bitcode::deserialize(&serialized_data).unwrap();
         let restored_ns =
-            MmdsNetworkStack::restore(Arc::new(Mutex::new(Mmds::default())), &restored_state)
+            MmdsNetworkStack::provision(Arc::new(Mutex::new(Mmds::default())), &restored_state)
                 .unwrap();
 
         assert_eq!(restored_ns.mac_addr, ns.mac_addr);

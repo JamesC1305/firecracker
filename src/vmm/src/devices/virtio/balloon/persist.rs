@@ -12,7 +12,7 @@ use crate::devices::virtio::balloon::device::{BalloonStats, ConfigSpace, Hinting
 use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::persist::VirtioDeviceState;
 use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 use crate::vstate::memory::GuestMemoryMmap;
 
 /// Information about the balloon config's that are saved
@@ -114,7 +114,6 @@ pub struct BalloonConstructorArgs {
 
 impl Persist<'_> for Balloon {
     type State = BalloonState;
-    type ConstructorArgs = BalloonConstructorArgs;
     type Error = super::BalloonError;
 
     fn save(&self) -> Self::State {
@@ -130,11 +129,12 @@ impl Persist<'_> for Balloon {
             virtio_state: VirtioDeviceState::from_device(self),
         }
     }
+}
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
+impl Provision<'_> for Balloon {
+    type ProvisionArgs = BalloonConstructorArgs;
+
+    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
         let free_page_hinting =
             state.virtio_state.avail_features & (1u64 << VIRTIO_BALLOON_F_FREE_PAGE_HINTING) != 0;
 
@@ -169,7 +169,7 @@ impl Persist<'_> for Balloon {
         balloon.queues = state
             .virtio_state
             .build_queues_checked(
-                &constructor_args.mem,
+                &args.mem,
                 VirtioDeviceType::Balloon,
                 num_queues,
                 FIRECRACKER_MAX_QUEUE_SIZE,
@@ -218,7 +218,7 @@ mod tests {
         // Deserialize and restore the balloon device.
         let restored_state = bitcode::deserialize(&serialized_data).unwrap();
         let restored_balloon =
-            Balloon::restore(BalloonConstructorArgs { mem: guest_mem }, &restored_state).unwrap();
+            Balloon::provision(BalloonConstructorArgs { mem: guest_mem }, &restored_state).unwrap();
 
         assert_eq!(restored_balloon.device_type(), VirtioDeviceType::Balloon);
 

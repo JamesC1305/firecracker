@@ -15,7 +15,7 @@ use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::transport::mmio::MmioTransport;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap, GuestMemorySlice};
 
 /// Errors thrown during restoring virtio state.
@@ -68,7 +68,6 @@ pub struct QueueConstructorArgs {
 
 impl Persist<'_> for Queue {
     type State = QueueState;
-    type ConstructorArgs = QueueConstructorArgs;
     type Error = QueueError;
 
     fn save(&self) -> Self::State {
@@ -84,11 +83,12 @@ impl Persist<'_> for Queue {
             num_added: self.num_added,
         }
     }
+}
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
+impl Provision<'_> for Queue {
+    type ProvisionArgs = QueueConstructorArgs;
+
+    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
         let mut queue = Queue {
             max_size: state.max_size,
             size: state.size,
@@ -106,8 +106,8 @@ impl Persist<'_> for Queue {
             uses_notif_suppression: false,
             num_added: state.num_added,
         };
-        if constructor_args.is_activated {
-            queue.initialize(&constructor_args.mem)?;
+        if args.is_activated {
+            queue.initialize(&args.mem)?;
         }
         Ok(queue)
     }
@@ -169,7 +169,7 @@ impl VirtioDeviceState {
             .queues
             .iter()
             .map(|queue_state| {
-                Queue::restore(queue_construction_args.clone(), queue_state)
+                Queue::provision(queue_construction_args.clone(), queue_state)
                     .map(|mut queue| {
                         if uses_notif_suppression {
                             queue.enable_notif_suppression();
@@ -218,7 +218,6 @@ pub struct MmioTransportConstructorArgs {
 
 impl Persist<'_> for MmioTransport {
     type State = MmioTransportState;
-    type ConstructorArgs = MmioTransportConstructorArgs;
     type Error = ();
 
     fn save(&self) -> Self::State {
@@ -231,17 +230,14 @@ impl Persist<'_> for MmioTransport {
             interrupt_status: self.interrupt.irq_status.load(Ordering::SeqCst),
         }
     }
+}
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
-        let mut transport = MmioTransport::new(
-            constructor_args.mem,
-            constructor_args.interrupt,
-            constructor_args.device,
-            constructor_args.is_vhost_user,
-        );
+impl Provision<'_> for MmioTransport {
+    type ProvisionArgs = MmioTransportConstructorArgs;
+
+    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
+        let mut transport =
+            MmioTransport::new(args.mem, args.interrupt, args.device, args.is_vhost_user);
         transport.features_select = state.features_select;
         transport.acked_features_select = state.acked_features_select;
         transport.queue_select = state.queue_select;
@@ -377,7 +373,7 @@ mod tests {
             is_activated: true,
         };
         let restored_state = bitcode::deserialize(&serialized_data).unwrap();
-        let restored_queue = Queue::restore(ca, &restored_state).unwrap();
+        let restored_queue = Queue::provision(ca, &restored_state).unwrap();
 
         assert_eq!(restored_queue, queue);
     }
@@ -425,7 +421,7 @@ mod tests {
         };
         let restored_state = bitcode::deserialize(&serialized_data).unwrap();
         let restored_mmio_transport =
-            MmioTransport::restore(restore_args, &restored_state).unwrap();
+            MmioTransport::provision(restore_args, &restored_state).unwrap();
 
         assert_eq!(restored_mmio_transport, mmio_transport);
     }

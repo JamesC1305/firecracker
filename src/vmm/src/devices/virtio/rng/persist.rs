@@ -11,7 +11,7 @@ use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
 use crate::devices::virtio::rng::{Entropy, EntropyError, RNG_NUM_QUEUES};
 use crate::rate_limiter::RateLimiter;
 use crate::rate_limiter::persist::RateLimiterState;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 use crate::vstate::memory::GuestMemoryMmap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,7 +37,6 @@ pub enum EntropyPersistError {
 
 impl Persist<'_> for Entropy {
     type State = EntropyState;
-    type ConstructorArgs = EntropyConstructorArgs;
     type Error = EntropyPersistError;
 
     fn save(&self) -> Self::State {
@@ -46,19 +45,20 @@ impl Persist<'_> for Entropy {
             rate_limiter_state: self.rate_limiter().save(),
         }
     }
+}
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
+impl Provision<'_> for Entropy {
+    type ProvisionArgs = EntropyConstructorArgs;
+
+    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
         let queues = state.virtio_state.build_queues_checked(
-            &constructor_args.mem,
+            &args.mem,
             VirtioDeviceType::Rng,
             RNG_NUM_QUEUES,
             FIRECRACKER_MAX_QUEUE_SIZE,
         )?;
 
-        let rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)?;
+        let rate_limiter = RateLimiter::provision((), &state.rate_limiter_state)?;
         let mut entropy = Entropy::new_with_queues(queues, rate_limiter)?;
         entropy.set_avail_features(state.virtio_state.avail_features);
         entropy.set_acked_features(state.virtio_state.acked_features);
@@ -85,7 +85,7 @@ mod tests {
         let guest_mem = create_virtio_mem();
         let restored_state = bitcode::deserialize(&serialized_data).unwrap();
         let restored =
-            Entropy::restore(EntropyConstructorArgs { mem: guest_mem }, &restored_state).unwrap();
+            Entropy::provision(EntropyConstructorArgs { mem: guest_mem }, &restored_state).unwrap();
 
         assert_eq!(restored.device_type(), VirtioDeviceType::Rng);
         assert_eq!(restored.id(), ENTROPY_DEV_ID);

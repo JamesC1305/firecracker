@@ -17,7 +17,7 @@ use crate::devices::acpi::generated::vmclock_abi::{
 };
 use crate::devices::legacy::EventFdTrigger;
 use crate::logger::debug;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 use crate::vstate::memory::{GuestMemoryExtension, GuestMemoryMmap};
 use crate::vstate::resources::ResourceAllocator;
 
@@ -168,7 +168,6 @@ pub struct VmClockState {
 
 impl<'a> Persist<'a> for VmClock {
     type State = VmClockState;
-    type ConstructorArgs = ();
     type Error = VmClockError;
 
     fn save(&self) -> Self::State {
@@ -178,8 +177,12 @@ impl<'a> Persist<'a> for VmClock {
             inner: self.inner,
         }
     }
+}
 
-    fn restore(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
+impl<'a> Provision<'a> for VmClock {
+    type ProvisionArgs = ();
+
+    fn provision(_: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
         let interrupt_evt = EventFdTrigger::new(
             EventFd::new(libc::EFD_NONBLOCK).map_err(VmClockError::CreateEventFd)?,
         );
@@ -228,7 +231,7 @@ mod tests {
     use crate::arch;
     use crate::devices::acpi::generated::vmclock_abi::vmclock_abi;
     use crate::devices::acpi::vmclock::{VMCLOCK_SIZE, VmClock};
-    use crate::snapshot::Persist;
+    use crate::snapshot::{Persist, Provision};
     use crate::test_utils::single_region_mem;
     use crate::utils::u64_to_usize;
     use crate::vstate::resources::ResourceAllocator;
@@ -270,7 +273,7 @@ mod tests {
         vmclock.activate(&mem).unwrap();
 
         let state = vmclock.save();
-        let mut vmclock_new = VmClock::restore((), &state).unwrap();
+        let mut vmclock_new = VmClock::provision((), &state).unwrap();
         vmclock_new.do_post_restore(&mem).unwrap();
 
         let guest_data_new: vmclock_abi = mem.read_obj(VMCLOCK_TEST_GUEST_ADDR).unwrap();

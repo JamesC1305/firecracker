@@ -23,22 +23,22 @@ use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::mem::VirtioMem;
-use crate::devices::virtio::mem::persist::{VirtioMemConstructorArgs, VirtioMemState};
+use crate::devices::virtio::mem::persist::{VirtioMemProvisionArgs, VirtioMemState};
 use crate::devices::virtio::net::Net;
-use crate::devices::virtio::net::persist::{NetConstructorArgs, NetState};
+use crate::devices::virtio::net::persist::{NetProvisionArgs, NetState};
 use crate::devices::virtio::persist::{MmioTransportConstructorArgs, MmioTransportState};
 use crate::devices::virtio::pmem::device::Pmem;
-use crate::devices::virtio::pmem::persist::{PmemConstructorArgs, PmemState};
+use crate::devices::virtio::pmem::persist::{PmemProvisionArgs, PmemState};
 use crate::devices::virtio::rng::Entropy;
 use crate::devices::virtio::rng::persist::{EntropyConstructorArgs, EntropyState};
 use crate::devices::virtio::transport::mmio::{IrqTrigger, MmioTransport};
 use crate::devices::virtio::vsock::persist::{
-    VsockConstructorArgs, VsockState, VsockUdsConstructorArgs,
+    VsockProvisionArgs, VsockState, VsockUdsConstructorArgs,
 };
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 use crate::mmds::data_store::MmdsVersion;
 use crate::resources::VmResources;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vm::KvmVm;
@@ -131,7 +131,7 @@ pub struct DeviceStates {
     pub memory_device: Option<VirtioDeviceState<VirtioMemState>>,
 }
 
-pub struct MMIODevManagerConstructorArgs<'a> {
+pub struct MMIODevManagerProvisionArgs<'a> {
     pub mem: &'a GuestMemoryMmap,
     pub vm: &'a Arc<KvmVm>,
     pub event_manager: &'a mut EventManager,
@@ -139,16 +139,16 @@ pub struct MMIODevManagerConstructorArgs<'a> {
     pub instance_id: &'a str,
 }
 
-pub struct MMIOPlatformDevicesConstructorArgs<'a> {
+pub struct MMIOPlatformDevicesProvisionArgs<'a> {
     pub vm: &'a Arc<KvmVm>,
     pub event_manager: &'a mut EventManager,
     pub vm_resources: &'a mut VmResources,
     pub serial_state: Option<&'a SerialState>,
 }
 
-impl fmt::Debug for MMIOPlatformDevicesConstructorArgs<'_> {
+impl fmt::Debug for MMIOPlatformDevicesProvisionArgs<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MMIOPlatformDevicesConstructorArgs")
+        f.debug_struct("MMIOPlatformDevicesProvisionArgs")
             .field("vm", &self.vm)
             .field("event_manager", &"?")
             .field("vm_resources", &self.vm_resources)
@@ -156,9 +156,9 @@ impl fmt::Debug for MMIOPlatformDevicesConstructorArgs<'_> {
     }
 }
 
-impl fmt::Debug for MMIODevManagerConstructorArgs<'_> {
+impl fmt::Debug for MMIODevManagerProvisionArgs<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MMIODevManagerConstructorArgs")
+        f.debug_struct("MMIODevManagerProvisionArgs")
             .field("mem", &self.mem)
             .field("vm", &self.vm)
             .field("event_manager", &"?")
@@ -194,7 +194,6 @@ pub struct MMIOPlatformDevicesState {
 
 impl<'a> Persist<'a> for ACPIDeviceManager {
     type State = ACPIDeviceManagerState;
-    type ConstructorArgs = &'a KvmVm;
     type Error = ACPIDeviceError;
 
     fn save(&self) -> Self::State {
@@ -203,11 +202,15 @@ impl<'a> Persist<'a> for ACPIDeviceManager {
             vmclock: self.vmclock().save(),
         }
     }
+}
 
-    fn restore(vm: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
+impl<'a> Provision<'a> for ACPIDeviceManager {
+    type ProvisionArgs = &'a KvmVm;
+
+    fn provision(vm: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
         let mut acpi_devices = ACPIDeviceManager::new(
-            VmGenId::restore((), &state.vmgenid)?,
-            VmClock::restore((), &state.vmclock)?,
+            VmGenId::provision((), &state.vmgenid)?,
+            VmClock::provision((), &state.vmclock)?,
         );
 
         acpi_devices.replay_gsi_allocations(vm)?;
@@ -224,7 +227,6 @@ impl<'a> Persist<'a> for ACPIDeviceManager {
 
 impl<'a> Persist<'a> for MMIOPlatformDevices {
     type State = MMIOPlatformDevicesState;
-    type ConstructorArgs = MMIOPlatformDevicesConstructorArgs<'a>;
     type Error = DevicePersistError;
 
     fn save(&self) -> Self::State {
@@ -242,11 +244,15 @@ impl<'a> Persist<'a> for MMIOPlatformDevices {
                 .map(|device| device.inner.lock().expect("Poisoned lock").state()),
         }
     }
+}
+
+impl<'a> Provision<'a> for MMIOPlatformDevices {
+    type ProvisionArgs = MMIOPlatformDevicesProvisionArgs<'a>;
 
     #[allow(unused_variables)]
     #[cfg_attr(not(target_arch = "aarch64"), allow(unused_mut))]
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
+    fn provision(
+        constructor_args: Self::ProvisionArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
         let mut platform_devices = MMIOPlatformDevices::new();
@@ -293,7 +299,6 @@ impl<'a> Persist<'a> for MMIOPlatformDevices {
 
 impl<'a> Persist<'a> for MMIOVirtioDevices {
     type State = DeviceStates;
-    type ConstructorArgs = MMIODevManagerConstructorArgs<'a>;
     type Error = DevicePersistError;
 
     fn save(&self) -> Self::State {
@@ -422,9 +427,13 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
         });
         states
     }
+}
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
+impl<'a> Provision<'a> for MMIOVirtioDevices {
+    type ProvisionArgs = MMIODevManagerProvisionArgs<'a>;
+
+    fn provision(
+        constructor_args: Self::ProvisionArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
         let mut dev_manager = MMIOVirtioDevices::new();
@@ -447,7 +456,7 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
                 is_vhost_user,
             };
             let mmio_transport = Arc::new(Mutex::new(
-                MmioTransport::restore(restore_args, state)
+                MmioTransport::provision(restore_args, state)
                     .map_err(|()| DevicePersistError::MmioTransport)?,
             ));
 
@@ -477,7 +486,7 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
         };
 
         if let Some(balloon_state) = &state.balloon_device {
-            let device = Arc::new(Mutex::new(Balloon::restore(
+            let device = Arc::new(Mutex::new(Balloon::provision(
                 BalloonConstructorArgs { mem: mem.clone() },
                 &balloon_state.device_state,
             )?));
@@ -499,7 +508,7 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
         }
 
         for block_state in &state.block_devices {
-            let device = Arc::new(Mutex::new(Block::restore(
+            let device = Arc::new(Mutex::new(Block::provision(
                 BlockConstructorArgs { mem: mem.clone() },
                 &block_state.device_state,
             )?));
@@ -530,8 +539,8 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
         }
 
         for net_state in &state.net_devices {
-            let device = Arc::new(Mutex::new(Net::restore(
-                NetConstructorArgs {
+            let device = Arc::new(Mutex::new(Net::provision(
+                NetProvisionArgs {
                     mem: mem.clone(),
                     mmds: constructor_args
                         .vm_resources
@@ -563,9 +572,10 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
             let ctor_args = VsockUdsConstructorArgs {
                 cid: vsock_state.device_state.frontend.cid,
             };
-            let backend = VsockUnixBackend::restore(ctor_args, &vsock_state.device_state.backend)?;
-            let device = Arc::new(Mutex::new(Vsock::restore(
-                VsockConstructorArgs {
+            let backend =
+                VsockUnixBackend::provision(ctor_args, &vsock_state.device_state.backend)?;
+            let device = Arc::new(Mutex::new(Vsock::provision(
+                VsockProvisionArgs {
                     mem: mem.clone(),
                     backend,
                 },
@@ -591,7 +601,7 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
         if let Some(entropy_state) = &state.entropy_device {
             let ctor_args = EntropyConstructorArgs { mem: mem.clone() };
 
-            let device = Arc::new(Mutex::new(Entropy::restore(
+            let device = Arc::new(Mutex::new(Entropy::provision(
                 ctor_args,
                 &entropy_state.device_state,
             )?));
@@ -613,8 +623,8 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
         }
 
         for pmem_state in &state.pmem_devices {
-            let device = Arc::new(Mutex::new(Pmem::restore(
-                PmemConstructorArgs {
+            let device = Arc::new(Mutex::new(Pmem::provision(
+                PmemProvisionArgs {
                     mem,
                     vm: vm.clone(),
                 },
@@ -639,8 +649,8 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
         }
 
         if let Some(memory_state) = &state.memory_device {
-            let ctor_args = VirtioMemConstructorArgs::new(Arc::clone(vm));
-            let device = VirtioMem::restore(ctor_args, &memory_state.device_state)?;
+            let ctor_args = VirtioMemProvisionArgs::new(Arc::clone(vm));
+            let device = VirtioMem::provision(ctor_args, &memory_state.device_state)?;
 
             constructor_args.vm_resources.memory_hotplug = Some(MemoryHotplugConfig {
                 total_size_mib: device.total_size_mib(),
@@ -781,8 +791,8 @@ mod tests {
         let restore_vm = Arc::new(restore_vm);
         let mut restore_event_manager = EventManager::new().unwrap();
         let mut vm_resources = crate::resources::VmResources::default();
-        let restored = MMIOPlatformDevices::restore(
-            MMIOPlatformDevicesConstructorArgs {
+        let restored = MMIOPlatformDevices::provision(
+            MMIOPlatformDevicesProvisionArgs {
                 vm: &restore_vm,
                 event_manager: &mut restore_event_manager,
                 vm_resources: &mut vm_resources,
@@ -937,14 +947,15 @@ mod tests {
         };
         let vm_resources = &mut VmResources::default();
         let kvm_vm = vmm.vm.as_kvm().unwrap().clone();
-        let restore_args = MMIODevManagerConstructorArgs {
+        let provision_args = MMIODevManagerProvisionArgs {
             mem: kvm_vm.guest_memory(),
             vm: &kvm_vm,
             event_manager: &mut event_manager,
             vm_resources,
             instance_id: "microvm-id",
         };
-        let _restored_dev_manager = MMIOVirtioDevices::restore(restore_args, mmio_state).unwrap();
+        let _restored_dev_manager =
+            MMIOVirtioDevices::provision(provision_args, mmio_state).unwrap();
 
         let expected_vm_resources = format!(
             r#"{{

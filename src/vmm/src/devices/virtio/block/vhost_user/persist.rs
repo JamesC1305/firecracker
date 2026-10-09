@@ -10,7 +10,7 @@ use super::device::VhostUserBlock;
 use crate::devices::virtio::block::CacheType;
 use crate::devices::virtio::block::persist::BlockConstructorArgs;
 use crate::devices::virtio::persist::VirtioDeviceState;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 
 /// vhost-user block device state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,17 +27,17 @@ pub struct VhostUserBlockState {
 
 impl Persist<'_> for VhostUserBlock {
     type State = VhostUserBlockState;
-    type ConstructorArgs = BlockConstructorArgs;
     type Error = VhostUserBlockError;
 
     fn save(&self) -> Self::State {
         unimplemented!("VhostUserBlock does not support snapshotting yet");
     }
+}
 
-    fn restore(
-        _constructor_args: Self::ConstructorArgs,
-        _state: &Self::State,
-    ) -> Result<Self, Self::Error> {
+impl Provision<'_> for VhostUserBlock {
+    type ProvisionArgs = BlockConstructorArgs;
+
+    fn provision(_args: Self::ProvisionArgs, _state: &Self::State) -> Result<Self, Self::Error> {
         Err(VhostUserBlockError::SnapshottingNotSupported)
     }
 }

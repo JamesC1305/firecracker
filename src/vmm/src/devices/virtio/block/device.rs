@@ -16,7 +16,7 @@ use crate::devices::virtio::queue::{InvalidAvailIdx, Queue};
 use crate::devices::virtio::transport::VirtioInterrupt;
 use crate::impl_device_type;
 use crate::rate_limiter::BucketUpdate;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 use crate::vmm_config::drive::BlockDeviceConfig;
 use crate::vstate::memory::GuestMemoryMmap;
 
@@ -247,7 +247,6 @@ impl MutEventSubscriber for Block {
 
 impl Persist<'_> for Block {
     type State = BlockState;
-    type ConstructorArgs = BlockConstructorArgs;
     type Error = BlockError;
 
     fn save(&self) -> Self::State {
@@ -256,18 +255,18 @@ impl Persist<'_> for Block {
             Self::VhostUser(b) => BlockState::VhostUser(b.save()),
         }
     }
+}
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
+impl Provision<'_> for Block {
+    type ProvisionArgs = BlockConstructorArgs;
+
+    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
         match state {
             BlockState::Virtio(s) => Ok(Self::Virtio(
-                VirtioBlock::restore(constructor_args, s).map_err(BlockError::VirtioBackend)?,
+                VirtioBlock::provision(args, s).map_err(BlockError::VirtioBackend)?,
             )),
             BlockState::VhostUser(s) => Ok(Self::VhostUser(
-                VhostUserBlock::restore(constructor_args, s)
-                    .map_err(BlockError::VhostUserBackend)?,
+                VhostUserBlock::provision(args, s).map_err(BlockError::VhostUserBackend)?,
             )),
         }
     }

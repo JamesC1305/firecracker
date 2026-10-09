@@ -11,7 +11,7 @@ use super::*;
 use crate::devices::virtio::device::{DeviceState, VirtioDeviceType};
 use crate::devices::virtio::persist::VirtioDeviceState;
 use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 use crate::vstate::memory::GuestMemoryMmap;
 
 /// The Vsock serializable state.
@@ -45,16 +45,16 @@ pub struct VsockBackendState {
     pub local_port_last: u32,
 }
 
-/// A helper structure that holds the constructor arguments for VsockUnixBackend
+/// Provisioning arguments for a vsock device.
 #[derive(Debug)]
-pub struct VsockConstructorArgs<B> {
+pub struct VsockProvisionArgs<B> {
     /// Pointer to guest memory.
     pub mem: GuestMemoryMmap,
     /// The vsock Unix Backend.
     pub backend: B,
 }
 
-/// A helper structure that holds the constructor arguments for VsockUnixBackend
+/// Provisioning arguments for VsockUnixBackend.
 #[derive(Debug)]
 pub struct VsockUdsConstructorArgs {
     /// cid available in VsockFrontendState.
@@ -63,7 +63,6 @@ pub struct VsockUdsConstructorArgs {
 
 impl Persist<'_> for VsockUnixBackend {
     type State = VsockBackendState;
-    type ConstructorArgs = VsockUdsConstructorArgs;
     type Error = VsockUnixBackendError;
 
     fn save(&self) -> Self::State {
@@ -72,12 +71,13 @@ impl Persist<'_> for VsockUnixBackend {
             local_port_last: self.local_port_last,
         }
     }
+}
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
-        let mut backend = Self::new(constructor_args.cid, state.uds_path.clone())?;
+impl Provision<'_> for VsockUnixBackend {
+    type ProvisionArgs = VsockUdsConstructorArgs;
+
+    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
+        let mut backend = Self::new(args.cid, state.uds_path.clone())?;
         backend.local_port_last = state.local_port_last;
         Ok(backend)
     }
@@ -88,7 +88,6 @@ where
     B: VsockBackend + 'static + Debug,
 {
     type State = VsockFrontendState;
-    type ConstructorArgs = VsockConstructorArgs<B>;
     type Error = VsockError;
 
     fn save(&self) -> Self::State {
@@ -98,22 +97,26 @@ where
             pending_event_ack: self.pending_event_ack,
         }
     }
+}
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
+impl<B> Provision<'_> for Vsock<B>
+where
+    B: VsockBackend + 'static + Debug,
+{
+    type ProvisionArgs = VsockProvisionArgs<B>;
+
+    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
         // Restore queues.
         let queues = state
             .virtio_state
             .build_queues_checked(
-                &constructor_args.mem,
+                &args.mem,
                 VirtioDeviceType::Vsock,
                 defs::VSOCK_NUM_QUEUES,
                 FIRECRACKER_MAX_QUEUE_SIZE,
             )
             .map_err(VsockError::VirtioState)?;
-        let mut vsock = Self::with_queues(state.cid, constructor_args.backend, queues)?;
+        let mut vsock = Self::with_queues(state.cid, args.backend, queues)?;
 
         vsock.acked_features = state.virtio_state.acked_features;
         vsock.avail_features = state.virtio_state.avail_features;
@@ -133,7 +136,6 @@ pub(crate) mod tests {
 
     impl Persist<'_> for TestBackend {
         type State = VsockBackendState;
-        type ConstructorArgs = VsockUdsConstructorArgs;
         type Error = VsockUnixBackendError;
 
         fn save(&self) -> Self::State {
@@ -142,8 +144,12 @@ pub(crate) mod tests {
                 local_port_last: 0xdeadbeef,
             }
         }
+    }
 
-        fn restore(_: Self::ConstructorArgs, _state: &Self::State) -> Result<Self, Self::Error> {
+    impl Provision<'_> for TestBackend {
+        type ProvisionArgs = VsockUdsConstructorArgs;
+
+        fn provision(_: Self::ProvisionArgs, _state: &Self::State) -> Result<Self, Self::Error> {
             Ok(TestBackend::new())
         }
     }
@@ -159,8 +165,8 @@ pub(crate) mod tests {
             let state = ctx.device.save();
             assert_eq!(state.pending_event_ack, armed);
 
-            let restored = Vsock::restore(
-                VsockConstructorArgs {
+            let restored = Vsock::provision(
+                VsockProvisionArgs {
                     mem: ctx.mem.clone(),
                     backend: TestBackend::new(),
                 },
@@ -195,8 +201,8 @@ pub(crate) mod tests {
         let serialized_data = bitcode::serialize(&state).unwrap();
 
         let restored_state: VsockState = bitcode::deserialize(&serialized_data).unwrap();
-        let mut restored_device = Vsock::restore(
-            VsockConstructorArgs {
+        let mut restored_device = Vsock::provision(
+            VsockProvisionArgs {
                 mem: ctx.mem.clone(),
                 backend: {
                     assert_eq!(restored_state.backend.uds_path, "test".to_owned());

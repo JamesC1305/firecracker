@@ -11,7 +11,7 @@ use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDe
 use crate::devices::virtio::pmem::{PMEM_NUM_QUEUES, PMEM_QUEUE_SIZE};
 use crate::rate_limiter::RateLimiter;
 use crate::rate_limiter::persist::RateLimiterState;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 use crate::vmm_config::pmem::PmemConfig;
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vm::{KvmVm, VmError};
@@ -25,7 +25,7 @@ pub struct PmemState {
 }
 
 #[derive(Debug)]
-pub struct PmemConstructorArgs<'a> {
+pub struct PmemProvisionArgs<'a> {
     pub mem: &'a GuestMemoryMmap,
     pub vm: Arc<KvmVm>,
 }
@@ -44,7 +44,6 @@ pub enum PmemPersistError {
 
 impl<'a> Persist<'a> for Pmem {
     type State = PmemState;
-    type ConstructorArgs = PmemConstructorArgs<'a>;
     type Error = PmemPersistError;
 
     fn save(&self) -> Self::State {
@@ -55,26 +54,27 @@ impl<'a> Persist<'a> for Pmem {
             rate_limiter_state: self.rate_limiter.save(),
         }
     }
+}
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
+impl<'a> Provision<'a> for Pmem {
+    type ProvisionArgs = PmemProvisionArgs<'a>;
+
+    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
         let queues = state.virtio_state.build_queues_checked(
-            constructor_args.mem,
+            args.mem,
             VirtioDeviceType::Pmem,
             PMEM_NUM_QUEUES,
             PMEM_QUEUE_SIZE,
         )?;
 
         let mut pmem = Pmem::new_with_queues(
-            constructor_args.vm,
+            args.vm,
             state.config.clone(),
             queues,
             state.virtio_state.acked_features,
             Some(state.config_space),
         )?;
-        pmem.rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)
+        pmem.rate_limiter = RateLimiter::provision((), &state.rate_limiter_state)
             .map_err(PmemPersistError::RateLimiter)?;
 
         Ok(pmem)
@@ -115,8 +115,8 @@ mod tests {
 
         // Restore the block device.
         let restored_state = bitcode::deserialize(&serialized_data).unwrap();
-        let restored_pmem = Pmem::restore(
-            PmemConstructorArgs {
+        let restored_pmem = Pmem::provision(
+            PmemProvisionArgs {
                 mem: &guest_mem,
                 vm: vm.clone(),
             },
@@ -159,8 +159,8 @@ mod tests {
 
         pmem_state.config_space.size += Pmem::ALIGNMENT;
 
-        let err = Pmem::restore(
-            PmemConstructorArgs {
+        let err = Pmem::provision(
+            PmemProvisionArgs {
                 mem: &guest_mem,
                 vm: vm.clone(),
             },

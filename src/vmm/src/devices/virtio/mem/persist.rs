@@ -13,7 +13,7 @@ use crate::devices::virtio::generated::virtio_mem::virtio_mem_config;
 use crate::devices::virtio::mem::{MEM_NUM_QUEUES, VirtioMem, VirtioMemError};
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
 use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 use crate::utils::usize_to_u64;
 use crate::vstate::vm::KvmVm;
 
@@ -30,11 +30,11 @@ pub struct VirtioMemState {
 }
 
 #[derive(Debug)]
-pub struct VirtioMemConstructorArgs {
+pub struct VirtioMemProvisionArgs {
     vm: Arc<KvmVm>,
 }
 
-impl VirtioMemConstructorArgs {
+impl VirtioMemProvisionArgs {
     pub fn new(vm: Arc<KvmVm>) -> Self {
         Self { vm }
     }
@@ -50,7 +50,6 @@ pub enum VirtioMemPersistError {
 
 impl Persist<'_> for VirtioMem {
     type State = VirtioMemState;
-    type ConstructorArgs = VirtioMemConstructorArgs;
     type Error = VirtioMemPersistError;
 
     fn save(&self) -> Self::State {
@@ -65,13 +64,14 @@ impl Persist<'_> for VirtioMem {
             slot_size: self.slot_size,
         }
     }
+}
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
+impl Provision<'_> for VirtioMem {
+    type ProvisionArgs = VirtioMemProvisionArgs;
+
+    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
         let queues = state.virtio_state.build_queues_checked(
-            constructor_args.vm.guest_memory(),
+            args.vm.guest_memory(),
             VirtioDeviceType::Mem,
             MEM_NUM_QUEUES,
             FIRECRACKER_MAX_QUEUE_SIZE,
@@ -89,13 +89,8 @@ impl Persist<'_> for VirtioMem {
             ..Default::default()
         };
 
-        let mut virtio_mem = VirtioMem::from_state(
-            constructor_args.vm,
-            queues,
-            config,
-            state.slot_size,
-            plugged_blocks,
-        )?;
+        let mut virtio_mem =
+            VirtioMem::from_state(args.vm, queues, config, state.slot_size, plugged_blocks)?;
         virtio_mem.set_avail_features(state.virtio_state.avail_features);
         virtio_mem.set_acked_features(state.virtio_state.acked_features);
 
@@ -136,8 +131,8 @@ mod tests {
         // Create a "new" VM for restore
         let vm = setup_vm_with_memory(0x1000);
         let vm = Arc::new(vm);
-        let constructor_args = VirtioMemConstructorArgs::new(vm);
-        let restored_dev = VirtioMem::restore(constructor_args, &state).unwrap();
+        let provision_args = VirtioMemProvisionArgs::new(vm);
+        let restored_dev = VirtioMem::provision(provision_args, &state).unwrap();
 
         assert_eq!(original_dev.config, restored_dev.config);
         assert_eq!(original_dev.slot_size, restored_dev.slot_size);

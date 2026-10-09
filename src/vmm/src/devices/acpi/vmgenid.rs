@@ -10,7 +10,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use super::super::legacy::EventFdTrigger;
 use crate::logger::debug;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 use crate::vstate::memory::{Bytes, GuestMemoryExtension, GuestMemoryMmap};
 use crate::vstate::resources::ResourceAllocator;
 
@@ -134,7 +134,6 @@ pub struct VMGenIDState {
 
 impl<'a> Persist<'a> for VmGenId {
     type State = VMGenIDState;
-    type ConstructorArgs = ();
     type Error = VmGenIdError;
 
     fn save(&self) -> Self::State {
@@ -143,8 +142,12 @@ impl<'a> Persist<'a> for VmGenId {
             addr: self.guest_address.0,
         }
     }
+}
 
-    fn restore(_: Self::ConstructorArgs, state: &Self::State) -> Result<Self, Self::Error> {
+impl<'a> Provision<'a> for VmGenId {
+    type ProvisionArgs = ();
+
+    fn provision(_: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
         Self::from_parts(GuestAddress(state.addr), state.gsi)
     }
 }

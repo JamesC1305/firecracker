@@ -18,7 +18,7 @@ use crate::devices::virtio::generated::virtio_blk::VIRTIO_BLK_F_RO;
 use crate::devices::virtio::persist::VirtioDeviceState;
 use crate::rate_limiter::RateLimiter;
 use crate::rate_limiter::persist::RateLimiterState;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 
 /// Holds info about block's file engine type. Gets saved in snapshot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,7 +68,6 @@ pub struct VirtioBlockState {
 
 impl Persist<'_> for VirtioBlock {
     type State = VirtioBlockState;
-    type ConstructorArgs = BlockConstructorArgs;
     type Error = VirtioBlockError;
 
     fn save(&self) -> Self::State {
@@ -87,13 +86,14 @@ impl Persist<'_> for VirtioBlock {
             discard_sector_alignment: self.config_space.discard_sector_alignment,
         }
     }
+}
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
+impl Provision<'_> for VirtioBlock {
+    type ProvisionArgs = BlockConstructorArgs;
+
+    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
         let is_read_only = state.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0;
-        let rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)
+        let rate_limiter = RateLimiter::provision((), &state.rate_limiter_state)
             .map_err(VirtioBlockError::RateLimiter)?;
 
         let disk_properties = DiskProperties::new(
@@ -107,7 +107,7 @@ impl Persist<'_> for VirtioBlock {
         let queues = state
             .virtio_state
             .build_queues_checked(
-                &constructor_args.mem,
+                &args.mem,
                 VirtioDeviceType::Block,
                 BLOCK_NUM_QUEUES,
                 FIRECRACKER_MAX_QUEUE_SIZE,
@@ -232,7 +232,8 @@ mod tests {
         // Restore the block device.
         let restored_state = bitcode::deserialize(&serialized_data).unwrap();
         let restored_block =
-            VirtioBlock::restore(BlockConstructorArgs { mem: guest_mem }, &restored_state).unwrap();
+            VirtioBlock::provision(BlockConstructorArgs { mem: guest_mem }, &restored_state)
+                .unwrap();
 
         // Test that virtio specific fields are the same.
         assert_eq!(restored_block.device_type(), VirtioDeviceType::Block);
