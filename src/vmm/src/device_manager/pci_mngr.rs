@@ -29,12 +29,12 @@ use crate::devices::virtio::transport::pci::device::{
     CAPABILITY_BAR_SIZE, VirtioPciDevice, VirtioPciDeviceError, VirtioPciDeviceState,
 };
 use crate::devices::virtio::vsock::persist::{VsockProvisionArgs, VsockState};
-use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
+use crate::devices::virtio::vsock::{Vsock, VsockError, VsockUnixBackend};
 use crate::logger::{debug, warn};
 use crate::pci::PciSBDF;
 use crate::pci::bus::PciBusError;
 use crate::resources::VmResources;
-use crate::snapshot::{LoadContext, Persist, Provision, restore};
+use crate::snapshot::{LoadContext, Persist, Provision};
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::bus::BusError;
 use crate::vstate::interrupts::{InterruptError, MsixVectorGroup};
@@ -231,13 +231,12 @@ impl PciDevices {
         Ok(())
     }
 
-    fn restore_pci_device<T: 'static + VirtioDevice + MutEventSubscriber + Debug>(
+    fn create_pci_device<T: 'static + VirtioDevice + MutEventSubscriber + Debug>(
         &mut self,
         vm: &Arc<KvmVm>,
         device: Arc<Mutex<T>>,
         device_id: &str,
         transport_state: &VirtioPciDeviceState,
-        event_manager: &mut EventManager,
     ) -> Result<(), PciManagerError> {
         let device_type = device.lock().expect("Poisoned lock").device_type();
 
@@ -264,21 +263,15 @@ impl PciDevices {
             transport_state.sbdf,
         );
         virtio_device.set_restored_bar_address(transport_state.bar_address);
-        virtio_device.apply_state(transport_state, ())?;
-        virtio_device.post_restore(
-            transport_state,
-            &mut crate::snapshot::LoadContext { event_manager },
-        )?;
         let virtio_device = Arc::new(Mutex::new(virtio_device));
 
-        let device = self.attach_common(
+        self.attach_common(
             vm,
             device_type,
             device_id.to_string(),
             transport_state.sbdf,
             virtio_device,
         )?;
-        Self::subscribe_device(&mut device.lock().expect("Poisoned lock"), event_manager);
 
         Ok(())
     }
@@ -324,6 +317,83 @@ impl PciDevices {
             f(*device_type, &mut *device);
         }
     }
+
+    /// Installs the GSI routes that restoring the devices staged, then enables the unmasked
+    /// MSI-X vectors of every device. Installing the routes after enabling an irqfd can panic
+    /// older AMD/SVM kernels (see kernel commit a80ced6ea514).
+    fn enable_msix_vectors(&self, vm: &KvmVm) -> Result<(), PciManagerError> {
+        if self.virtio_devices.is_empty() {
+            return Ok(());
+        }
+        vm.set_gsi_routes()?;
+        for device in self.virtio_devices.values() {
+            device
+                .lock()
+                .expect("Poisoned lock")
+                .enable_unmasked_vectors()?;
+        }
+        Ok(())
+    }
+
+    fn apply_device_states<'a, D>(
+        &self,
+        states: &[VirtioDeviceState<D::State>],
+        mem: &'a GuestMemoryMmap,
+    ) -> Result<(), DevicePersistError>
+    where
+        D: VirtioDevice + Persist<'a, ApplyArgs = &'a GuestMemoryMmap> + 'static,
+        DevicePersistError: From<D::Error>,
+    {
+        for state in states {
+            let device = self
+                .get_virtio_device(D::const_device_type(), &state.device_id)
+                .expect("snapshot load created a device for each state");
+            let mut transport = device.lock().expect("Poisoned lock");
+            transport
+                .virtio_device()
+                .lock()
+                .expect("Poisoned lock")
+                .as_mut_any()
+                .downcast_mut::<D>()
+                .expect("a device has the type of its state")
+                .apply_state(&state.device_state, mem)?;
+            transport
+                .apply_state(&state.transport_state, ())
+                .map_err(PciManagerError::from)?;
+        }
+        Ok(())
+    }
+
+    fn post_restore_devices<'a, D>(
+        &self,
+        states: &[VirtioDeviceState<D::State>],
+        load: &mut LoadContext<'_>,
+    ) -> Result<(), DevicePersistError>
+    where
+        D: VirtioDevice + Persist<'a> + 'static,
+        DevicePersistError: From<D::Error>,
+    {
+        for state in states {
+            let device = self
+                .get_virtio_device(D::const_device_type(), &state.device_id)
+                .expect("snapshot load created a device for each state");
+            let mut transport = device.lock().expect("Poisoned lock");
+            transport
+                .virtio_device()
+                .lock()
+                .expect("Poisoned lock")
+                .as_mut_any()
+                .downcast_mut::<D>()
+                .expect("a device has the type of its state")
+                .post_restore(&state.device_state, load)?;
+            transport
+                .post_restore(&state.transport_state, load)
+                .map_err(PciManagerError::from)?;
+            // PCI snapshot restore activates the backend before subscribing to its events.
+            Self::subscribe_device(&mut transport, load.event_manager);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,17 +430,14 @@ pub struct PciDevicesState {
 
 pub struct PciDevicesProvisionArgs<'a> {
     pub vm: &'a Arc<KvmVm>,
-    pub mem: &'a GuestMemoryMmap,
     pub vm_resources: &'a mut VmResources,
     pub instance_id: &'a str,
-    pub event_manager: &'a mut EventManager,
 }
 
 impl<'a> Debug for PciDevicesProvisionArgs<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PciDevicesProvisionArgs")
             .field("vm", &self.vm)
-            .field("mem", &self.mem)
             .field("vm_resources", &self.vm_resources)
             .field("instance_id", &self.instance_id)
             .finish()
@@ -379,7 +446,7 @@ impl<'a> Debug for PciDevicesProvisionArgs<'a> {
 
 impl<'a> Persist<'a> for PciDevices {
     type State = PciDevicesState;
-    type ApplyArgs = ();
+    type ApplyArgs = &'a KvmVm;
     type Error = DevicePersistError;
 
     fn save(&self) -> Self::State {
@@ -518,6 +585,36 @@ impl<'a> Persist<'a> for PciDevices {
 
         state
     }
+
+    /// Keeps bus mappings, ioeventfds and interrupt objects, then installs the restored routes
+    /// before enabling unmasked vectors.
+    fn apply_state(&mut self, state: &Self::State, vm: Self::ApplyArgs) -> Result<(), Self::Error> {
+        let mem = vm.guest_memory();
+        self.apply_device_states::<Balloon>(state.balloon_device.as_slice(), mem)?;
+        self.apply_device_states::<Block>(&state.block_devices, mem)?;
+        self.apply_device_states::<Net>(&state.net_devices, mem)?;
+        self.apply_device_states::<Vsock<VsockUnixBackend>>(state.vsock_device.as_slice(), mem)?;
+        self.apply_device_states::<Entropy>(state.entropy_device.as_slice(), mem)?;
+        self.apply_device_states::<Pmem>(&state.pmem_devices, mem)?;
+        self.apply_device_states::<VirtioMem>(state.memory_device.as_slice(), mem)?;
+        self.enable_msix_vectors(vm)?;
+        Ok(())
+    }
+
+    fn post_restore(
+        &mut self,
+        state: &Self::State,
+        load: &mut LoadContext<'_>,
+    ) -> Result<(), Self::Error> {
+        self.post_restore_devices::<Balloon>(state.balloon_device.as_slice(), load)?;
+        self.post_restore_devices::<Block>(state.block_devices.as_slice(), load)?;
+        self.post_restore_devices::<Net>(state.net_devices.as_slice(), load)?;
+        self.post_restore_devices::<Vsock<VsockUnixBackend>>(state.vsock_device.as_slice(), load)?;
+        self.post_restore_devices::<Entropy>(state.entropy_device.as_slice(), load)?;
+        self.post_restore_devices::<Pmem>(state.pmem_devices.as_slice(), load)?;
+        self.post_restore_devices::<VirtioMem>(state.memory_device.as_slice(), load)?;
+        Ok(())
+    }
 }
 
 impl<'a> Provision<'a> for PciDevices {
@@ -527,18 +624,12 @@ impl<'a> Provision<'a> for PciDevices {
         constructor_args: Self::ProvisionArgs,
         state: &Self::State,
     ) -> Result<Self, Self::Error> {
-        let mem = constructor_args.mem;
         let mut pci_devices = PciDevices::new(constructor_args.vm, 0)?;
-        let mut load = LoadContext {
-            event_manager: constructor_args.event_manager,
-        };
 
         if let Some(balloon_state) = &state.balloon_device {
-            let device = Arc::new(Mutex::new(restore::<Balloon>(
+            let device = Arc::new(Mutex::new(Balloon::provision(
                 (),
                 &balloon_state.device_state,
-                mem,
-                &mut load,
             )?));
 
             constructor_args
@@ -546,38 +637,30 @@ impl<'a> Provision<'a> for PciDevices {
                 .balloon
                 .set_device(device.clone());
 
-            pci_devices.restore_pci_device(
+            pci_devices.create_pci_device(
                 constructor_args.vm,
                 device,
                 &balloon_state.device_id,
                 &balloon_state.transport_state,
-                load.event_manager,
             )?
         }
 
         for block_state in &state.block_devices {
-            let device = Arc::new(Mutex::new(restore::<Block>(
-                (),
-                &block_state.device_state,
-                mem,
-                &mut load,
-            )?));
+            let device = Arc::new(Mutex::new(Block::provision((), &block_state.device_state)?));
 
             constructor_args
                 .vm_resources
                 .block
                 .add_virtio_device(device.clone());
 
-            pci_devices.restore_pci_device(
+            pci_devices.create_pci_device(
                 constructor_args.vm,
                 device,
                 &block_state.device_id,
                 &block_state.transport_state,
-                load.event_manager,
             )?
         }
 
-        // Initialize MMDS if MMDS state is included.
         if let Some(mmds) = &state.mmds {
             constructor_args.vm_resources.set_mmds_basic_config(
                 mmds.version,
@@ -596,7 +679,7 @@ impl<'a> Provision<'a> for PciDevices {
         }
 
         for net_state in &state.net_devices {
-            let device = Arc::new(Mutex::new(restore::<Net>(
+            let device = Arc::new(Mutex::new(Net::provision(
                 NetProvisionArgs {
                     mmds: constructor_args
                         .vm_resources
@@ -606,8 +689,6 @@ impl<'a> Provision<'a> for PciDevices {
                         .cloned(),
                 },
                 &net_state.device_state,
-                mem,
-                &mut load,
             )?));
 
             constructor_args
@@ -615,12 +696,11 @@ impl<'a> Provision<'a> for PciDevices {
                 .net_builder
                 .add_device(device.clone());
 
-            pci_devices.restore_pci_device(
+            pci_devices.create_pci_device(
                 constructor_args.vm,
                 device,
                 &net_state.device_id,
                 &net_state.transport_state,
-                load.event_manager,
             )?
         }
 
@@ -628,12 +708,11 @@ impl<'a> Provision<'a> for PciDevices {
             let backend = VsockUnixBackend::provision(
                 vsock_state.device_state.frontend.cid,
                 &vsock_state.device_state.backend,
-            )?;
-            let device = Arc::new(Mutex::new(restore::<Vsock<VsockUnixBackend>>(
+            )
+            .map_err(VsockError::VsockUdsBackend)?;
+            let device = Arc::new(Mutex::new(Vsock::provision(
                 VsockProvisionArgs { backend },
                 &vsock_state.device_state,
-                mem,
-                &mut load,
             )?));
 
             constructor_args
@@ -641,21 +720,18 @@ impl<'a> Provision<'a> for PciDevices {
                 .vsock
                 .set_device(device.clone());
 
-            pci_devices.restore_pci_device(
+            pci_devices.create_pci_device(
                 constructor_args.vm,
                 device,
                 &vsock_state.device_id,
                 &vsock_state.transport_state,
-                load.event_manager,
             )?
         }
 
         if let Some(entropy_state) = &state.entropy_device {
-            let device = Arc::new(Mutex::new(restore::<Entropy>(
+            let device = Arc::new(Mutex::new(Entropy::provision(
                 (),
                 &entropy_state.device_state,
-                mem,
-                &mut load,
             )?));
 
             constructor_args
@@ -663,23 +739,20 @@ impl<'a> Provision<'a> for PciDevices {
                 .entropy
                 .set_device(device.clone());
 
-            pci_devices.restore_pci_device(
+            pci_devices.create_pci_device(
                 constructor_args.vm,
                 device,
                 &entropy_state.device_id,
                 &entropy_state.transport_state,
-                load.event_manager,
             )?
         }
 
         for pmem_state in &state.pmem_devices {
-            let device = Arc::new(Mutex::new(restore::<Pmem>(
+            let device = Arc::new(Mutex::new(Pmem::provision(
                 PmemProvisionArgs {
                     vm: constructor_args.vm.clone(),
                 },
                 &pmem_state.device_state,
-                mem,
-                &mut load,
             )?));
 
             constructor_args
@@ -688,19 +761,17 @@ impl<'a> Provision<'a> for PciDevices {
                 .configs
                 .push(pmem_state.device_state.config.clone());
 
-            pci_devices.restore_pci_device(
+            pci_devices.create_pci_device(
                 constructor_args.vm,
                 device,
                 &pmem_state.device_id,
                 &pmem_state.transport_state,
-                load.event_manager,
             )?
         }
 
         if let Some(memory_device) = &state.memory_device {
             let ctor_args = VirtioMemProvisionArgs::new(Arc::clone(constructor_args.vm));
-            let device =
-                restore::<VirtioMem>(ctor_args, &memory_device.device_state, mem, &mut load)?;
+            let device = VirtioMem::provision(ctor_args, &memory_device.device_state)?;
 
             constructor_args.vm_resources.memory_hotplug = Some(MemoryHotplugConfig {
                 total_size_mib: device.total_size_mib(),
@@ -709,30 +780,12 @@ impl<'a> Provision<'a> for PciDevices {
             });
 
             let arcd_device = Arc::new(Mutex::new(device));
-            pci_devices.restore_pci_device(
+            pci_devices.create_pci_device(
                 constructor_args.vm,
                 arcd_device,
                 &memory_device.device_id,
                 &memory_device.transport_state,
-                load.event_manager,
             )?
-        }
-
-        // After PCI devices are restored, we must set up the GSI routes (one KVM_SET_GSI_ROUTING call for all vectors),
-        // and enable all unmasked vectors (one kvm_irqfd call per vector).
-        // Ordering: routing must be set before IRQFDs to avoid kernel panics on
-        // older AMD/SVM hosts (see kernel commit a80ced6ea514).
-        if !pci_devices.virtio_devices.is_empty() {
-            constructor_args
-                .vm
-                .set_gsi_routes()
-                .map_err(PciManagerError::from)?;
-
-            for pci_device in pci_devices.virtio_devices.values() {
-                let dev = pci_device.lock().expect("Poisoned lock");
-                dev.enable_unmasked_vectors()
-                    .map_err(PciManagerError::from)?;
-            }
         }
 
         Ok(pci_devices)
@@ -872,12 +925,23 @@ mod tests {
         let kvm_vm = vmm.vm.as_kvm().unwrap().clone();
         let provision_args = PciDevicesProvisionArgs {
             vm: &kvm_vm,
-            mem: kvm_vm.guest_memory(),
             vm_resources,
             instance_id: "microvm-id",
-            event_manager: &mut event_manager,
         };
-        let _restored_dev_manager = PciDevices::provision(provision_args, pci_state).unwrap();
+        let restored_dev_manager = crate::snapshot::restore::<PciDevices>(
+            provision_args,
+            pci_state,
+            &kvm_vm,
+            &mut LoadContext {
+                event_manager: &mut event_manager,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            bitcode::serialize(&restored_dev_manager.save()).unwrap(),
+            bitcode::serialize(pci_state).unwrap()
+        );
 
         let expected_vm_resources = format!(
             r#"{{

@@ -769,13 +769,18 @@ impl<'a> Provision<'a> for DeviceManager {
             VirtioDevicesState::Pci(pci_state) => {
                 let pci_ctor_args = PciDevicesProvisionArgs {
                     vm: constructor_args.vm,
-                    mem: constructor_args.mem,
                     vm_resources: constructor_args.vm_resources,
                     instance_id: constructor_args.instance_id,
-                    event_manager: constructor_args.event_manager,
                 };
-                let pci_devices = PciDevices::provision(pci_ctor_args, pci_state)
-                    .map_err(DeviceManagerPersistError::PciRestore)?;
+                let pci_devices = restore::<PciDevices>(
+                    pci_ctor_args,
+                    pci_state,
+                    constructor_args.vm,
+                    &mut LoadContext {
+                        event_manager: constructor_args.event_manager,
+                    },
+                )
+                .map_err(DeviceManagerPersistError::PciRestore)?;
                 VirtioDevices::Pci(pci_devices)
             }
             VirtioDevicesState::Mmio(mmio_state) => {
