@@ -14,6 +14,7 @@ use zerocopy::FromBytes;
 use crate::logger::{debug, error, warn};
 use crate::pci::configuration::PciCapability;
 use crate::pci::{PciCapabilityId, PciSBDF};
+use crate::snapshot::Persist;
 use crate::vstate::interrupts::{InterruptError, MsixVectorGroup};
 use crate::vstate::vm::KvmVm;
 
@@ -63,6 +64,37 @@ pub struct MsixConfigState {
     masked: bool,
     enabled: bool,
     vectors: Vec<u32>,
+}
+
+impl MsixConfigState {
+    /// Validates the saved layout before its host GSI identities are allocated on load.
+    pub fn checked_gsis(&self) -> Result<&[u32], InterruptError> {
+        let num_vectors = self.vectors.len();
+        if num_vectors > MAX_MSIX_VECTORS_PER_DEVICE as usize {
+            return Err(InterruptError::MsixStateSizeMismatch(format!(
+                "vectors length ({num_vectors}) exceeds maximum \
+                 ({MAX_MSIX_VECTORS_PER_DEVICE})"
+            )));
+        }
+
+        let num_table_entries = self.table_entries.len();
+        if num_table_entries != num_vectors {
+            return Err(InterruptError::MsixStateSizeMismatch(format!(
+                "table_entries length ({num_table_entries}) does not match \
+                 vectors length ({num_vectors})"
+            )));
+        }
+
+        let expected_pba_entries = num_vectors.div_ceil(usize::from(BITS_PER_PBA_ENTRY));
+        if self.pba_entries.len() != expected_pba_entries {
+            return Err(InterruptError::MsixStateSizeMismatch(format!(
+                "pba_entries length ({}) does not match expected length \
+                 ({expected_pba_entries}) for {num_vectors} vectors",
+                self.pba_entries.len()
+            )));
+        }
+        Ok(&self.vectors)
+    }
 }
 
 /// MSI-X configuration
@@ -176,7 +208,7 @@ impl MsixConfig {
 
     /// Enable unmasked MSI-X vectors by registering IRQFDs with KVM.
     ///
-    /// Must be called after the GSI routes have been set up (see [KvmVm::set_gsi_routes]).
+    /// Must follow [`crate::vstate::vm::KvmVm::set_gsi_routes`].
     pub fn enable_unmasked_vectors(&self) -> Result<(), InterruptError> {
         if self.enabled && !self.masked {
             for (idx, table_entry) in self.table_entries.iter().enumerate() {
@@ -477,6 +509,43 @@ impl MsixConfig {
     }
 }
 
+impl Persist<'_> for MsixConfig {
+    type State = MsixConfigState;
+    type ApplyArgs = ();
+    type Error = InterruptError;
+
+    fn save(&self) -> Self::State {
+        MsixConfigState {
+            table_entries: self.table_entries.clone(),
+            pba_entries: self.pba_entries.clone(),
+            masked: self.masked,
+            enabled: self.enabled,
+            vectors: self.vectors.save(),
+        }
+    }
+
+    /// Applies guest state and stages routes using the provisioned GSIs and eventfds.
+    /// All IRQFDs remain disabled until the owner calls
+    /// [`crate::vstate::vm::KvmVm::set_gsi_routes`], then [`Self::enable_unmasked_vectors`].
+    /// Pending bits are restored without injecting interrupts.
+    fn apply_state(&mut self, state: &Self::State, _: Self::ApplyArgs) -> Result<(), Self::Error> {
+        state.checked_gsis()?;
+        self.table_entries.clone_from(&state.table_entries);
+        self.pba_entries.clone_from(&state.pba_entries);
+        self.masked = state.masked;
+        self.enabled = state.enabled;
+
+        if self.enabled && !self.masked {
+            for (idx, table_entry) in self.table_entries.iter().enumerate() {
+                if !table_entry.masked() {
+                    self.vectors.register(idx, table_entry, self.sbdf)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 /// PCIe spec revision 6.0: 7.7.2 MSI-X Capability and Table Structure
@@ -596,6 +665,21 @@ mod tests {
         Arc::new(KvmVm::create_msix_group(vmm.vm.as_kvm().unwrap().clone(), nr_vectors).unwrap())
     }
 
+    fn assert_irqfd_registered(group: &MsixVectorGroup, index: usize) {
+        let vector = &group.vectors[index];
+        assert!(vector.enabled.load(Ordering::Acquire));
+        assert_eq!(
+            group
+                .vm
+                .common
+                .fd
+                .register_irqfd(&vector.event_fd, vector.gsi)
+                .unwrap_err()
+                .errno(),
+            libc::EBUSY
+        );
+    }
+
     #[test]
     #[should_panic]
     fn test_too_many_vectors() {
@@ -639,83 +723,82 @@ mod tests {
     }
 
     #[test]
-    fn test_msix_from_state() {
+    fn test_load_stages_routes_before_enabling_vectors() {
         let sbdf = PciSBDF::from(0x42);
 
         // Setting up the original configuration (first vector enabled and unmasked)
         let mut original = MsixConfig::new(msix_vector_group(2), sbdf);
         original.set_msg_ctl(0x8000);
         original.write_table(8, &u64::to_le_bytes(0x0));
+        original.set_pba_bit(1, false);
         assert!(original.enabled);
         assert!(!original.masked);
         assert!(original.vectors.vectors[0].enabled.load(Ordering::Acquire));
 
-        // Restoring from original config
+        let state = original.save();
         let vmm = default_vmm();
-        let restored =
-            MsixConfig::from_state(original.state(), vmm.vm.as_kvm().unwrap().clone(), sbdf)
-                .unwrap();
-        restored.enable_unmasked_vectors().unwrap();
+        let vm = vmm.vm.as_kvm().unwrap().clone();
+        let vectors = Arc::new(
+            MsixVectorGroup::from_gsis(vm.clone(), state.checked_gsis().unwrap()).unwrap(),
+        );
+        let mut restored = MsixConfig::new(vectors.clone(), sbdf);
+        check_metric_after_block!(METRICS.interrupts.triggers, 0, {
+            crate::snapshot::assert_apply_restores(&mut restored, &state, ());
+        });
+        let mut pending = [0; 8];
+        restored.read_pba(0, &mut pending);
+        assert_eq!(u64::from_le_bytes(pending), 0b10);
 
-        // Assert state matches original
-        assert_eq!(original.enabled, restored.enabled);
-        assert_eq!(original.masked, restored.masked);
-        assert_eq!(original.table_entries, restored.table_entries);
-        assert_eq!(original.pba_entries, restored.pba_entries);
-        for idx in [0, 1] {
-            assert_eq!(
-                original.vectors.vectors[idx].gsi,
-                restored.vectors.vectors[idx].gsi,
-            );
-            assert_eq!(
-                original.vectors.vectors[idx]
-                    .enabled
-                    .load(Ordering::Acquire),
-                restored.vectors.vectors[idx]
-                    .enabled
-                    .load(Ordering::Acquire),
-            );
+        for vector in &vectors.vectors {
+            assert!(!vector.enabled.load(Ordering::Acquire));
         }
+        {
+            let routes = vm.common.interrupts.lock().unwrap();
+            assert!(routes.contains_key(&vectors.vectors[0].gsi));
+            assert!(!routes.contains_key(&vectors.vectors[1].gsi));
+        }
+
+        vm.set_gsi_routes().unwrap();
+        restored.enable_unmasked_vectors().unwrap();
+        assert_irqfd_registered(&vectors, 0);
+        assert!(!vectors.vectors[1].enabled.load(Ordering::Acquire));
     }
 
     #[test]
-    fn test_from_state_rejects_size_mismatches() {
+    fn test_apply_state_rejects_size_mismatches() {
         let sbdf = PciSBDF::from(0x42);
-        let vmm = default_vmm();
-        let vm = vmm.vm.as_kvm().unwrap().clone();
-
-        let config = MsixConfig::new(msix_vector_group(2), sbdf);
+        let mut config = MsixConfig::new(msix_vector_group(2), sbdf);
 
         // More table_entries than vectors
-        let mut state = config.state();
+        let mut state = config.save();
         state.table_entries.push(MsixTableEntry::default());
         assert!(matches!(
-            MsixConfig::from_state(state, vm.clone(), sbdf),
+            config.apply_state(&state, ()),
             Err(InterruptError::MsixStateSizeMismatch(_))
         ));
 
         // Fewer table_entries than vectors
-        let mut state = config.state();
+        let mut state = config.save();
         state.table_entries.pop();
         assert!(matches!(
-            MsixConfig::from_state(state, vm.clone(), sbdf),
+            config.apply_state(&state, ()),
             Err(InterruptError::MsixStateSizeMismatch(_))
         ));
 
         // Wrong number of pba_entries
-        let mut state = config.state();
+        let mut state = config.save();
         state.pba_entries.push(0);
         assert!(matches!(
-            MsixConfig::from_state(state, vm.clone(), sbdf),
+            config.apply_state(&state, ()),
             Err(InterruptError::MsixStateSizeMismatch(_))
         ));
 
         // Too many vectors (exceeds MAX_MSIX_VECTORS_PER_DEVICE)
-        let mut state = config.state();
+        let mut state = config.save();
         state.vectors = vec![0; 2049];
         state.table_entries = vec![MsixTableEntry::default(); 2049];
         assert!(matches!(
-            MsixConfig::from_state(state, vm, sbdf),
+            config.apply_state(&state, ()),
             Err(InterruptError::MsixStateSizeMismatch(_))
         ));
     }
