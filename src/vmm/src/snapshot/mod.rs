@@ -35,6 +35,8 @@ use serde::{Deserialize, Serialize};
 use crate::persist::SNAPSHOT_VERSION;
 use crate::snapshot::crc::CRC64Writer;
 #[cfg(test)]
+pub(crate) use crate::snapshot::persist::assert_apply_restores;
+#[cfg(test)]
 pub(crate) use crate::snapshot::persist::restore_for_test;
 pub use crate::snapshot::persist::{LoadContext, Persist, Provision, restore};
 use crate::utils::Version;

@@ -89,3 +89,20 @@ pub(crate) fn restore_for_test<'a, T: Provision<'a>>(
         },
     )
 }
+
+/// Applies `state` to `live` and checks that saving again reproduces `state`, so a saved field
+/// that `apply_state` ignores fails the test. `live` must start out with different values.
+#[cfg(test)]
+pub(crate) fn assert_apply_restores<'a, T>(live: &mut T, state: &T::State, args: T::ApplyArgs)
+where
+    T: Persist<'a>,
+    T::State: serde::Serialize + std::fmt::Debug,
+    T::Error: std::fmt::Debug,
+{
+    live.apply_state(state, args).unwrap();
+    let restored = live.save();
+    assert!(
+        bitcode::serialize(&restored).unwrap() == bitcode::serialize(state).unwrap(),
+        "apply_state did not restore every saved field\nrestored: {restored:?}\n   saved: {state:?}"
+    );
+}

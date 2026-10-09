@@ -26,7 +26,7 @@ use crate::devices::virtio::mem::VirtioMem;
 use crate::devices::virtio::mem::persist::{VirtioMemProvisionArgs, VirtioMemState};
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::net::persist::{NetProvisionArgs, NetState};
-use crate::devices::virtio::persist::{MmioTransportConstructorArgs, MmioTransportState};
+use crate::devices::virtio::persist::MmioTransportState;
 use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::pmem::persist::{PmemProvisionArgs, PmemState};
 use crate::devices::virtio::rng::Entropy;
@@ -464,21 +464,14 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
                                   event_manager: &mut EventManager|
          -> Result<(), Self::Error> {
             let interrupt = Arc::new(IrqTrigger::new());
-            let restore_args = MmioTransportConstructorArgs {
-                mem: mem.clone(),
-                interrupt: interrupt.clone(),
-                device: device.clone(),
+            let mut mmio_transport = MmioTransport::new(
+                mem.clone(),
+                interrupt.clone(),
+                device.clone(),
                 is_vhost_user,
-            };
-            let mmio_transport = Arc::new(Mutex::new(
-                restore::<MmioTransport>(
-                    restore_args,
-                    state,
-                    (),
-                    &mut LoadContext { event_manager },
-                )
-                .map_err(|()| DevicePersistError::MmioTransport)?,
-            ));
+            );
+            mmio_transport.apply_state(state, ()).unwrap();
+            let mmio_transport = Arc::new(Mutex::new(mmio_transport));
 
             vm.resource_allocator()
                 .gsi_legacy_allocator

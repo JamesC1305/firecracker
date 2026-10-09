@@ -3,19 +3,18 @@
 
 //! Defines the structures needed for saving/restoring Virtio primitives.
 
+use std::convert::Infallible;
 use std::num::Wrapping;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
 use super::queue::{InvalidAvailIdx, QueueError};
-use super::transport::mmio::IrqTrigger;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::transport::mmio::MmioTransport;
-use crate::snapshot::{Persist, Provision};
+use crate::snapshot::Persist;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap, GuestMemorySlice};
 
 /// Errors thrown during restoring virtio state.
@@ -57,19 +56,10 @@ pub struct QueueState {
     num_added: Wrapping<u16>,
 }
 
-/// Auxiliary structure for restoring queues.
-#[derive(Debug, Clone)]
-pub struct QueueConstructorArgs {
-    /// Pointer to guest memory.
-    pub mem: GuestMemoryMmap,
-    /// Is device this queue belong to activated
-    pub is_activated: bool,
-}
-
 impl Persist<'_> for Queue {
     type State = QueueState;
     type ApplyArgs = ();
-    type Error = QueueError;
+    type Error = Infallible;
 
     fn save(&self) -> Self::State {
         QueueState {
@@ -84,13 +74,10 @@ impl Persist<'_> for Queue {
             num_added: self.num_added,
         }
     }
-}
 
-impl Provision<'_> for Queue {
-    type ProvisionArgs = QueueConstructorArgs;
-
-    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let mut queue = Queue {
+    /// Applies queue state with unresolved rings; the device initializes activated queues.
+    fn apply_state(&mut self, state: &Self::State, _: Self::ApplyArgs) -> Result<(), Self::Error> {
+        *self = Queue {
             max_size: state.max_size,
             size: state.size,
             ready: state.ready,
@@ -107,10 +94,7 @@ impl Provision<'_> for Queue {
             uses_notif_suppression: false,
             num_added: state.num_added,
         };
-        if args.is_activated {
-            queue.initialize(&args.mem)?;
-        }
-        Ok(queue)
+        Ok(())
     }
 }
 
@@ -162,24 +146,24 @@ impl VirtioDeviceState {
         }
 
         let uses_notif_suppression = (self.acked_features & (1u64 << VIRTIO_RING_F_EVENT_IDX)) != 0;
-        let queue_construction_args = QueueConstructorArgs {
-            mem: mem.clone(),
-            is_activated: self.activated,
-        };
+
         let queues: Vec<Queue> = self
             .queues
             .iter()
             .map(|queue_state| {
-                Queue::provision(queue_construction_args.clone(), queue_state)
-                    .map(|mut queue| {
-                        if uses_notif_suppression {
-                            queue.enable_notif_suppression();
-                        }
-                        queue
-                    })
-                    .map_err(PersistError::QueueConstruction)
+                let mut queue = Queue::new(queue_state.max_size);
+                queue.apply_state(queue_state, ()).unwrap();
+                if self.activated {
+                    queue
+                        .initialize(mem)
+                        .map_err(PersistError::QueueConstruction)?;
+                }
+                if uses_notif_suppression {
+                    queue.enable_notif_suppression();
+                }
+                Ok(queue)
             })
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<_, PersistError>>()?;
 
         for q in &queues {
             // Sanity check queue size and queue max size.
@@ -188,6 +172,40 @@ impl VirtioDeviceState {
             }
         }
         Ok(queues)
+    }
+
+    /// Checks and applies saved features and queues without changing the device's activation.
+    /// All queues must have the device's maximum size. Rings are resolved only when the saved
+    /// state is activated.
+    pub fn apply_to(
+        &self,
+        device: &mut dyn VirtioDevice,
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), PersistError> {
+        let queues = device.queues();
+        let max_size = queues.first().map_or(0, |queue| queue.max_size);
+        if self.device_type != device.device_type()
+            || (self.acked_features & !self.avail_features) != 0
+            || self.queues.len() != queues.len()
+            || self.queues.iter().any(|queue| queue.max_size != max_size)
+        {
+            return Err(PersistError::InvalidInput);
+        }
+
+        let uses_notif_suppression = (self.acked_features & (1u64 << VIRTIO_RING_F_EVENT_IDX)) != 0;
+        for (queue, state) in device.queues_mut().iter_mut().zip(&self.queues) {
+            queue.apply_state(state, ()).unwrap();
+            if self.activated {
+                queue
+                    .initialize(mem)
+                    .map_err(PersistError::QueueConstruction)?;
+            }
+            if uses_notif_suppression {
+                queue.enable_notif_suppression();
+            }
+        }
+        device.set_acked_features(self.acked_features);
+        Ok(())
     }
 }
 
@@ -204,23 +222,10 @@ pub struct MmioTransportState {
     interrupt_status: u32,
 }
 
-/// Auxiliary structure for initializing the transport when resuming from a snapshot.
-#[derive(Debug)]
-pub struct MmioTransportConstructorArgs {
-    /// Pointer to guest memory.
-    pub mem: GuestMemoryMmap,
-    /// Interrupt to use for the device
-    pub interrupt: Arc<IrqTrigger>,
-    /// Device associated with the current MMIO state.
-    pub device: Arc<Mutex<dyn VirtioDevice>>,
-    /// Is device backed by vhost-user.
-    pub is_vhost_user: bool,
-}
-
 impl Persist<'_> for MmioTransport {
     type State = MmioTransportState;
     type ApplyArgs = ();
-    type Error = ();
+    type Error = Infallible;
 
     fn save(&self) -> Self::State {
         MmioTransportState {
@@ -232,29 +237,25 @@ impl Persist<'_> for MmioTransport {
             interrupt_status: self.interrupt.irq_status.load(Ordering::SeqCst),
         }
     }
-}
 
-impl Provision<'_> for MmioTransport {
-    type ProvisionArgs = MmioTransportConstructorArgs;
-
-    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let mut transport =
-            MmioTransport::new(args.mem, args.interrupt, args.device, args.is_vhost_user);
-        transport.features_select = state.features_select;
-        transport.acked_features_select = state.acked_features_select;
-        transport.queue_select = state.queue_select;
-        transport.device_status = state.device_status;
-        transport.config_generation = state.config_generation;
-        transport
-            .interrupt
+    /// Applies the register values of `state`, keeping the device and its interrupt.
+    fn apply_state(&mut self, state: &Self::State, _: Self::ApplyArgs) -> Result<(), Self::Error> {
+        self.features_select = state.features_select;
+        self.acked_features_select = state.acked_features_select;
+        self.queue_select = state.queue_select;
+        self.device_status = state.device_status;
+        self.config_generation = state.config_generation;
+        self.interrupt
             .irq_status
             .store(state.interrupt_status, Ordering::SeqCst);
-        Ok(transport)
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -264,98 +265,143 @@ mod tests {
     use crate::devices::virtio::net::Net;
     use crate::devices::virtio::net::test_utils::default_net;
     use crate::devices::virtio::test_utils::default_mem;
+    use crate::devices::virtio::transport::mmio::IrqTrigger;
     use crate::devices::virtio::transport::mmio::tests::DummyDevice;
     use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
+    use crate::snapshot::assert_apply_restores;
+    use crate::vmm_config::machine_config::HugePageConfig;
+    use crate::vstate::memory::anonymous;
+    use crate::vstate::memory::test_utils::into_region_ext;
 
-    const DEFAULT_QUEUE_MAX_SIZE: u16 = 256;
-    impl Default for QueueState {
-        fn default() -> QueueState {
-            QueueState {
-                max_size: DEFAULT_QUEUE_MAX_SIZE,
-                size: DEFAULT_QUEUE_MAX_SIZE,
-                ready: false,
-                desc_table: 0,
-                avail_ring: 0,
-                used_ring: 0,
-                next_avail: Wrapping(0),
-                next_used: Wrapping(0),
-                num_added: Wrapping(0),
-            }
+    #[test]
+    fn test_virtio_state_apply() {
+        let mem = into_region_ext(
+            anonymous(&[(GuestAddress(0), 0x10_000)], true, HugePageConfig::None).unwrap(),
+        );
+        let mut device = DummyDevice::new();
+        // Real devices give all their queues the same maximum size.
+        device.queues_mut()[1] = Queue::new(16);
+        let event_idx = 1u64 << VIRTIO_RING_F_EVENT_IDX;
+        device.set_avail_features(event_idx);
+        for (queue, ring) in device.queues_mut().iter_mut().zip([0x1000, 0x4000]) {
+            queue.size = queue.max_size;
+            queue.ready = true;
+            queue.desc_table_address = GuestAddress(ring);
+            queue.avail_ring_address = GuestAddress(ring + 0x1000);
+            queue.used_ring_address = GuestAddress(ring + 0x2000);
+        }
+        let mut state = VirtioDeviceState::from_device(&device);
+        state.activated = true;
+        state.acked_features = event_idx;
+        state.queues[0].next_avail = Wrapping(7);
+        state.queues[0].next_used = Wrapping(5);
+        let serialized_data = bitcode::serialize(&state).unwrap();
+        let mut state: VirtioDeviceState = bitcode::deserialize(&serialized_data).unwrap();
+        for queue in device.queues_mut() {
+            *queue = Queue::new(16);
+        }
+
+        state.apply_to(&mut device, &mem).unwrap();
+
+        assert!(!device.is_activated());
+        device
+            .activate(mem.clone(), Arc::new(IrqTrigger::new()))
+            .unwrap();
+
+        assert_eq!(VirtioDeviceState::from_device(&device), state);
+        assert!(device.queues()[0].uses_notif_suppression);
+
+        // Inactive saved queues remain unresolved.
+        state.activated = false;
+        state.acked_features = 0;
+        state.queues[0].size = 0;
+        state.queues[0].avail_ring = u64::MAX;
+        let mut device = DummyDevice::new();
+        device.queues_mut()[1] = Queue::new(16);
+        state.apply_to(&mut device, &mem).unwrap();
+        assert!(!device.is_activated());
+        assert_eq!(device.acked_features(), 0);
+        for (queue, saved) in device.queues().iter().zip(&state.queues) {
+            assert_eq!(queue.save(), *saved);
+            assert_eq!(queue.desc_table, GuestMemorySlice::UNRESOLVED);
+            assert_eq!(queue.avail_ring, GuestMemorySlice::UNRESOLVED);
+            assert_eq!(queue.used_ring, GuestMemorySlice::UNRESOLVED);
+            assert!(!queue.uses_notif_suppression);
         }
     }
 
     #[test]
+    fn test_mmio_transport_apply() {
+        let device: Arc<Mutex<dyn VirtioDevice>> = Arc::new(Mutex::new(DummyDevice::new()));
+        let interrupt = Arc::new(IrqTrigger::new());
+        let mut transport =
+            MmioTransport::new(default_mem(), interrupt.clone(), device.clone(), false);
+        let mut state = transport.save();
+        state.features_select = 1;
+        state.acked_features_select = 1;
+        state.queue_select = 1;
+        state.device_status = 0xf;
+        state.config_generation = 17;
+        state.interrupt_status = 3;
+        let serialized_data = bitcode::serialize(&state).unwrap();
+        let state = bitcode::deserialize(&serialized_data).unwrap();
+
+        assert_apply_restores(&mut transport, &state, ());
+        assert!(Arc::ptr_eq(&transport.device(), &device));
+        assert!(Arc::ptr_eq(&transport.interrupt, &interrupt));
+    }
+
+    #[test]
     fn test_virtiodev_sanity_checks() {
-        let max_size = DEFAULT_QUEUE_MAX_SIZE;
-        let mut state = VirtioDeviceState {
-            device_type: VirtioDeviceType::Net,
-            avail_features: 0,
-            acked_features: 0,
-            queues: vec![],
-            activated: false,
-        };
         let mem = default_mem();
-        // Valid checks.
-        state
-            .build_queues_checked(&mem, VirtioDeviceType::Net, 0, max_size)
-            .unwrap();
-        // Invalid dev-type.
-        state
-            .build_queues_checked(&mem, VirtioDeviceType::Block, 0, max_size)
-            .unwrap_err();
-        // Invalid num-queues.
-        state
-            .build_queues_checked(&mem, VirtioDeviceType::Net, 1, max_size)
-            .unwrap_err();
-        // Unavailable features acked.
-        state.acked_features = 1;
-        state
-            .build_queues_checked(&mem, VirtioDeviceType::Net, 0, max_size)
-            .unwrap_err();
+        let mut device = DummyDevice::new();
+        let max_size = device.queues()[0].max_size;
+        device.queues_mut()[1] = Queue::new(max_size);
+        let state = VirtioDeviceState::from_device(&device);
 
-        // Validate queue sanity checks.
-        let mut state = VirtioDeviceState {
-            device_type: VirtioDeviceType::Net,
-            avail_features: 0,
-            acked_features: 0,
-            queues: vec![],
-            activated: false,
-        };
-        let good_q = QueueState::default();
-        state.queues = vec![good_q];
-        // Valid.
-        state
-            .build_queues_checked(&mem, VirtioDeviceType::Net, state.queues.len(), max_size)
-            .unwrap();
+        let mut invalid = state.clone();
+        invalid.device_type = VirtioDeviceType::Net;
+        assert!(matches!(
+            invalid.apply_to(&mut device, &mem),
+            Err(PersistError::InvalidInput)
+        ));
 
-        // Invalid max queue size.
-        let bad_q = QueueState {
-            max_size: max_size + 1,
-            ..Default::default()
-        };
-        state.queues = vec![bad_q];
-        state
-            .build_queues_checked(&mem, VirtioDeviceType::Net, state.queues.len(), max_size)
-            .unwrap_err();
+        let mut invalid = state.clone();
+        invalid.queues.pop();
+        assert!(matches!(
+            invalid.apply_to(&mut device, &mem),
+            Err(PersistError::InvalidInput)
+        ));
 
-        // Invalid: size > max.
-        let bad_q = QueueState {
-            size: max_size + 1,
-            ..Default::default()
-        };
-        state.queues = vec![bad_q];
-        state.activated = true;
-        state
-            .build_queues_checked(&mem, VirtioDeviceType::Net, state.queues.len(), max_size)
-            .unwrap_err();
+        let mut invalid = state.clone();
+        invalid.acked_features = 1;
+        assert!(matches!(
+            invalid.apply_to(&mut device, &mem),
+            Err(PersistError::InvalidInput)
+        ));
 
-        // activated && !q.is_valid()
-        let bad_q = QueueState::default();
-        state.queues = vec![bad_q];
-        state.activated = true;
-        state
-            .build_queues_checked(&mem, VirtioDeviceType::Net, state.queues.len(), max_size)
-            .unwrap_err();
+        let mut invalid = state.clone();
+        invalid.queues[0].max_size = max_size + 1;
+        assert!(matches!(
+            invalid.apply_to(&mut device, &mem),
+            Err(PersistError::InvalidInput)
+        ));
+
+        let mut invalid = state.clone();
+        invalid.activated = true;
+        invalid.queues[0].ready = true;
+        invalid.queues[0].size = max_size + 1;
+        assert!(matches!(
+            invalid.apply_to(&mut device, &mem),
+            Err(PersistError::QueueConstruction(QueueError::InvalidSize(_)))
+        ));
+
+        let mut invalid = state;
+        invalid.activated = true;
+        assert!(matches!(
+            invalid.apply_to(&mut device, &mem),
+            Err(PersistError::QueueConstruction(QueueError::NotReady))
+        ));
     }
 
     #[test]
@@ -364,18 +410,27 @@ mod tests {
 
         let mut queue = Queue::new(128);
         queue.ready = true;
-        queue.size = queue.max_size;
+        queue.size = 64;
+        queue.desc_table_address = GuestAddress(0x1000);
+        queue.avail_ring_address = GuestAddress(0x2000);
+        queue.used_ring_address = GuestAddress(0x3000);
+        queue.next_avail = Wrapping(7);
+        queue.next_used = Wrapping(5);
+        queue.num_added = Wrapping(2);
         queue.initialize(&mem).unwrap();
 
         let queue_state = queue.save();
         let serialized_data = bitcode::serialize(&queue_state).unwrap();
 
-        let ca = QueueConstructorArgs {
-            mem,
-            is_activated: true,
-        };
         let restored_state = bitcode::deserialize(&serialized_data).unwrap();
-        let restored_queue = Queue::provision(ca, &restored_state).unwrap();
+        let mut restored_queue = Queue::new(16);
+        assert_apply_restores(&mut restored_queue, &restored_state, ());
+
+        assert_eq!(restored_queue.desc_table, GuestMemorySlice::UNRESOLVED);
+        assert_eq!(restored_queue.avail_ring, GuestMemorySlice::UNRESOLVED);
+        assert_eq!(restored_queue.used_ring, GuestMemorySlice::UNRESOLVED);
+        assert!(!restored_queue.uses_notif_suppression);
+        restored_queue.initialize(&mem).unwrap();
 
         assert_eq!(restored_queue, queue);
     }
@@ -415,17 +470,16 @@ mod tests {
         let transport_state = mmio_transport.save();
         let serialized_data = bitcode::serialize(&transport_state).unwrap();
 
-        let restore_args = MmioTransportConstructorArgs {
-            mem,
-            interrupt,
-            device,
-            is_vhost_user: false,
-        };
+        let mut restored_mmio_transport =
+            MmioTransport::new(mem, interrupt.clone(), device.clone(), false);
         let restored_state = bitcode::deserialize(&serialized_data).unwrap();
-        let restored_mmio_transport =
-            MmioTransport::provision(restore_args, &restored_state).unwrap();
+        restored_mmio_transport
+            .apply_state(&restored_state, ())
+            .unwrap();
 
         assert_eq!(restored_mmio_transport, mmio_transport);
+        assert!(Arc::ptr_eq(&restored_mmio_transport.device(), &device));
+        assert!(Arc::ptr_eq(&restored_mmio_transport.interrupt, &interrupt));
     }
 
     fn create_default_block() -> (
