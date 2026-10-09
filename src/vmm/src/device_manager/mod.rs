@@ -782,12 +782,18 @@ impl<'a> Provision<'a> for DeviceManager {
                 let mmio_ctor_args = MMIODevManagerProvisionArgs {
                     mem: constructor_args.mem,
                     vm: constructor_args.vm,
-                    event_manager: constructor_args.event_manager,
                     vm_resources: constructor_args.vm_resources,
                     instance_id: constructor_args.instance_id,
                 };
-                let mmio_virtio_devices = MMIOVirtioDevices::provision(mmio_ctor_args, mmio_state)
-                    .map_err(DeviceManagerPersistError::MmioRestore)?;
+                let mmio_virtio_devices = restore::<MMIOVirtioDevices>(
+                    mmio_ctor_args,
+                    mmio_state,
+                    constructor_args.mem,
+                    &mut LoadContext {
+                        event_manager: constructor_args.event_manager,
+                    },
+                )
+                .map_err(DeviceManagerPersistError::MmioRestore)?;
                 VirtioDevices::Mmio(mmio_virtio_devices)
             }
         };
