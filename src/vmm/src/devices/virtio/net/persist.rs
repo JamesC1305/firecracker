@@ -93,9 +93,10 @@ impl Provision<'_> for Net {
     type ProvisionArgs = NetProvisionArgs;
 
     fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        // RateLimiter::provision() can fail at creating a timerfd.
-        let rx_rate_limiter = RateLimiter::provision((), &state.rx_rate_limiter_state)?;
-        let tx_rate_limiter = RateLimiter::provision((), &state.tx_rate_limiter_state)?;
+        let mut rx_rate_limiter = RateLimiter::default();
+        rx_rate_limiter.apply_state(&state.rx_rate_limiter_state, ())?;
+        let mut tx_rate_limiter = RateLimiter::default();
+        tx_rate_limiter.apply_state(&state.tx_rate_limiter_state, ())?;
         let mut net = Net::new(
             state.id.clone(),
             &state.tap_if_name,

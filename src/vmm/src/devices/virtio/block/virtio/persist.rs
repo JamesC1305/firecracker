@@ -94,7 +94,9 @@ impl Provision<'_> for VirtioBlock {
 
     fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
         let is_read_only = state.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0;
-        let rate_limiter = RateLimiter::provision((), &state.rate_limiter_state)
+        let mut rate_limiter = RateLimiter::default();
+        rate_limiter
+            .apply_state(&state.rate_limiter_state, ())
             .map_err(VirtioBlockError::RateLimiter)?;
 
         let disk_properties = DiskProperties::new(

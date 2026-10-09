@@ -59,7 +59,8 @@ impl Provision<'_> for Entropy {
             FIRECRACKER_MAX_QUEUE_SIZE,
         )?;
 
-        let rate_limiter = RateLimiter::provision((), &state.rate_limiter_state)?;
+        let mut rate_limiter = RateLimiter::default();
+        rate_limiter.apply_state(&state.rate_limiter_state, ())?;
         let mut entropy = Entropy::new_with_queues(queues, rate_limiter)?;
         entropy.set_avail_features(state.virtio_state.avail_features);
         entropy.set_acked_features(state.virtio_state.acked_features);

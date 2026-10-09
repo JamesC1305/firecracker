@@ -17,7 +17,10 @@ impl std::fmt::Debug for LoadContext<'_> {
     }
 }
 
-/// The snapshot lifecycle of a device or a component made of devices.
+/// Saving and applying the snapshot state of a device or component.
+///
+/// Components constructed by their owner need only this trait. Components with snapshot-specific
+/// construction also implement [`Provision`].
 pub trait Persist<'a>: Sized {
     /// The type of the object representing the state of the component.
     type State;

@@ -9,7 +9,6 @@ use super::device::{ConfigSpace, Pmem, PmemError};
 use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
 use crate::devices::virtio::pmem::{PMEM_NUM_QUEUES, PMEM_QUEUE_SIZE};
-use crate::rate_limiter::RateLimiter;
 use crate::rate_limiter::persist::RateLimiterState;
 use crate::snapshot::{Persist, Provision};
 use crate::vmm_config::pmem::PmemConfig;
@@ -75,7 +74,8 @@ impl<'a> Provision<'a> for Pmem {
             state.virtio_state.acked_features,
             Some(state.config_space),
         )?;
-        pmem.rate_limiter = RateLimiter::provision((), &state.rate_limiter_state)
+        pmem.rate_limiter
+            .apply_state(&state.rate_limiter_state, ())
             .map_err(PmemPersistError::RateLimiter)?;
 
         Ok(pmem)
