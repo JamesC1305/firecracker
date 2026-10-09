@@ -6,13 +6,10 @@
 use std::fmt::{self, Debug};
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_arch = "aarch64")]
-use event_manager::SubscriberOps;
 use serde::{Deserialize, Serialize};
 
 use super::acpi::ACPIDeviceManager;
 use super::mmio::*;
-use crate::EventManager;
 use crate::device_manager::DevicePersistError;
 use crate::device_manager::acpi::ACPIDeviceError;
 use crate::devices::acpi::vmclock::{VmClock, VmClockState};
@@ -140,16 +137,13 @@ pub struct MMIODevManagerProvisionArgs<'a> {
 
 pub struct MMIOPlatformDevicesProvisionArgs<'a> {
     pub vm: &'a Arc<KvmVm>,
-    pub event_manager: &'a mut EventManager,
     pub vm_resources: &'a mut VmResources,
-    pub serial_state: Option<&'a SerialState>,
 }
 
 impl fmt::Debug for MMIOPlatformDevicesProvisionArgs<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MMIOPlatformDevicesProvisionArgs")
             .field("vm", &self.vm)
-            .field("event_manager", &"?")
             .field("vm_resources", &self.vm_resources)
             .finish()
     }
@@ -266,6 +260,20 @@ impl<'a> Persist<'a> for MMIOPlatformDevices {
         }
         Ok(())
     }
+
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+    fn post_restore(
+        &mut self,
+        _state: &Self::State,
+        load: &mut LoadContext<'_>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(target_arch = "aarch64")]
+        if let Some(serial) = &self.serial {
+            use event_manager::SubscriberOps;
+            load.event_manager.add_subscriber(serial.inner.clone());
+        }
+        Ok(())
+    }
 }
 
 impl<'a> Provision<'a> for MMIOPlatformDevices {
@@ -282,15 +290,10 @@ impl<'a> Provision<'a> for MMIOPlatformDevices {
         #[cfg(target_arch = "aarch64")]
         {
             if let Some(device_info) = state.serial {
-                let serial_state = constructor_args.serial_state.map(Into::into);
                 let serial = crate::DeviceManager::setup_serial_device(
                     constructor_args.vm_resources.serial_out_path.as_ref(),
-                    serial_state.as_ref(),
                     constructor_args.vm_resources.serial_rate_limiter(),
                 )?;
-                constructor_args
-                    .event_manager
-                    .add_subscriber(serial.clone());
 
                 platform_devices.register_mmio_serial(
                     constructor_args.vm,
@@ -841,9 +844,7 @@ mod tests {
         let mut restored = MMIOPlatformDevices::provision(
             MMIOPlatformDevicesProvisionArgs {
                 vm: &restore_vm,
-                event_manager: &mut restore_event_manager,
                 vm_resources: &mut vm_resources,
-                serial_state: None,
             },
             &state,
         )
@@ -860,6 +861,14 @@ mod tests {
             PL061State::default()
         );
         restored.apply_state(&state, ()).unwrap();
+        restored
+            .post_restore(
+                &state,
+                &mut LoadContext {
+                    event_manager: &mut restore_event_manager,
+                },
+            )
+            .unwrap();
 
         assert!(restored.serial.is_none());
         assert_eq!(
@@ -1222,11 +1231,26 @@ mod tests {
             &mut event_manager,
             EntropyDeviceConfig::default(),
         );
+        let state = vmm.device_manager.save();
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut serial = vmm
+                .device_manager
+                .legacy_devices
+                .as_ref()
+                .unwrap()
+                .stdio_serial
+                .lock()
+                .expect("Poisoned lock");
+            let mut live_state = serial.save();
+            live_state.scratch = 123;
+            live_state.in_buffer = vec![1, 2, 3];
+            serial.apply_state(&live_state, ()).unwrap();
+        }
         let device_manager::VirtioDevices::Mmio(devices) = &mut vmm.device_manager.virtio_devices
         else {
             panic!("expected the MMIO transport");
         };
-        let state = devices.save();
 
         // Give the target different features and selectors to detect ignored saved fields.
         for device in devices.virtio_devices.values() {
@@ -1238,10 +1262,20 @@ mod tests {
             transport.write(0, 0x30, &1u32.to_le_bytes());
         }
 
-        crate::snapshot::assert_apply_restores(
-            devices,
-            &state,
-            vmm.vm.as_kvm().unwrap().guest_memory(),
+        vmm.device_manager
+            .apply_state(&state, vmm.vm.as_kvm().unwrap())
+            .unwrap();
+        let mut applied = vmm.device_manager.save();
+        // ACPI publishes a new generation; its transition is checked by the ACPI tests.
+        applied.acpi_state.vmclock.inner.seq_count = state.acpi_state.vmclock.inner.seq_count;
+        applied.acpi_state.vmclock.inner.disruption_marker =
+            state.acpi_state.vmclock.inner.disruption_marker;
+        applied.acpi_state.vmclock.inner.vm_generation_counter =
+            state.acpi_state.vmclock.inner.vm_generation_counter;
+        assert_eq!(
+            bitcode::serialize(&applied).unwrap(),
+            bitcode::serialize(&state).unwrap(),
+            "applied: {applied:?}\nsaved: {state:?}"
         );
     }
 }

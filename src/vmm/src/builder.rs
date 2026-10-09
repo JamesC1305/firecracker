@@ -45,7 +45,6 @@ use crate::logger::warn;
 use crate::persist::{MicrovmState, MicrovmStateError};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
-use crate::snapshot::Provision;
 use crate::utils::{u32_mib_to_bytes, u64_to_usize};
 use crate::vmm_config::boot_source::{
     DEFAULT_KERNEL_CMDLINE, append_root_device_cmdline, build_cmdline,
@@ -543,17 +542,20 @@ pub fn build_microvm_from_snapshot(
     // Restoring VMGenID injects an interrupt in the guest to notify it about the new generation
     // ID. As a result, we need to restore DeviceManager after restoring the KVM state, otherwise
     // the injected interrupt will be overwritten.
-    let device_ctor_args = DeviceProvisionArgs {
+    let device_provision_args = DeviceProvisionArgs {
         mem: kvm_vm.guest_memory(),
         vm: &kvm_vm,
-        event_manager,
         vm_resources,
         instance_id: &instance_info.id,
         vcpus_exit_evt: kvm_vm.vcpus_exit_evt(),
     };
     #[allow(unused_mut)]
-    let mut device_manager =
-        DeviceManager::provision(device_ctor_args, &microvm_state.device_states)?;
+    let mut device_manager = crate::snapshot::restore::<DeviceManager>(
+        device_provision_args,
+        &microvm_state.device_states,
+        &kvm_vm,
+        &mut crate::snapshot::LoadContext { event_manager },
+    )?;
 
     let vmm = Vmm {
         instance_info: instance_info.clone(),
