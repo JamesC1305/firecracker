@@ -10,7 +10,6 @@ use vmm_sys_util::eventfd::EventFd;
 use crate::logger::{IncMetric, METRICS, error};
 use crate::pci::PciSBDF;
 use crate::pci::msix::MsixTableEntry;
-use crate::snapshot::Persist;
 use crate::vstate::vm::KvmVm;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -222,37 +221,29 @@ impl Drop for MsixVectorGroup {
     }
 }
 
-impl<'a> Persist<'a> for MsixVectorGroup {
-    type State = Vec<u32>;
-    type ConstructorArgs = Arc<KvmVm>;
-    type Error = InterruptError;
-
-    fn save(&self) -> Self::State {
+impl MsixVectorGroup {
+    /// Saves the host GSI identities needed to construct this group on snapshot load.
+    pub fn save(&self) -> Vec<u32> {
         // We don't save the "enabled" state of the MSI interrupt. PCI devices store the MSI-X
         // configuration and make sure that the vector is enabled during the restore path if it was
         // initially enabled
         self.vectors.iter().map(|route| route.gsi).collect()
     }
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
-        state: &Self::State,
-    ) -> Result<Self, Self::Error> {
+    /// Allocates saved host GSIs and fresh, disabled eventfds for snapshot load.
+    pub fn from_gsis(vm: Arc<KvmVm>, state: &[u32]) -> Result<Self, InterruptError> {
         let mut vectors = Vec::with_capacity(state.len());
 
         {
             // Replay the GSI allocations rather than trusting the serialized allocator state.
             // This validates the snapshot is not malformed, containing doubly allocated GSI IDs
-            let mut resource_allocator = constructor_args.resource_allocator();
+            let mut resource_allocator = vm.resource_allocator();
             for gsi in state {
                 resource_allocator.gsi_msi_allocator.allocate_id_at(*gsi)?;
                 vectors.push(MsixVector::new(*gsi, false)?);
             }
         }
 
-        Ok(MsixVectorGroup {
-            vm: constructor_args,
-            vectors,
-        })
+        Ok(MsixVectorGroup { vm, vectors })
     }
 }

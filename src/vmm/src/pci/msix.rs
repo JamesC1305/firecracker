@@ -14,7 +14,6 @@ use zerocopy::FromBytes;
 use crate::logger::{debug, error, warn};
 use crate::pci::configuration::PciCapability;
 use crate::pci::{PciCapabilityId, PciSBDF};
-use crate::snapshot::Persist;
 use crate::vstate::interrupts::{InterruptError, MsixVectorGroup};
 use crate::vstate::vm::KvmVm;
 
@@ -152,7 +151,7 @@ impl MsixConfig {
             )));
         }
 
-        let vectors = Arc::new(MsixVectorGroup::restore(vm, &state.vectors)?);
+        let vectors = Arc::new(MsixVectorGroup::from_gsis(vm, &state.vectors)?);
         if state.enabled && !state.masked {
             for (idx, table_entry) in state.table_entries.iter().enumerate() {
                 if table_entry.masked() {
