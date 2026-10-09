@@ -84,21 +84,19 @@ impl PciDevices {
         id: String,
         sbdf: PciSBDF,
         virtio_device: Arc<Mutex<VirtioPciDevice>>,
-        event_manager: &mut EventManager,
-    ) -> Result<(), PciManagerError> {
+    ) -> Result<&Arc<Mutex<VirtioPciDevice>>, PciManagerError> {
         let bar_address = {
-            let mut device = virtio_device.lock().unwrap();
+            let device = virtio_device.lock().unwrap();
 
             device.register_notification_ioevents(vm)?;
 
-            let sub_id = event_manager.add_subscriber(device.virtio_device());
-            device.sub_id = Some(sub_id);
-
             device.bar_address()
         };
-
-        self.virtio_devices
-            .insert((device_type, id), virtio_device.clone());
+        let virtio_device = self
+            .virtio_devices
+            .entry((device_type, id))
+            .insert_entry(virtio_device)
+            .into_mut();
 
         self.pci_segment
             .pci_buses
@@ -115,7 +113,11 @@ impl PciDevices {
             .mmio_bus
             .insert(virtio_device.clone(), bar_address, CAPABILITY_BAR_SIZE)?;
 
-        Ok(())
+        Ok(virtio_device)
+    }
+
+    fn subscribe_device(device: &mut VirtioPciDevice, event_manager: &mut EventManager) {
+        device.sub_id = Some(event_manager.add_subscriber(device.virtio_device()));
     }
 
     pub(crate) fn attach_pci_virtio_device(
@@ -147,7 +149,9 @@ impl PciDevices {
 
         let virtio_device = Arc::new(Mutex::new(virtio_device));
 
-        self.attach_common(vm, device_type, id, sbdf, virtio_device, event_manager)
+        let device = self.attach_common(vm, device_type, id, sbdf, virtio_device)?;
+        Self::subscribe_device(&mut device.lock().expect("Poisoned lock"), event_manager);
+        Ok(())
     }
 
     pub(crate) fn pci_segment(&self) -> &PciSegment {
@@ -267,14 +271,14 @@ impl PciDevices {
         )?;
         let virtio_device = Arc::new(Mutex::new(virtio_device));
 
-        self.attach_common(
+        let device = self.attach_common(
             vm,
             device_type,
             device_id.to_string(),
             transport_state.sbdf,
             virtio_device,
-            event_manager,
         )?;
+        Self::subscribe_device(&mut device.lock().expect("Poisoned lock"), event_manager);
 
         Ok(())
     }
