@@ -1,7 +1,10 @@
 // Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Defines snapshot lifecycles for devices and their runtime state.
+//! Snapshot lifecycles for devices and their runtime state.
+//!
+//! Load provisions components, applies their saved state, then finishes load-only activation and
+//! subscriptions. Managers complete each phase across their children before starting the next.
 
 use crate::EventManager;
 
@@ -32,15 +35,16 @@ pub trait Persist<'a>: Sized {
     /// Returns the current state of the component.
     fn save(&self) -> Self::State;
     /// Applies saved runtime state to a provisioned component, retaining its host resources.
-    /// The no-op default is temporary scaffolding for unconverted components whose
-    /// `provision` still applies their saved state. Converted components must implement this.
+    ///
+    /// Restore saved runtime fields without replacing resource owners or registrations.
+    /// Saved fields that [`Provision::provision`] consumes, such as paths, addresses and
+    /// device layout, are provisioning inputs and are left alone here. Component tests check
+    /// the remaining fields with a save/apply/save round trip using `assert_apply_restores`.
     fn apply_state(
         &mut self,
-        _state: &Self::State,
-        _args: Self::ApplyArgs,
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
+        state: &Self::State,
+        args: Self::ApplyArgs,
+    ) -> Result<(), Self::Error>;
     /// Finishes load-only activation and subscriptions after runtime state is applied.
     fn post_restore(
         &mut self,
@@ -51,12 +55,14 @@ pub trait Persist<'a>: Sized {
     }
 }
 
-/// Construction capability for components that can be loaded from a snapshot.
+/// Snapshot-specific construction of a component's host resources and fixed configuration.
+///
+/// Saved paths, addresses and device layout may be needed during construction.
 pub trait Provision<'a>: Persist<'a> {
-    /// The type of the object holding the provisioning arguments.
+    /// Inputs needed to construct the component's host resources and fixed configuration.
     type ProvisionArgs;
 
-    /// Creates the component. Unconverted components temporarily apply saved state here.
+    /// Provisions resources and fixed configuration for subsequent state application.
     fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error>;
 }
 
@@ -91,7 +97,8 @@ pub(crate) fn restore_for_test<'a, T: Provision<'a>>(
 }
 
 /// Applies `state` to `live` and checks that saving again reproduces `state`, so a saved field
-/// that `apply_state` ignores fails the test. `live` must start out with different values.
+/// that `apply_state` ignores fails the test. `live` must start out with different values,
+/// except for fields that provisioning consumes, which must already match `state`.
 #[cfg(test)]
 pub(crate) fn assert_apply_restores<'a, T>(live: &mut T, state: &T::State, args: T::ApplyArgs)
 where
