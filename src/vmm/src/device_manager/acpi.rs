@@ -6,7 +6,6 @@ use acpi_tables::{Aml, aml};
 
 use crate::devices::acpi::vmclock::{VmClock, VmClockError};
 use crate::devices::acpi::vmgenid::{VmGenId, VmGenIdError};
-use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vm::KvmVm;
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -54,8 +53,16 @@ impl ACPIDeviceManager {
         self.vmgenid.as_ref().expect("Missing VMGenID device")
     }
 
+    pub fn vmgenid_mut(&mut self) -> &mut VmGenId {
+        self.vmgenid.as_mut().expect("Missing VMGenID device")
+    }
+
     pub fn vmclock(&self) -> &VmClock {
         self.vmclock.as_ref().expect("Missing VMClock device")
+    }
+
+    pub fn vmclock_mut(&mut self) -> &mut VmClock {
+        self.vmclock.as_mut().expect("Missing VMClock device")
     }
 
     pub fn activate_vmgenid(&self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
@@ -67,33 +74,6 @@ impl ACPIDeviceManager {
     pub fn activate_vmclock(&self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
         vm.register_irq(&self.vmclock().interrupt_evt, self.vmclock().gsi)?;
         self.vmclock().activate(vm.guest_memory())?;
-        Ok(())
-    }
-
-    pub fn replay_gsi_allocations(&self, vm: &KvmVm) -> Result<(), ACPIDeviceError> {
-        let mut resource_allocator = vm.resource_allocator();
-        resource_allocator
-            .gsi_legacy_allocator
-            .allocate_id_at(self.vmgenid().gsi)?;
-        resource_allocator
-            .gsi_legacy_allocator
-            .allocate_id_at(self.vmclock().gsi)?;
-        Ok(())
-    }
-
-    pub fn do_post_restore_vmgenid(&self) -> Result<(), ACPIDeviceError> {
-        self.vmgenid().do_post_restore()?;
-        Ok(())
-    }
-
-    pub fn do_post_restore_vmclock(
-        &mut self,
-        mem: &GuestMemoryMmap,
-    ) -> Result<(), ACPIDeviceError> {
-        self.vmclock
-            .as_mut()
-            .expect("Missing VMClock device")
-            .do_post_restore(mem)?;
         Ok(())
     }
 }
@@ -149,5 +129,51 @@ impl Aml for ACPIDeviceManager {
             ],
         )
         .append_aml_bytes(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch;
+    use crate::snapshot::Persist;
+    use crate::utils::u64_to_usize;
+    use crate::vstate::resources::ResourceAllocator;
+    use crate::vstate::vm::tests::setup_vm_with_memory;
+
+    #[test]
+    fn test_load_publishes_generation_state() {
+        let vm = setup_vm_with_memory(
+            u64_to_usize(arch::SYSTEM_MEM_START) + u64_to_usize(arch::SYSTEM_MEM_SIZE),
+        );
+        #[cfg(target_arch = "aarch64")]
+        let mut vm = vm;
+        #[cfg(target_arch = "x86_64")]
+        vm.setup_irqchip().unwrap();
+        #[cfg(target_arch = "aarch64")]
+        vm.setup_irqchip(1).unwrap();
+
+        let mut resource_allocator = ResourceAllocator::new();
+        let mut source = ACPIDeviceManager::new(
+            VmGenId::new(&mut resource_allocator).unwrap(),
+            VmClock::new(&mut resource_allocator).unwrap(),
+        );
+        // Set up a source clock at generation seven before saving the manager.
+        let mut clock_state = source.vmclock().save();
+        clock_state.inner.seq_count = 12;
+        clock_state.inner.disruption_marker = 6;
+        clock_state.inner.vm_generation_counter = 6;
+        source
+            .vmclock_mut()
+            .apply_state(&clock_state, vm.guest_memory())
+            .unwrap();
+        let state = source.save();
+        let acpi =
+            crate::snapshot::restore_for_test::<ACPIDeviceManager>(&vm, &state, vm.guest_memory())
+                .unwrap();
+        let clock = acpi.vmclock().save().inner;
+        assert_eq!(clock.seq_count, 16);
+        assert_eq!(clock.disruption_marker, 8);
+        assert_eq!(clock.vm_generation_counter, 8);
     }
 }

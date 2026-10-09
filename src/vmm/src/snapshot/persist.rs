@@ -69,3 +69,20 @@ pub fn restore<'a, T: Provision<'a>>(
     value.post_restore(state, load)?;
     Ok(value)
 }
+
+#[cfg(test)]
+pub(crate) fn restore_for_test<'a, T: Provision<'a>>(
+    args: T::ProvisionArgs,
+    state: &T::State,
+    apply: T::ApplyArgs,
+) -> Result<T, T::Error> {
+    let mut event_manager = EventManager::new().unwrap();
+    restore::<T>(
+        args,
+        state,
+        apply,
+        &mut LoadContext {
+            event_manager: &mut event_manager,
+        },
+    )
+}

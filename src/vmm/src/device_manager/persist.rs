@@ -194,7 +194,7 @@ pub struct MMIOPlatformDevicesState {
 
 impl<'a> Persist<'a> for ACPIDeviceManager {
     type State = ACPIDeviceManagerState;
-    type ApplyArgs = ();
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = ACPIDeviceError;
 
     fn save(&self) -> Self::State {
@@ -203,26 +203,35 @@ impl<'a> Persist<'a> for ACPIDeviceManager {
             vmclock: self.vmclock().save(),
         }
     }
+
+    fn apply_state(
+        &mut self,
+        state: &Self::State,
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), Self::Error> {
+        self.vmgenid_mut().apply_state(&state.vmgenid, mem)?;
+        self.vmclock_mut().apply_state(&state.vmclock, mem)?;
+        Ok(())
+    }
 }
 
 impl<'a> Provision<'a> for ACPIDeviceManager {
     type ProvisionArgs = &'a KvmVm;
 
     fn provision(vm: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let mut acpi_devices = ACPIDeviceManager::new(
-            VmGenId::provision((), &state.vmgenid)?,
-            VmClock::provision((), &state.vmclock)?,
-        );
+        {
+            let mut resource_allocator = vm.resource_allocator();
+            resource_allocator
+                .gsi_legacy_allocator
+                .allocate_id_at(state.vmgenid.gsi)?;
+            resource_allocator
+                .gsi_legacy_allocator
+                .allocate_id_at(state.vmclock.gsi)?;
+        }
 
-        acpi_devices.replay_gsi_allocations(vm)?;
-
-        acpi_devices.activate_vmgenid(vm)?;
-        acpi_devices.do_post_restore_vmgenid()?;
-
-        acpi_devices.activate_vmclock(vm)?;
-        acpi_devices.do_post_restore_vmclock(vm.guest_memory())?;
-
-        Ok(acpi_devices)
+        let vmgenid = VmGenId::provision(vm, &state.vmgenid)?;
+        let vmclock = VmClock::provision(vm, &state.vmclock)?;
+        Ok(ACPIDeviceManager::new(vmgenid, vmclock))
     }
 }
 
@@ -713,6 +722,9 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+    use crate::EventManager;
+    #[cfg(target_arch = "aarch64")]
+    use crate::Kvm;
     #[cfg(target_arch = "aarch64")]
     use crate::arch::KvmVm;
     use crate::builder::tests::*;
@@ -729,8 +741,6 @@ mod tests {
     use crate::vmm_config::net::NetworkInterfaceConfig;
     use crate::vmm_config::pmem::PmemConfig;
     use crate::vmm_config::vsock::VsockDeviceConfig;
-    #[cfg(target_arch = "aarch64")]
-    use crate::{EventManager, Kvm};
 
     impl<T> PartialEq for VirtioDeviceState<T> {
         fn eq(&self, other: &VirtioDeviceState<T>) -> bool {

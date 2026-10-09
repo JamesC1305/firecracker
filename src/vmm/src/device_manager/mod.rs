@@ -764,7 +764,7 @@ impl<'a> Provision<'a> for DeviceManager {
         let acpi_devices = restore::<ACPIDeviceManager>(
             constructor_args.vm,
             &state.acpi_state,
-            (),
+            constructor_args.vm.guest_memory(),
             &mut LoadContext {
                 event_manager: constructor_args.event_manager,
             },

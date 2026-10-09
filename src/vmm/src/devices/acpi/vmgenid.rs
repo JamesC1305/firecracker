@@ -13,6 +13,7 @@ use crate::logger::debug;
 use crate::snapshot::{Persist, Provision};
 use crate::vstate::memory::{Bytes, GuestMemoryExtension, GuestMemoryMmap};
 use crate::vstate::resources::ResourceAllocator;
+use crate::vstate::vm::KvmVm;
 
 /// Bytes of memory we allocate for VMGenID device
 pub const VMGENID_MEM_SIZE: u64 = 16;
@@ -21,6 +22,8 @@ pub const VMGENID_MEM_SIZE: u64 = 16;
 pub enum VmGenIdError {
     /// Could not create EventFd: {0}
     CreateEventFd(std::io::Error),
+    /// Could not register IRQ with KVM: {0}
+    RegisterIrq(#[from] kvm_ioctls::Error),
     /// Could not allocate GSI: {0}
     AllocateGsi(vm_allocator::Error),
     /// Could not allocate guest memory: {0}
@@ -96,18 +99,6 @@ impl VmGenId {
         u128::from_le_bytes(gen_id_bytes)
     }
 
-    /// Notify guest after snapshot restore
-    ///
-    /// This will only have effect if we have updated the generation ID in guest memory, i.e. when
-    /// re-creating the device after snapshot resumption.
-    pub fn do_post_restore(&self) -> Result<(), VmGenIdError> {
-        self.interrupt_evt
-            .trigger()
-            .map_err(VmGenIdError::NotifyGuest)?;
-        debug!("vmgenid: notifying guest about new generation ID");
-        Ok(())
-    }
-
     /// Attach the [`VmGenId`] device
     pub fn activate(&self, mem: &GuestMemoryMmap) -> Result<(), VmGenIdError> {
         debug!(
@@ -134,7 +125,7 @@ pub struct VMGenIDState {
 
 impl<'a> Persist<'a> for VmGenId {
     type State = VMGenIDState;
-    type ApplyArgs = ();
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = VmGenIdError;
 
     fn save(&self) -> Self::State {
@@ -143,13 +134,29 @@ impl<'a> Persist<'a> for VmGenId {
             addr: self.guest_address.0,
         }
     }
+
+    /// Publishes the provisioned generation at its saved address and notifies the guest.
+    fn apply_state(
+        &mut self,
+        _state: &Self::State,
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), Self::Error> {
+        self.activate(mem)?;
+        self.interrupt_evt
+            .trigger()
+            .map_err(VmGenIdError::NotifyGuest)?;
+        debug!("vmgenid: notifying guest about new generation ID");
+        Ok(())
+    }
 }
 
 impl<'a> Provision<'a> for VmGenId {
-    type ProvisionArgs = ();
+    type ProvisionArgs = &'a KvmVm;
 
-    fn provision(_: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        Self::from_parts(GuestAddress(state.addr), state.gsi)
+    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
+        let device = Self::from_parts(GuestAddress(state.addr), state.gsi)?;
+        args.register_irq(&device.interrupt_evt, device.gsi)?;
+        Ok(device)
     }
 }
 
