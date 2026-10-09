@@ -558,7 +558,6 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
         for net_state in &state.net_devices {
             let device = Arc::new(Mutex::new(restore::<Net>(
                 NetProvisionArgs {
-                    mem: mem.clone(),
                     mmds: constructor_args
                         .vm_resources
                         .mmds
@@ -567,7 +566,7 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
                         .cloned(),
                 },
                 &net_state.device_state,
-                (),
+                mem,
                 &mut load,
             )?));
 
