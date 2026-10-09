@@ -28,9 +28,7 @@ use crate::devices::virtio::rng::persist::EntropyState;
 use crate::devices::virtio::transport::pci::device::{
     CAPABILITY_BAR_SIZE, VirtioPciDevice, VirtioPciDeviceError, VirtioPciDeviceState,
 };
-use crate::devices::virtio::vsock::persist::{
-    VsockProvisionArgs, VsockState, VsockUdsConstructorArgs,
-};
+use crate::devices::virtio::vsock::persist::{VsockProvisionArgs, VsockState};
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 use crate::logger::{debug, warn};
 use crate::pci::PciSBDF;
@@ -600,22 +598,14 @@ impl<'a> Provision<'a> for PciDevices {
         }
 
         if let Some(vsock_state) = &state.vsock_device {
-            let ctor_args = VsockUdsConstructorArgs {
-                cid: vsock_state.device_state.frontend.cid,
-            };
-            let backend = restore::<VsockUnixBackend>(
-                ctor_args,
+            let backend = VsockUnixBackend::provision(
+                vsock_state.device_state.frontend.cid,
                 &vsock_state.device_state.backend,
-                (),
-                &mut load,
             )?;
-            let device = Arc::new(Mutex::new(restore::<Vsock<_>>(
-                VsockProvisionArgs {
-                    mem: mem.clone(),
-                    backend,
-                },
+            let device = Arc::new(Mutex::new(restore::<Vsock<VsockUnixBackend>>(
+                VsockProvisionArgs { backend },
                 &vsock_state.device_state,
-                (),
+                mem,
                 &mut load,
             )?));
 

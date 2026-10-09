@@ -8,9 +8,7 @@ use std::fmt::Debug;
 use serde::{Deserialize, Serialize};
 
 use super::*;
-use crate::devices::virtio::device::{DeviceState, VirtioDeviceType};
 use crate::devices::virtio::persist::VirtioDeviceState;
-use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
 use crate::snapshot::{Persist, Provision};
 use crate::vstate::memory::GuestMemoryMmap;
 
@@ -45,20 +43,11 @@ pub struct VsockBackendState {
     pub local_port_last: u32,
 }
 
-/// Provisioning arguments for a vsock device.
+/// A helper structure that holds the provisioning arguments for a vsock device.
 #[derive(Debug)]
 pub struct VsockProvisionArgs<B> {
-    /// Pointer to guest memory.
-    pub mem: GuestMemoryMmap,
-    /// The vsock Unix Backend.
+    /// Backend with its host resources already created.
     pub backend: B,
-}
-
-/// Provisioning arguments for VsockUnixBackend.
-#[derive(Debug)]
-pub struct VsockUdsConstructorArgs {
-    /// cid available in VsockFrontendState.
-    pub cid: u64,
 }
 
 impl Persist<'_> for VsockUnixBackend {
@@ -72,27 +61,31 @@ impl Persist<'_> for VsockUnixBackend {
             local_port_last: self.local_port_last,
         }
     }
+
+    /// Applies the saved host-side port cursor while keeping the host socket.
+    fn apply_state(&mut self, state: &Self::State, _: Self::ApplyArgs) -> Result<(), Self::Error> {
+        self.local_port_last = state.local_port_last;
+        Ok(())
+    }
 }
 
 impl Provision<'_> for VsockUnixBackend {
-    type ProvisionArgs = VsockUdsConstructorArgs;
+    type ProvisionArgs = u64;
 
-    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let mut backend = Self::new(args.cid, state.uds_path.clone())?;
-        backend.local_port_last = state.local_port_last;
-        Ok(backend)
+    fn provision(cid: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
+        Self::new(cid, state.uds_path.clone())
     }
 }
 
 impl<'a, B> Persist<'a> for Vsock<B>
 where
     B: VsockBackend
-        + Persist<'a, State = VsockBackendState, Error = VsockUnixBackendError>
+        + Persist<'a, State = VsockBackendState, Error = VsockUnixBackendError, ApplyArgs = ()>
         + 'static
         + Debug,
 {
     type State = VsockState;
-    type ApplyArgs = ();
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = VsockError;
 
     fn save(&self) -> Self::State {
@@ -105,44 +98,49 @@ where
             },
         }
     }
+
+    /// Applies saved runtime state while keeping the host socket and eventfds.
+    fn apply_state(
+        &mut self,
+        state: &Self::State,
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), Self::Error> {
+        state
+            .frontend
+            .virtio_state
+            .apply_to(self, mem)
+            .map_err(VsockError::VirtioState)?;
+        self.avail_features = state.frontend.virtio_state.avail_features;
+        self.backend
+            .apply_state(&state.backend, ())
+            .map_err(VsockError::VsockUdsBackend)?;
+        self.pending_event_ack = state.frontend.pending_event_ack;
+        Ok(())
+    }
 }
 
 impl<'a, B> Provision<'a> for Vsock<B>
 where
     B: VsockBackend
-        + Persist<'a, State = VsockBackendState, Error = VsockUnixBackendError>
+        + Persist<'a, State = VsockBackendState, Error = VsockUnixBackendError, ApplyArgs = ()>
         + 'static
         + Debug,
 {
     type ProvisionArgs = VsockProvisionArgs<B>;
 
     fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
-        let state = &state.frontend;
-        // Restore queues.
-        let queues = state
-            .virtio_state
-            .build_queues_checked(
-                &args.mem,
-                VirtioDeviceType::Vsock,
-                defs::VSOCK_NUM_QUEUES,
-                FIRECRACKER_MAX_QUEUE_SIZE,
-            )
-            .map_err(VsockError::VirtioState)?;
-        let mut vsock = Self::with_queues(state.cid, args.backend, queues)?;
-
-        vsock.acked_features = state.virtio_state.acked_features;
-        vsock.avail_features = state.virtio_state.avail_features;
-        vsock.device_state = DeviceState::Inactive;
-        vsock.pending_event_ack = state.pending_event_ack;
-        Ok(vsock)
+        Self::new(state.frontend.cid, args.backend)
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::num::Wrapping;
+    use std::os::fd::AsRawFd;
+
     use super::device::AVAIL_FEATURES;
     use super::*;
-    use crate::devices::virtio::device::VirtioDevice;
+    use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
     use crate::devices::virtio::vsock::test_utils::{TestBackend, TestContext};
     use crate::utils::byte_order;
 
@@ -157,13 +155,13 @@ pub(crate) mod tests {
                 local_port_last: 0xdeadbeef,
             }
         }
-    }
 
-    impl Provision<'_> for TestBackend {
-        type ProvisionArgs = VsockUdsConstructorArgs;
-
-        fn provision(_: Self::ProvisionArgs, _state: &Self::State) -> Result<Self, Self::Error> {
-            Ok(TestBackend::new())
+        fn apply_state(
+            &mut self,
+            _state: &Self::State,
+            _: Self::ApplyArgs,
+        ) -> Result<(), Self::Error> {
+            Ok(())
         }
     }
 
@@ -178,12 +176,12 @@ pub(crate) mod tests {
             let state = ctx.device.save();
             assert_eq!(state.frontend.pending_event_ack, armed);
 
-            let restored = Vsock::provision(
+            let restored = crate::snapshot::restore_for_test::<Vsock<TestBackend>>(
                 VsockProvisionArgs {
-                    mem: ctx.mem.clone(),
                     backend: TestBackend::new(),
                 },
                 &state,
+                &ctx.mem,
             )
             .unwrap();
             assert_eq!(restored.pending_event_ack, armed);
@@ -210,16 +208,14 @@ pub(crate) mod tests {
         let serialized_data = bitcode::serialize(&state).unwrap();
 
         let restored_state: VsockState = bitcode::deserialize(&serialized_data).unwrap();
-        let mut restored_device = Vsock::provision(
+        assert_eq!(restored_state.backend.uds_path, "test");
+        assert_eq!(restored_state.backend.local_port_last, 0xdeadbeef);
+        let mut restored_device = crate::snapshot::restore_for_test::<Vsock<TestBackend>>(
             VsockProvisionArgs {
-                mem: ctx.mem.clone(),
-                backend: {
-                    assert_eq!(restored_state.backend.uds_path, "test".to_owned());
-                    assert_eq!(restored_state.backend.local_port_last, 0xdeadbeef);
-                    TestBackend::new()
-                },
+                backend: TestBackend::new(),
             },
             &restored_state,
+            &ctx.mem,
         )
         .unwrap();
 
@@ -241,5 +237,39 @@ pub(crate) mod tests {
         let config = restored_device.config_as_bytes();
         assert_eq!(config.len(), 8);
         assert_eq!(byte_order::read_le_u64(config), ctx.cid);
+    }
+
+    #[test]
+    fn test_apply_state() {
+        let ctx = TestContext::new();
+        let mut handler_ctx = ctx.create_event_handler_context();
+        handler_ctx.mock_activate(ctx.mem.clone(), ctx.interrupt.clone());
+        let device = &mut handler_ctx.device;
+        let fds = |device: &Vsock<TestBackend>| {
+            [
+                device.backend.as_raw_fd(),
+                device.activate_evt.as_raw_fd(),
+                device.queue_events[0].as_raw_fd(),
+                device.queue_events[1].as_raw_fd(),
+                device.queue_events[2].as_raw_fd(),
+            ]
+        };
+        let original_fds = fds(device);
+        device.acked_features = AVAIL_FEATURES;
+        for armed in [false, true] {
+            device.pending_event_ack = armed;
+            let state = device.save();
+            device.pending_event_ack = !armed;
+            device.acked_features = 0;
+            device.avail_features = 0;
+            for queue in &mut device.queues {
+                queue.next_avail += Wrapping(1);
+                queue.next_used += Wrapping(1);
+                queue.num_added += Wrapping(1);
+            }
+
+            crate::snapshot::assert_apply_restores(device, &state, &ctx.mem);
+        }
+        assert_eq!(fds(device), original_fds);
     }
 }
