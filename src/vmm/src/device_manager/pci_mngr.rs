@@ -24,7 +24,7 @@ use crate::devices::virtio::net::persist::{NetProvisionArgs, NetState};
 use crate::devices::virtio::pmem::device::Pmem;
 use crate::devices::virtio::pmem::persist::{PmemProvisionArgs, PmemState};
 use crate::devices::virtio::rng::Entropy;
-use crate::devices::virtio::rng::persist::{EntropyConstructorArgs, EntropyState};
+use crate::devices::virtio::rng::persist::EntropyState;
 use crate::devices::virtio::transport::pci::device::{
     CAPABILITY_BAR_SIZE, VirtioPciDevice, VirtioPciDeviceError, VirtioPciDeviceState,
 };
@@ -638,12 +638,10 @@ impl<'a> Provision<'a> for PciDevices {
         }
 
         if let Some(entropy_state) = &state.entropy_device {
-            let ctor_args = EntropyConstructorArgs { mem: mem.clone() };
-
             let device = Arc::new(Mutex::new(restore::<Entropy>(
-                ctor_args,
-                &entropy_state.device_state,
                 (),
+                &entropy_state.device_state,
+                mem,
                 &mut load,
             )?));
 

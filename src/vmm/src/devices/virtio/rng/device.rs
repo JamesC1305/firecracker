@@ -67,13 +67,6 @@ pub struct Entropy {
 impl Entropy {
     pub fn new(rate_limiter: RateLimiter) -> Result<Self, EntropyError> {
         let queues = vec![Queue::new(FIRECRACKER_MAX_QUEUE_SIZE); RNG_NUM_QUEUES];
-        Self::new_with_queues(queues, rate_limiter)
-    }
-
-    pub fn new_with_queues(
-        queues: Vec<Queue>,
-        rate_limiter: RateLimiter,
-    ) -> Result<Self, EntropyError> {
         let activate_event = EventFd::new(libc::EFD_NONBLOCK)?;
         let queue_events = (0..RNG_NUM_QUEUES)
             .map(|_| EventFd::new(libc::EFD_NONBLOCK))
@@ -245,10 +238,6 @@ impl Entropy {
 
     pub(crate) fn set_avail_features(&mut self, features: u64) {
         self.avail_features = features;
-    }
-
-    pub(crate) fn set_acked_features(&mut self, features: u64) {
-        self.acked_features = features;
     }
 
     pub(crate) fn activate_event(&self) -> &EventFd {
