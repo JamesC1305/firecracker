@@ -114,6 +114,7 @@ pub struct BalloonConstructorArgs {
 
 impl Persist<'_> for Balloon {
     type State = BalloonState;
+    type ApplyArgs = ();
     type Error = super::BalloonError;
 
     fn save(&self) -> Self::State {

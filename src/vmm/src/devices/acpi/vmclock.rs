@@ -168,6 +168,7 @@ pub struct VmClockState {
 
 impl<'a> Persist<'a> for VmClock {
     type State = VmClockState;
+    type ApplyArgs = ();
     type Error = VmClockError;
 
     fn save(&self) -> Self::State {

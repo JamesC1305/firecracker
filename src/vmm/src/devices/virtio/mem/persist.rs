@@ -50,6 +50,7 @@ pub enum VirtioMemPersistError {
 
 impl Persist<'_> for VirtioMem {
     type State = VirtioMemState;
+    type ApplyArgs = ();
     type Error = VirtioMemPersistError;
 
     fn save(&self) -> Self::State {

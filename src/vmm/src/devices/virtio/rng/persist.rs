@@ -37,6 +37,7 @@ pub enum EntropyPersistError {
 
 impl Persist<'_> for Entropy {
     type State = EntropyState;
+    type ApplyArgs = ();
     type Error = EntropyPersistError;
 
     fn save(&self) -> Self::State {

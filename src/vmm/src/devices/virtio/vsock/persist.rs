@@ -63,6 +63,7 @@ pub struct VsockUdsConstructorArgs {
 
 impl Persist<'_> for VsockUnixBackend {
     type State = VsockBackendState;
+    type ApplyArgs = ();
     type Error = VsockUnixBackendError;
 
     fn save(&self) -> Self::State {
@@ -88,6 +89,7 @@ where
     B: VsockBackend + 'static + Debug,
 {
     type State = VsockFrontendState;
+    type ApplyArgs = ();
     type Error = VsockError;
 
     fn save(&self) -> Self::State {
@@ -136,6 +138,7 @@ pub(crate) mod tests {
 
     impl Persist<'_> for TestBackend {
         type State = VsockBackendState;
+        type ApplyArgs = ();
         type Error = VsockUnixBackendError;
 
         fn save(&self) -> Self::State {

@@ -51,7 +51,7 @@ use crate::logger::{error, info};
 use crate::rate_limiter::TokenBucket;
 use crate::resources::VmResources;
 use crate::rpc_interface::VmmActionError;
-use crate::snapshot::{Persist, Provision};
+use crate::snapshot::{LoadContext, Persist, Provision, restore};
 use crate::utils::open_file_nonblock;
 use crate::vmm_config::HotplugDeviceConfig;
 use crate::vmm_config::drive::{BlockDeviceConfig, DriveError};
@@ -710,6 +710,7 @@ impl std::fmt::Debug for DeviceProvisionArgs<'_> {
 
 impl<'a> Persist<'a> for DeviceManager {
     type State = DevicesState;
+    type ApplyArgs = ();
     type Error = DeviceManagerPersistError;
 
     fn save(&self) -> Self::State {
@@ -760,7 +761,14 @@ impl<'a> Provision<'a> for DeviceManager {
                 .map_err(DeviceManagerPersistError::MmioRestore)?;
 
         // Restore ACPI devices
-        let acpi_devices = ACPIDeviceManager::provision(constructor_args.vm, &state.acpi_state)?;
+        let acpi_devices = restore::<ACPIDeviceManager>(
+            constructor_args.vm,
+            &state.acpi_state,
+            (),
+            &mut LoadContext {
+                event_manager: constructor_args.event_manager,
+            },
+        )?;
 
         let virtio_devices = match &state.virtio_state {
             VirtioDevicesState::Pci(pci_state) => {

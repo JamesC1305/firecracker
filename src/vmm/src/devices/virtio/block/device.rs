@@ -247,6 +247,7 @@ impl MutEventSubscriber for Block {
 
 impl Persist<'_> for Block {
     type State = BlockState;
+    type ApplyArgs = ();
     type Error = BlockError;
 
     fn save(&self) -> Self::State {

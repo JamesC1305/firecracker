@@ -36,7 +36,7 @@ use crate::logger::{debug, warn};
 use crate::pci::PciSBDF;
 use crate::pci::bus::PciBusError;
 use crate::resources::VmResources;
-use crate::snapshot::{Persist, Provision};
+use crate::snapshot::{LoadContext, Persist, Provision, restore};
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::bus::BusError;
 use crate::vstate::interrupts::InterruptError;
@@ -354,6 +354,7 @@ impl<'a> Debug for PciDevicesProvisionArgs<'a> {
 
 impl<'a> Persist<'a> for PciDevices {
     type State = PciDevicesState;
+    type ApplyArgs = ();
     type Error = DevicePersistError;
 
     fn save(&self) -> Self::State {
@@ -506,11 +507,16 @@ impl<'a> Provision<'a> for PciDevices {
     ) -> Result<Self, Self::Error> {
         let mem = constructor_args.mem;
         let mut pci_devices = PciDevices::new(constructor_args.vm, 0)?;
+        let mut load = LoadContext {
+            event_manager: constructor_args.event_manager,
+        };
 
         if let Some(balloon_state) = &state.balloon_device {
-            let device = Arc::new(Mutex::new(Balloon::provision(
+            let device = Arc::new(Mutex::new(restore::<Balloon>(
                 BalloonConstructorArgs { mem: mem.clone() },
                 &balloon_state.device_state,
+                (),
+                &mut load,
             )?));
 
             constructor_args
@@ -523,14 +529,16 @@ impl<'a> Provision<'a> for PciDevices {
                 device,
                 &balloon_state.device_id,
                 &balloon_state.transport_state,
-                constructor_args.event_manager,
+                load.event_manager,
             )?
         }
 
         for block_state in &state.block_devices {
-            let device = Arc::new(Mutex::new(Block::provision(
+            let device = Arc::new(Mutex::new(restore::<Block>(
                 BlockConstructorArgs { mem: mem.clone() },
                 &block_state.device_state,
+                (),
+                &mut load,
             )?));
 
             constructor_args
@@ -543,7 +551,7 @@ impl<'a> Provision<'a> for PciDevices {
                 device,
                 &block_state.device_id,
                 &block_state.transport_state,
-                constructor_args.event_manager,
+                load.event_manager,
             )?
         }
 
@@ -566,7 +574,7 @@ impl<'a> Provision<'a> for PciDevices {
         }
 
         for net_state in &state.net_devices {
-            let device = Arc::new(Mutex::new(Net::provision(
+            let device = Arc::new(Mutex::new(restore::<Net>(
                 NetProvisionArgs {
                     mem: mem.clone(),
                     mmds: constructor_args
@@ -577,6 +585,8 @@ impl<'a> Provision<'a> for PciDevices {
                         .cloned(),
                 },
                 &net_state.device_state,
+                (),
+                &mut load,
             )?));
 
             constructor_args
@@ -589,7 +599,7 @@ impl<'a> Provision<'a> for PciDevices {
                 device,
                 &net_state.device_id,
                 &net_state.transport_state,
-                constructor_args.event_manager,
+                load.event_manager,
             )?
         }
 
@@ -597,14 +607,20 @@ impl<'a> Provision<'a> for PciDevices {
             let ctor_args = VsockUdsConstructorArgs {
                 cid: vsock_state.device_state.frontend.cid,
             };
-            let backend =
-                VsockUnixBackend::provision(ctor_args, &vsock_state.device_state.backend)?;
-            let device = Arc::new(Mutex::new(Vsock::provision(
+            let backend = restore::<VsockUnixBackend>(
+                ctor_args,
+                &vsock_state.device_state.backend,
+                (),
+                &mut load,
+            )?;
+            let device = Arc::new(Mutex::new(restore::<Vsock<_>>(
                 VsockProvisionArgs {
                     mem: mem.clone(),
                     backend,
                 },
                 &vsock_state.device_state.frontend,
+                (),
+                &mut load,
             )?));
 
             constructor_args
@@ -617,16 +633,18 @@ impl<'a> Provision<'a> for PciDevices {
                 device,
                 &vsock_state.device_id,
                 &vsock_state.transport_state,
-                constructor_args.event_manager,
+                load.event_manager,
             )?
         }
 
         if let Some(entropy_state) = &state.entropy_device {
             let ctor_args = EntropyConstructorArgs { mem: mem.clone() };
 
-            let device = Arc::new(Mutex::new(Entropy::provision(
+            let device = Arc::new(Mutex::new(restore::<Entropy>(
                 ctor_args,
                 &entropy_state.device_state,
+                (),
+                &mut load,
             )?));
 
             constructor_args
@@ -639,17 +657,19 @@ impl<'a> Provision<'a> for PciDevices {
                 device,
                 &entropy_state.device_id,
                 &entropy_state.transport_state,
-                constructor_args.event_manager,
+                load.event_manager,
             )?
         }
 
         for pmem_state in &state.pmem_devices {
-            let device = Arc::new(Mutex::new(Pmem::provision(
+            let device = Arc::new(Mutex::new(restore::<Pmem>(
                 PmemProvisionArgs {
                     mem,
                     vm: constructor_args.vm.clone(),
                 },
                 &pmem_state.device_state,
+                (),
+                &mut load,
             )?));
 
             constructor_args
@@ -663,13 +683,14 @@ impl<'a> Provision<'a> for PciDevices {
                 device,
                 &pmem_state.device_id,
                 &pmem_state.transport_state,
-                constructor_args.event_manager,
+                load.event_manager,
             )?
         }
 
         if let Some(memory_device) = &state.memory_device {
             let ctor_args = VirtioMemProvisionArgs::new(Arc::clone(constructor_args.vm));
-            let device = VirtioMem::provision(ctor_args, &memory_device.device_state)?;
+            let device =
+                restore::<VirtioMem>(ctor_args, &memory_device.device_state, (), &mut load)?;
 
             constructor_args.vm_resources.memory_hotplug = Some(MemoryHotplugConfig {
                 total_size_mib: device.total_size_mib(),
@@ -683,7 +704,7 @@ impl<'a> Provision<'a> for PciDevices {
                 arcd_device,
                 &memory_device.device_id,
                 &memory_device.transport_state,
-                constructor_args.event_manager,
+                load.event_manager,
             )?
         }
 

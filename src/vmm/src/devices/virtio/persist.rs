@@ -68,6 +68,7 @@ pub struct QueueConstructorArgs {
 
 impl Persist<'_> for Queue {
     type State = QueueState;
+    type ApplyArgs = ();
     type Error = QueueError;
 
     fn save(&self) -> Self::State {
@@ -218,6 +219,7 @@ pub struct MmioTransportConstructorArgs {
 
 impl Persist<'_> for MmioTransport {
     type State = MmioTransportState;
+    type ApplyArgs = ();
     type Error = ();
 
     fn save(&self) -> Self::State {

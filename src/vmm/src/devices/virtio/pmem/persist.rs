@@ -44,6 +44,7 @@ pub enum PmemPersistError {
 
 impl<'a> Persist<'a> for Pmem {
     type State = PmemState;
+    type ApplyArgs = ();
     type Error = PmemPersistError;
 
     fn save(&self) -> Self::State {

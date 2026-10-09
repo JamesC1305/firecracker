@@ -70,6 +70,7 @@ pub enum NetPersistError {
 
 impl Persist<'_> for Net {
     type State = NetState;
+    type ApplyArgs = ();
     type Error = NetPersistError;
 
     fn save(&self) -> Self::State {

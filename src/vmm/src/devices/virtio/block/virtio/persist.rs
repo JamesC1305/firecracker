@@ -68,6 +68,7 @@ pub struct VirtioBlockState {
 
 impl Persist<'_> for VirtioBlock {
     type State = VirtioBlockState;
+    type ApplyArgs = ();
     type Error = VirtioBlockError;
 
     fn save(&self) -> Self::State {

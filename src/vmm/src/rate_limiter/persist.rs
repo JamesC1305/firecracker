@@ -23,6 +23,7 @@ pub struct TokenBucketState {
 
 impl Persist<'_> for TokenBucket {
     type State = TokenBucketState;
+    type ApplyArgs = ();
     type Error = io::Error;
 
     fn save(&self) -> Self::State {
@@ -66,6 +67,7 @@ pub struct RateLimiterState {
 
 impl Persist<'_> for RateLimiter {
     type State = RateLimiterState;
+    type ApplyArgs = ();
     type Error = io::Error;
 
     fn save(&self) -> Self::State {

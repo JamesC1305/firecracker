@@ -141,9 +141,12 @@ corresponding to the guest exposed features.
 
 The microVM state file format is implemented in the
 [snapshot crate](../../src/vmm/src/snapshot/mod.rs) in the Firecracker
-repository. All Firecracker devices implement the
-[Persist](../../src/vmm/src/snapshot/persist.rs) trait which exposes an
-interface that enables creating from and saving to the microVM state.
+repository. Device persistence uses the
+[Persist](../../src/vmm/src/snapshot/persist.rs) trait to save state and apply it
+to an existing component. Components that support construction from saved state
+also implement the `Provision` trait. The no-op `apply_state` default is temporary
+scaffolding for unconverted components whose provisioning still applies their
+saved state. Converted components must implement `apply_state`.
 
 [1]: https://serde.rs
 [2]: https://github.com/SoftbearStudios/bitcode

@@ -27,6 +27,7 @@ pub struct VhostUserBlockState {
 
 impl Persist<'_> for VhostUserBlock {
     type State = VhostUserBlockState;
+    type ApplyArgs = ();
     type Error = VhostUserBlockError;
 
     fn save(&self) -> Self::State {

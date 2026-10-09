@@ -134,6 +134,7 @@ pub struct VMGenIDState {
 
 impl<'a> Persist<'a> for VmGenId {
     type State = VMGenIDState;
+    type ApplyArgs = ();
     type Error = VmGenIdError;
 
     fn save(&self) -> Self::State {

@@ -23,6 +23,7 @@ pub struct MmdsNetworkStackState {
 
 impl Persist<'_> for MmdsNetworkStack {
     type State = MmdsNetworkStackState;
+    type ApplyArgs = ();
     type Error = ();
 
     fn save(&self) -> Self::State {

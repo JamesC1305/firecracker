@@ -38,7 +38,7 @@ use crate::devices::virtio::vsock::persist::{
 use crate::devices::virtio::vsock::{Vsock, VsockUnixBackend};
 use crate::mmds::data_store::MmdsVersion;
 use crate::resources::VmResources;
-use crate::snapshot::{Persist, Provision};
+use crate::snapshot::{LoadContext, Persist, Provision, restore};
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vm::KvmVm;
@@ -194,6 +194,7 @@ pub struct MMIOPlatformDevicesState {
 
 impl<'a> Persist<'a> for ACPIDeviceManager {
     type State = ACPIDeviceManagerState;
+    type ApplyArgs = ();
     type Error = ACPIDeviceError;
 
     fn save(&self) -> Self::State {
@@ -227,6 +228,7 @@ impl<'a> Provision<'a> for ACPIDeviceManager {
 
 impl<'a> Persist<'a> for MMIOPlatformDevices {
     type State = MMIOPlatformDevicesState;
+    type ApplyArgs = ();
     type Error = DevicePersistError;
 
     fn save(&self) -> Self::State {
@@ -299,6 +301,7 @@ impl<'a> Provision<'a> for MMIOPlatformDevices {
 
 impl<'a> Persist<'a> for MMIOVirtioDevices {
     type State = DeviceStates;
+    type ApplyArgs = ();
     type Error = DevicePersistError;
 
     fn save(&self) -> Self::State {
@@ -439,6 +442,9 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
         let mut dev_manager = MMIOVirtioDevices::new();
         let mem = constructor_args.mem;
         let vm = constructor_args.vm;
+        let mut load = LoadContext {
+            event_manager: constructor_args.event_manager,
+        };
 
         let mut restore_helper = |device: Arc<Mutex<dyn VirtioDevice>>,
                                   activated: bool,
@@ -456,8 +462,13 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
                 is_vhost_user,
             };
             let mmio_transport = Arc::new(Mutex::new(
-                MmioTransport::provision(restore_args, state)
-                    .map_err(|()| DevicePersistError::MmioTransport)?,
+                restore::<MmioTransport>(
+                    restore_args,
+                    state,
+                    (),
+                    &mut LoadContext { event_manager },
+                )
+                .map_err(|()| DevicePersistError::MmioTransport)?,
             ));
 
             vm.resource_allocator()
@@ -486,9 +497,11 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
         };
 
         if let Some(balloon_state) = &state.balloon_device {
-            let device = Arc::new(Mutex::new(Balloon::provision(
+            let device = Arc::new(Mutex::new(restore::<Balloon>(
                 BalloonConstructorArgs { mem: mem.clone() },
                 &balloon_state.device_state,
+                (),
+                &mut load,
             )?));
 
             constructor_args
@@ -503,14 +516,16 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
                 &balloon_state.device_id,
                 &balloon_state.transport_state,
                 &balloon_state.device_info,
-                constructor_args.event_manager,
+                load.event_manager,
             )?;
         }
 
         for block_state in &state.block_devices {
-            let device = Arc::new(Mutex::new(Block::provision(
+            let device = Arc::new(Mutex::new(restore::<Block>(
                 BlockConstructorArgs { mem: mem.clone() },
                 &block_state.device_state,
+                (),
+                &mut load,
             )?));
 
             constructor_args
@@ -525,7 +540,7 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
                 &block_state.device_id,
                 &block_state.transport_state,
                 &block_state.device_info,
-                constructor_args.event_manager,
+                load.event_manager,
             )?;
         }
 
@@ -539,7 +554,7 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
         }
 
         for net_state in &state.net_devices {
-            let device = Arc::new(Mutex::new(Net::provision(
+            let device = Arc::new(Mutex::new(restore::<Net>(
                 NetProvisionArgs {
                     mem: mem.clone(),
                     mmds: constructor_args
@@ -550,6 +565,8 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
                         .cloned(),
                 },
                 &net_state.device_state,
+                (),
+                &mut load,
             )?));
 
             constructor_args
@@ -564,7 +581,7 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
                 &net_state.device_id,
                 &net_state.transport_state,
                 &net_state.device_info,
-                constructor_args.event_manager,
+                load.event_manager,
             )?;
         }
 
@@ -572,14 +589,20 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
             let ctor_args = VsockUdsConstructorArgs {
                 cid: vsock_state.device_state.frontend.cid,
             };
-            let backend =
-                VsockUnixBackend::provision(ctor_args, &vsock_state.device_state.backend)?;
-            let device = Arc::new(Mutex::new(Vsock::provision(
+            let backend = restore::<VsockUnixBackend>(
+                ctor_args,
+                &vsock_state.device_state.backend,
+                (),
+                &mut load,
+            )?;
+            let device = Arc::new(Mutex::new(restore::<Vsock<_>>(
                 VsockProvisionArgs {
                     mem: mem.clone(),
                     backend,
                 },
                 &vsock_state.device_state.frontend,
+                (),
+                &mut load,
             )?));
 
             constructor_args
@@ -594,16 +617,18 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
                 &vsock_state.device_id,
                 &vsock_state.transport_state,
                 &vsock_state.device_info,
-                constructor_args.event_manager,
+                load.event_manager,
             )?;
         }
 
         if let Some(entropy_state) = &state.entropy_device {
             let ctor_args = EntropyConstructorArgs { mem: mem.clone() };
 
-            let device = Arc::new(Mutex::new(Entropy::provision(
+            let device = Arc::new(Mutex::new(restore::<Entropy>(
                 ctor_args,
                 &entropy_state.device_state,
+                (),
+                &mut load,
             )?));
 
             constructor_args
@@ -618,17 +643,19 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
                 &entropy_state.device_id,
                 &entropy_state.transport_state,
                 &entropy_state.device_info,
-                constructor_args.event_manager,
+                load.event_manager,
             )?;
         }
 
         for pmem_state in &state.pmem_devices {
-            let device = Arc::new(Mutex::new(Pmem::provision(
+            let device = Arc::new(Mutex::new(restore::<Pmem>(
                 PmemProvisionArgs {
                     mem,
                     vm: vm.clone(),
                 },
                 &pmem_state.device_state,
+                (),
+                &mut load,
             )?));
 
             constructor_args
@@ -644,13 +671,14 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
                 &pmem_state.device_id,
                 &pmem_state.transport_state,
                 &pmem_state.device_info,
-                constructor_args.event_manager,
+                load.event_manager,
             )?;
         }
 
         if let Some(memory_state) = &state.memory_device {
             let ctor_args = VirtioMemProvisionArgs::new(Arc::clone(vm));
-            let device = VirtioMem::provision(ctor_args, &memory_state.device_state)?;
+            let device =
+                restore::<VirtioMem>(ctor_args, &memory_state.device_state, (), &mut load)?;
 
             constructor_args.vm_resources.memory_hotplug = Some(MemoryHotplugConfig {
                 total_size_mib: device.total_size_mib(),
@@ -667,7 +695,7 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
                 &memory_state.device_id,
                 &memory_state.transport_state,
                 &memory_state.device_info,
-                constructor_args.event_manager,
+                load.event_manager,
             )?;
         }
 
