@@ -16,7 +16,6 @@ use crate::pci::configuration::PciCapability;
 use crate::pci::{PciCapabilityId, PciSBDF};
 use crate::snapshot::Persist;
 use crate::vstate::interrupts::{InterruptError, MsixVectorGroup};
-use crate::vstate::vm::KvmVm;
 
 const MAX_MSIX_VECTORS_PER_DEVICE: u16 = 2048;
 const MSIX_TABLE_ENTRIES_MODULO: u64 = 16;
@@ -146,66 +145,6 @@ impl MsixConfig {
         }
     }
 
-    /// Create an MSI-X configuration from snapshot state.
-    ///
-    /// This populates the in-memory GSI routing table entries but does NOT flush them to KVM
-    /// (`KVM_SET_GSI_ROUTING`) and does NOT register IRQFDs (`KVM_IRQFD`).
-    /// The caller must call [KvmVm::set_gsi_routes] and [MsixConfig::enable_unmasked_vectors].
-    pub fn from_state(
-        state: MsixConfigState,
-        vm: Arc<KvmVm>,
-        sbdf: PciSBDF,
-    ) -> Result<Self, InterruptError> {
-        let num_vectors = state.vectors.len();
-        if num_vectors > MAX_MSIX_VECTORS_PER_DEVICE as usize {
-            return Err(InterruptError::MsixStateSizeMismatch(format!(
-                "vectors length ({num_vectors}) exceeds maximum \
-                 ({MAX_MSIX_VECTORS_PER_DEVICE})"
-            )));
-        }
-
-        let num_table_entries = state.table_entries.len();
-        if num_table_entries != num_vectors {
-            return Err(InterruptError::MsixStateSizeMismatch(format!(
-                "table_entries length ({num_table_entries}) does not match \
-                 vectors length ({num_vectors})"
-            )));
-        }
-
-        let expected_pba_entries = u16::try_from(num_vectors)
-            .unwrap()
-            .div_ceil(BITS_PER_PBA_ENTRY) as usize;
-        if state.pba_entries.len() != expected_pba_entries {
-            return Err(InterruptError::MsixStateSizeMismatch(format!(
-                "pba_entries length ({}) does not match expected length \
-                 ({expected_pba_entries}) for {num_vectors} vectors",
-                state.pba_entries.len()
-            )));
-        }
-
-        let vectors = Arc::new(MsixVectorGroup::from_gsis(vm, &state.vectors)?);
-        if state.enabled && !state.masked {
-            for (idx, table_entry) in state.table_entries.iter().enumerate() {
-                if table_entry.masked() {
-                    continue;
-                }
-
-                // Only populate the in-memory routing entry; do not flush to KVM or
-                // register the IRQFD yet.
-                vectors.register(idx, table_entry, sbdf)?;
-            }
-        }
-
-        Ok(MsixConfig {
-            table_entries: state.table_entries,
-            pba_entries: state.pba_entries,
-            sbdf,
-            vectors,
-            masked: state.masked,
-            enabled: state.enabled,
-        })
-    }
-
     /// Enable unmasked MSI-X vectors by registering IRQFDs with KVM.
     ///
     /// Must follow [`crate::vstate::vm::KvmVm::set_gsi_routes`].
@@ -218,17 +157,6 @@ impl MsixConfig {
             }
         }
         Ok(())
-    }
-
-    /// Create the state object for serializing MSI-X vectors
-    pub fn state(&self) -> MsixConfigState {
-        MsixConfigState {
-            table_entries: self.table_entries.clone(),
-            pba_entries: self.pba_entries.clone(),
-            masked: self.masked,
-            enabled: self.enabled,
-            vectors: self.vectors.save(),
-        }
     }
 
     /// Set the MSI-X control message (enable/disable, (un)mask)
