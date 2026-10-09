@@ -252,6 +252,20 @@ impl<'a> Persist<'a> for MMIOPlatformDevices {
                 .map(|device| device.inner.lock().expect("Poisoned lock").save()),
         }
     }
+
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+    fn apply_state(&mut self, state: &Self::State, _: Self::ApplyArgs) -> Result<(), Self::Error> {
+        // Serial state is stored separately and applied by DeviceManager.
+        #[cfg(target_arch = "aarch64")]
+        if let (Some(device), Some(saved)) = (&self.gpio_pl061, &state.gpio_pl061_state) {
+            device
+                .inner
+                .lock()
+                .expect("Poisoned lock")
+                .apply_state(saved, ())?;
+        }
+        Ok(())
+    }
 }
 
 impl<'a> Provision<'a> for MMIOPlatformDevices {
@@ -291,11 +305,7 @@ impl<'a> Provision<'a> for MMIOPlatformDevices {
             }
 
             if let Some(device_info) = state.gpio_pl061 {
-                let mut gpio = PL061Device::new()?;
-                if let Some(saved) = &state.gpio_pl061_state {
-                    gpio.apply_state(saved, ())?;
-                }
-                let gpio_pl061 = Arc::new(Mutex::new(gpio));
+                let gpio_pl061 = Arc::new(Mutex::new(PL061Device::new()?));
                 platform_devices.register_mmio_gpio_pl061(
                     constructor_args.vm,
                     gpio_pl061,
@@ -828,7 +838,7 @@ mod tests {
         let restore_vm = Arc::new(restore_vm);
         let mut restore_event_manager = EventManager::new().unwrap();
         let mut vm_resources = crate::resources::VmResources::default();
-        let restored = MMIOPlatformDevices::provision(
+        let mut restored = MMIOPlatformDevices::provision(
             MMIOPlatformDevicesProvisionArgs {
                 vm: &restore_vm,
                 event_manager: &mut restore_event_manager,
@@ -838,6 +848,18 @@ mod tests {
             &state,
         )
         .unwrap();
+        assert_eq!(
+            restored
+                .gpio_pl061
+                .as_ref()
+                .unwrap()
+                .inner
+                .lock()
+                .unwrap()
+                .save(),
+            PL061State::default()
+        );
+        restored.apply_state(&state, ()).unwrap();
 
         assert!(restored.serial.is_none());
         assert_eq!(
@@ -1110,6 +1132,50 @@ mod tests {
             expected_vm_resources,
             serde_json::to_string_pretty(&VmmConfig::from(&*vm_resources)).unwrap()
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_platform_apply_state_preserves_gpio_resources() {
+        use std::os::fd::AsRawFd;
+
+        let mut vmm = default_vmm();
+        let vm = vmm.vm.as_kvm().unwrap();
+        let devices = &mut vmm.device_manager.mmio_platform_devices;
+        let mut source = PL061Device::new().unwrap();
+        source.bus_write(0x40c, &1u32.to_le_bytes());
+        source.bus_write(0x410, &1u32.to_le_bytes());
+        let gpio = Arc::new(Mutex::new(PL061Device::new().unwrap()));
+        let interrupt_fd = gpio.lock().unwrap().interrupt_evt.as_raw_fd();
+        devices
+            .register_mmio_gpio_pl061(vm, gpio.clone(), None)
+            .unwrap();
+        let mut state = devices.save();
+        state.gpio_pl061_state = Some(source.save());
+        let resources = state.gpio_pl061.unwrap();
+
+        // As on the original load path, optional register state without a GPIO is ignored.
+        let mut no_gpio_state = state.clone();
+        no_gpio_state.gpio_pl061 = None;
+        MMIOPlatformDevices::new()
+            .apply_state(&no_gpio_state, ())
+            .unwrap();
+
+        devices.apply_state(&state, ()).unwrap();
+
+        assert_eq!(devices.gpio_pl061_device_info(), Some(&resources));
+        assert!(Arc::ptr_eq(
+            &devices.gpio_pl061.as_ref().unwrap().inner,
+            &gpio
+        ));
+        assert_eq!(gpio.lock().unwrap().interrupt_evt.as_raw_fd(), interrupt_fd);
+        assert_eq!(gpio.lock().unwrap().save(), source.save());
+        let mut value = [0; 4];
+        vm.common
+            .mmio_bus
+            .read(resources.addr + 0x410, &mut value)
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(value), 1);
     }
 
     #[test]

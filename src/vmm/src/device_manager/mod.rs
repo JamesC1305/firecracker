@@ -751,9 +751,12 @@ impl<'a> Provision<'a> for DeviceManager {
             vm_resources: constructor_args.vm_resources,
             serial_state: state.serial_state.as_ref(),
         };
-        let mmio_platform_devices =
+        let mut mmio_platform_devices =
             MMIOPlatformDevices::provision(platform_ctor_args, &state.mmio_platform_state)
                 .map_err(DeviceManagerPersistError::MmioRestore)?;
+        mmio_platform_devices
+            .apply_state(&state.mmio_platform_state, ())
+            .map_err(DeviceManagerPersistError::MmioRestore)?;
 
         // Restore ACPI devices
         let acpi_devices = restore::<ACPIDeviceManager>(
