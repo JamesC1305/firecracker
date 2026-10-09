@@ -118,7 +118,6 @@ impl VirtioMem {
         block_size_mib: u32,
         slot_size_mib: u32,
     ) -> Result<Self, VirtioMemError> {
-        let queues = vec![Queue::new(FIRECRACKER_MAX_QUEUE_SIZE); MEM_NUM_QUEUES];
         let config = virtio_mem_config {
             addr: addr.raw_value(),
             region_size: u32_mib_to_bytes(total_size_mib),
@@ -132,7 +131,6 @@ impl VirtioMem {
 
         Self::from_state(
             vm,
-            queues,
             config,
             u64_to_usize(u32_mib_to_bytes(slot_size_mib)),
             plugged_blocks,
@@ -141,7 +139,6 @@ impl VirtioMem {
 
     pub fn from_state(
         vm: Arc<KvmVm>,
-        queues: Vec<Queue>,
         config: virtio_mem_config,
         slot_size: usize,
         plugged_blocks: BitVec,
@@ -156,7 +153,7 @@ impl VirtioMem {
             acked_features: 0u64,
             activate_event,
             device_state: DeviceState::Inactive,
-            queues,
+            queues: vec![Queue::new(FIRECRACKER_MAX_QUEUE_SIZE); MEM_NUM_QUEUES],
             queue_events,
             config,
             vm,
@@ -486,10 +483,6 @@ impl VirtioMem {
         self.avail_features = features;
     }
 
-    pub(crate) fn set_acked_features(&mut self, features: u64) {
-        self.acked_features = features;
-    }
-
     pub(crate) fn activate_event(&self) -> &EventFd {
         &self.activate_event
     }
@@ -815,7 +808,6 @@ mod tests {
     fn test_from_state() {
         let vm = setup_vm_with_memory(0x1000);
         let vm = Arc::new(vm);
-        let queues = vec![Queue::new(FIRECRACKER_MAX_QUEUE_SIZE); MEM_NUM_QUEUES];
         let addr = 512 << 30;
         let region_size_mib: u32 = 2048;
         let block_size_mib: u32 = 2;
@@ -836,7 +828,6 @@ mod tests {
         );
         let mem = VirtioMem::from_state(
             vm,
-            queues,
             config,
             u64_to_usize(u32_mib_to_bytes(slot_size_mib)),
             plugged_blocks,

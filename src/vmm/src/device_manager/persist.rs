@@ -678,7 +678,7 @@ impl<'a> Provision<'a> for MMIOVirtioDevices {
         if let Some(memory_state) = &state.memory_device {
             let ctor_args = VirtioMemProvisionArgs::new(Arc::clone(vm));
             let device =
-                restore::<VirtioMem>(ctor_args, &memory_state.device_state, (), &mut load)?;
+                restore::<VirtioMem>(ctor_args, &memory_state.device_state, mem, &mut load)?;
 
             constructor_args.vm_resources.memory_hotplug = Some(MemoryHotplugConfig {
                 total_size_mib: device.total_size_mib(),

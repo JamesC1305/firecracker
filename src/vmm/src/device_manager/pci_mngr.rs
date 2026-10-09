@@ -688,7 +688,7 @@ impl<'a> Provision<'a> for PciDevices {
         if let Some(memory_device) = &state.memory_device {
             let ctor_args = VirtioMemProvisionArgs::new(Arc::clone(constructor_args.vm));
             let device =
-                restore::<VirtioMem>(ctor_args, &memory_device.device_state, (), &mut load)?;
+                restore::<VirtioMem>(ctor_args, &memory_device.device_state, mem, &mut load)?;
 
             constructor_args.vm_resources.memory_hotplug = Some(MemoryHotplugConfig {
                 total_size_mib: device.total_size_mib(),
