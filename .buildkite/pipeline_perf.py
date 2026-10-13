@@ -72,7 +72,8 @@ perf_test = {
     },
     "boottime": {
         "label": "boottime",
-        "tests": "integration_tests/performance/test_boottime.py::test_boottime",
+        # FC-OPS-3344: a subset of the configurations #1063 flagged on aarch64.
+        "tests": "integration_tests/performance/test_boottime.py::test_boottime -k 'BlockBoot and not Transparent and (1-1024 or 4-4096)'",
         "devtool_opts": "-c 1-10 -m 0",
     },
     "process-startup": {
@@ -119,6 +120,14 @@ BKPipeline.parser.add_argument(
     required=False,
     help="performance test",
     action="append",
+)
+
+# FC-OPS-3344: the personal pipeline's upload command can't be changed, so
+# default to aarch64 boottime on two instance types instead of the full matrix.
+BKPipeline.parser.set_defaults(
+    test=["boottime"],
+    instances=["m7g.metal", "m9g.metal-48xl"],
+    platforms=[("al2023", "linux_6.1")],
 )
 
 pipeline = BKPipeline(
