@@ -13,6 +13,7 @@ from framework.utils import (
     get_stable_rss_mem,
     start_fast_page_fault_helper,
     track_cpu_utilization,
+    wait_for_balloon_actual,
 )
 from framework.utils_hugepages import HugePagesConfig, supports_hugetlbfs_discard
 
@@ -24,6 +25,13 @@ pytestmark = pytest.mark.parametrize(
 )
 
 NS_IN_MSEC = 1_000_000
+
+# Resident guest memory the traditional balloon must hand back to the host.
+BALLOON_RECLAIM_MIB = 32
+# Resident guest memory free page hinting and reporting must hand back: half of
+# the 128 MiB that fast_page_fault_helper touches and then frees. 76-100 MiB
+# came back across hinting and reporting runs on x86 with guest 6.1 and 6.18.
+FREE_PAGE_RECLAIM_MIB = 64
 
 
 def trigger_page_fault_run(vm):
@@ -181,7 +189,7 @@ def test_hinting_fault_latency(
 @pytest.mark.parametrize("method", ["traditional", "hinting", "reporting"])
 def test_size_reduction(uvm, rootfs, method, backing, huge_pages):
     """
-    Verify that ballooning reduces RSS usage on a newly booted guest.
+    Verify that ballooning hands guest memory back to the host on a newly booted guest.
     """
     traditional_balloon = method == "traditional"
     free_page_reporting = method == "reporting"
@@ -209,7 +217,8 @@ def test_size_reduction(uvm, rootfs, method, backing, huge_pages):
     test_microvm.api.balloon.put(
         amount_mib=0,
         deflate_on_oom=True,
-        stats_polling_interval_s=0,
+        # wait_for_balloon_actual reads the balloon size from its statistics.
+        stats_polling_interval_s=1 if traditional_balloon else 0,
         free_page_reporting=free_page_reporting,
         free_page_hinting=free_page_hinting,
     )
@@ -217,12 +226,14 @@ def test_size_reduction(uvm, rootfs, method, backing, huge_pages):
     # Start the microvm.
     test_microvm.start()
 
-    get_stable_rss_mem(test_microvm)
+    # Only measure the guest's memory: Firecracker's own memory would throw off
+    # the estimate of untouched guest memory below.
+    get_stable_rss_mem(test_microvm, guest_only=True)
 
     # Blocks until the helper has touched its 128 MiB and is waiting in sigwait.
     pid = start_fast_page_fault_helper(test_microvm.ssh)
 
-    first_reading = get_stable_rss_mem(test_microvm)
+    first_reading = get_stable_rss_mem(test_microvm, guest_only=True)
 
     # Kill the application which will free the held memory
     test_microvm.ssh.check_output(f"kill -s {signal.SIGUSR1} {pid}")
@@ -233,26 +244,29 @@ def test_size_reduction(uvm, rootfs, method, backing, huge_pages):
     test_microvm.ssh.run("sync; echo 3 > /proc/sys/vm/drop_caches")
     time.sleep(2)
 
-    # We take the initial reading of the RSS, then calculate the amount
-    # we need to inflate the balloon with by subtracting it from the
-    # VM size and adding an offset of 10 MiB in order to make sure we
-    # get a lower reading than the initial one.
-    inflate_size = 256 - int(first_reading / 1024) + 10
-
     if traditional_balloon:
-        # Now inflate the balloon
-        test_microvm.api.balloon.patch(amount_mib=inflate_size)
-    elif free_page_hinting:
-        test_microvm.api.balloon_hinting_start.patch()
+        # Balloon pages that the guest never touched free nothing on the host,
+        # and the balloon may take those first. Inflate past all of them, so at
+        # least BALLOON_RECLAIM_MIB of resident memory has to come back.
+        guest_mib = test_microvm.mem_size_bytes // 2**20
+        untouched_mib = max(guest_mib - first_reading // 1024, 0)
+        inflate_mib = untouched_mib + BALLOON_RECLAIM_MIB
+        test_microvm.api.balloon.patch(amount_mib=inflate_mib)
+        wait_for_balloon_actual(test_microvm, inflate_mib)
+        expected_kib = BALLOON_RECLAIM_MIB * 1024
+    else:
+        if free_page_hinting:
+            test_microvm.api.balloon_hinting_start.patch()
+        # Hinting and reporting hand back free memory, most of it the
+        # helper's freed 128 MiB.
+        expected_kib = FREE_PAGE_RECLAIM_MIB * 1024
 
-    _ = get_stable_rss_mem(test_microvm)
+    _ = get_stable_rss_mem(test_microvm, guest_only=True)
+    second_reading = get_stable_rss_mem(test_microvm, guest_only=True)
 
-    if traditional_balloon:
-        # Deflate the balloon completely.
-        test_microvm.api.balloon.patch(amount_mib=0)
-
-    # Check memory usage again.
-    second_reading = get_stable_rss_mem(test_microvm)
-
-    # There should be a reduction of at least 10MB.
-    assert first_reading - second_reading >= 10000
+    # Allow 10% for pages the guest touches again between the two readings.
+    reduction_kib = first_reading - second_reading
+    assert reduction_kib >= expected_kib * 0.9, (
+        f"guest memory resident on the host fell by {reduction_kib} KiB "
+        f"({first_reading} -> {second_reading}), expected about {expected_kib} KiB"
+    )
