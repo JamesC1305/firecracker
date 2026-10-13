@@ -29,6 +29,8 @@ from tenacity import (
     wait_fixed,
 )
 
+from framework.utils_memory import get_guest_resident_memory, guest_memfds
+
 FLUSH_CMD = 'screen -S {session} -X colon "logfile flush 0^M"'
 CommandReturn = namedtuple("CommandReturn", "returncode stdout stderr")
 CMDLOG = logging.getLogger("commands")
@@ -136,11 +138,7 @@ def get_resident_memory(process: psutil.Process):
     """Returns current memory utilization in KiB, including used HugeTLBFS and memfds"""
 
     proc_status = Path("/proc", str(process.pid), "status").read_text("utf-8")
-    memfds = [
-        fd
-        for fd in Path("/proc", str(process.pid), "fd").iterdir()
-        if fd.resolve().name.startswith("memfd:guest_mem")
-    ]
+    memfds = guest_memfds(process.pid)
     if memfds:
         # MADV_DONTNEED unmaps memfd pages without freeing them, so RSS drops while
         # the memfd still holds the memory. Count what the memfd holds instead.
@@ -268,20 +266,28 @@ def search_output_from_cmd(cmd: str, find_regex: typing.Pattern) -> typing.Match
     )
 
 
-def get_stable_rss_mem(uvm, percentage_delta=1):
+def get_stable_rss_mem(uvm, percentage_delta=1, guest_only=False):
     """
     Get the RSS memory that a guest uses, given the pid of the guest.
 
     Wait till the fluctuations in RSS drop below percentage_delta.
     Or print a warning if this does not happen.
+
+    By default this measures the whole Firecracker process. With guest_only, it
+    measures only the guest's memory, see get_guest_resident_memory.
     """
+
+    def read_rss():
+        if guest_only:
+            return get_guest_resident_memory(uvm)
+        return get_resident_memory(uvm.ps)
 
     first_rss = 0
     second_rss = 0
     for _ in range(5):
-        first_rss = get_resident_memory(uvm.ps)
+        first_rss = read_rss()
         time.sleep(1)
-        second_rss = get_resident_memory(uvm.ps)
+        second_rss = read_rss()
         abs_diff = abs(first_rss - second_rss)
         abs_delta = abs_diff / first_rss * 100
         print(
