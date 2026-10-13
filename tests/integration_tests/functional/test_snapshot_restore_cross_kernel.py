@@ -118,7 +118,7 @@ def test_snap_restore_from_artifacts(
     # Skip memory monitor: the balloon inflation below fragments the guest
     # VMA via discard_range's MAP_FIXED anonymous mmap workaround (used only
     # for private file-backed mappings from snapshot restore), defeating
-    # MemoryMonitor.is_guest_mem. Cross-kernel test, not overhead.
+    # framework.utils_memory.is_guest_mem. Cross-kernel test, not overhead.
     vm = microvm_factory.build(monitor_memory=False)
     vm.time_api_requests = False
     vm.spawn()

@@ -8,7 +8,7 @@ from threading import Thread
 
 import psutil
 
-from framework.properties import global_props
+from framework.utils_memory import is_guest_mem
 
 
 class MemoryUsageExceededError(Exception):
@@ -29,19 +29,6 @@ class MemoryMonitor(Thread):
     The guest's memory region is skipped, as the main interest is the
     VMM memory usage.
     """
-
-    # If guest memory is >3GiB, it is split in a 2nd region
-    # Gap starts at 3GiBs and is 1GiB long
-    X86_32BIT_MEMORY_GAP_START = 3 << 30
-    X86_32BIT_MEMORY_GAP_SIZE = 1 << 30
-    # If guest memory is >255GiB, it is split in a 3rd region
-    # Gap starts at 256 GiB and is 256GiB long
-    X86_64BIT_MEMORY_GAP_START = 256 << 30
-    # On ARM64 we just have a single gap, but memory starts at an offset
-    # Gap starts at 256 GiB and is GiB long
-    # Memory starts at 2GiB
-    ARM64_64BIT_MEMORY_GAP_START = 256 << 30
-    ARM64_MEMORY_START = 2 << 30
 
     def __init__(
         self,
@@ -102,7 +89,7 @@ class MemoryMonitor(Thread):
                 return
             mem_total = 0
             for mmap in mmaps:
-                if self.is_guest_mem(mmap.size, guest_mem_bytes):
+                if is_guest_mem(mmap.size, guest_mem_bytes):
                     continue
 
                 mem_total += mmap.rss
@@ -112,59 +99,6 @@ class MemoryMonitor(Thread):
                 return
 
             time.sleep(self._period_s)
-
-    def is_guest_mem_x86(self, size, guest_mem_bytes):
-        """
-        Checks if a region is a guest memory region based on
-        x86_64 physical memory layout
-        """
-        # it could be bigger if hotplugging is enabled
-        # if it's bigger, it's likely not from FC because we don't have big allocations
-        return size >= guest_mem_bytes or size in (
-            # memory fits before the first gap
-            guest_mem_bytes,
-            # guest memory spans at least two regions & memory fits before the second gap
-            self.X86_32BIT_MEMORY_GAP_START,
-            # guest memory spans exactly two regions
-            guest_mem_bytes - self.X86_32BIT_MEMORY_GAP_START,
-            # guest memory fills the space between the two gaps
-            self.X86_64BIT_MEMORY_GAP_START
-            - self.X86_32BIT_MEMORY_GAP_START
-            - self.X86_32BIT_MEMORY_GAP_SIZE,
-            # guest memory spans 3 regions, this is what remains past the second gap
-            guest_mem_bytes
-            - self.X86_64BIT_MEMORY_GAP_START
-            + self.X86_32BIT_MEMORY_GAP_SIZE,
-        )
-
-    def is_guest_mem_arch64(self, size, guest_mem_bytes):
-        """
-        Checks if a region is a guest memory region based on
-        ARM64 physical memory layout
-        """
-        # it could be bigger if hotplugging is enabled
-        # if it's bigger, it's likely not from FC because we don't have big allocations
-        return size >= guest_mem_bytes or size in (
-            # guest memory fits before the gap
-            guest_mem_bytes,
-            # guest memory fills the space before the gap
-            self.ARM64_64BIT_MEMORY_GAP_START - self.ARM64_MEMORY_START,
-            # guest memory spans 2 regions, this is what remains past the gap
-            guest_mem_bytes
-            - self.ARM64_64BIT_MEMORY_GAP_START
-            + self.ARM64_MEMORY_START,
-        )
-
-    def is_guest_mem(self, size, guest_mem_bytes):
-        """
-        If the address is recognised as a guest memory region,
-        return True, otherwise return False.
-        """
-
-        if global_props.cpu_architecture == "x86_64":
-            return self.is_guest_mem_x86(size, guest_mem_bytes)
-
-        return self.is_guest_mem_arch64(size, guest_mem_bytes)
 
     def check_samples(self):
         """Check that there are no samples over the threshold."""
