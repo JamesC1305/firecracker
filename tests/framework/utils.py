@@ -266,6 +266,23 @@ def search_output_from_cmd(cmd: str, find_regex: typing.Pattern) -> typing.Match
     )
 
 
+
+def _smaps_guest_rss(uvm):
+    """Throwaway: the guest's Rss as smaps reports it, for comparison."""
+    # pylint: disable=import-outside-toplevel
+    from framework.utils_memory import MAPS_RANGE, is_guest_mem
+
+    smaps = Path("/proc", str(uvm.firecracker_pid), "smaps").read_text("utf-8")
+    resident_kib, in_guest_mem = 0, False
+    for line in smaps.splitlines():
+        if mapping := MAPS_RANGE.match(line):
+            start, end = (int(address, 16) for address in mapping.groups())
+            in_guest_mem = is_guest_mem(end - start, uvm.mem_size_bytes)
+        elif in_guest_mem and line.startswith(("Rss:", "Private_Hugetlb:")):
+            resident_kib += int(line.split()[1])
+    return resident_kib
+
+
 def get_stable_rss_mem(uvm, percentage_delta=1, guest_only=False):
     """
     Get the RSS memory that a guest uses, given the pid of the guest.
@@ -279,7 +296,9 @@ def get_stable_rss_mem(uvm, percentage_delta=1, guest_only=False):
 
     def read_rss():
         if guest_only:
-            return get_guest_resident_memory(uvm)
+            pagemap_kib = get_guest_resident_memory(uvm)
+            print(f"DIAG guest pagemap: {pagemap_kib} smaps: {_smaps_guest_rss(uvm)}")
+            return pagemap_kib
         return get_resident_memory(uvm.ps)
 
     first_rss = 0
