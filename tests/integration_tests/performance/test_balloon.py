@@ -3,6 +3,7 @@
 """Tests for guest-side operations on /balloon resources."""
 
 import concurrent
+import re
 import signal
 import time
 
@@ -177,6 +178,60 @@ def test_hinting_fault_latency(
             time.sleep(sleep_duration)
 
 
+
+def _diag(test_microvm):
+    """Throwaway: print what the balloon discarded and the host's THP settings."""
+    # pylint: disable=import-outside-toplevel
+    import json
+    from pathlib import Path
+
+    from framework.utils_memory import is_guest_mem
+
+    thp = Path("/sys/kernel/mm/transparent_hugepage")
+    settings = {}
+    for name in (
+        "enabled",
+        "defrag",
+        "khugepaged/defrag",
+        "khugepaged/max_ptes_none",
+        "khugepaged/pages_to_scan",
+        "khugepaged/scan_sleep_millisecs",
+    ):
+        try:
+            settings[name] = (thp / name).read_text("utf-8").strip()
+        except OSError as err:
+            settings[name] = repr(err)
+    print("DIAG thp", json.dumps(settings))
+    test_microvm.flush_metrics()
+    totals = {}
+    for line in test_microvm.get_all_metrics():
+        for key, value in line.get("balloon", {}).items():
+            if isinstance(value, int):
+                totals[key] = totals.get(key, 0) + value
+    print("DIAG balloon", json.dumps(totals))
+    smaps = Path("/proc", str(test_microvm.firecracker_pid), "smaps").read_text("utf-8")
+    vmas, current = [], None
+    for line in smaps.splitlines():
+        header = re.match(r"^([0-9a-f]+)-([0-9a-f]+) ", line)
+        if header:
+            start, end = (int(x, 16) for x in header.groups())
+            current = {"size_kib": (end - start) // 1024} if end - start >= 64 << 20 else None
+            if current is not None:
+                current["guest"] = is_guest_mem(end - start, test_microvm.mem_size_bytes)
+                vmas.append(current)
+        elif current is not None and line.split(":")[0] in (
+            "Rss",
+            "AnonHugePages",
+            "THPeligible",
+        ):
+            current[line.split(":")[0]] = line.split(":")[1].strip()
+    print("DIAG vmas", json.dumps(vmas))
+    _, out, _ = test_microvm.ssh.run(
+        "cat /proc/buddyinfo; grep -E 'MemFree|MemAvailable|AnonHugePages' /proc/meminfo"
+    )
+    print("DIAG guest", out.replace("\n", " | "))
+
+
 # pylint: disable=C0103
 @pytest.mark.parametrize("backing", ["anonymous", "memfd"])
 @pytest.mark.parametrize("method", ["traditional", "hinting", "reporting"])
@@ -258,6 +313,7 @@ def test_size_reduction(uvm, rootfs, method, backing, huge_pages):
 
     # Check memory usage again.
     second_reading = get_stable_rss_mem(test_microvm, guest_only=True)
+    _diag(test_microvm)
 
     # There should be a reduction of at least 10 MiB.
     reduction = first_reading - second_reading

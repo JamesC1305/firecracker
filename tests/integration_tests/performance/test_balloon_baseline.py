@@ -1,0 +1,314 @@
+# Copyright 2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for guest-side operations on /balloon resources."""
+
+import concurrent
+import re
+import signal
+import time
+
+import pytest
+
+from framework.artifacts import GUEST_KERNEL_DEFAULT, pin_guest_kernel
+from framework.utils import (
+    get_stable_rss_mem,
+    start_fast_page_fault_helper,
+    track_cpu_utilization,
+)
+from framework.utils_hugepages import HugePagesConfig, supports_hugetlbfs_discard
+
+# Every test in this module exercises all huge_pages variants.
+pytestmark = pytest.mark.parametrize(
+    "huge_pages",
+    HugePagesConfig,
+    indirect=True,
+)
+
+NS_IN_MSEC = 1_000_000
+
+
+def trigger_page_fault_run(vm):
+    """
+    Clears old data and starts the fast_page_fault_helper script
+    """
+    vm.ssh.check_output(
+        "rm -f /tmp/fast_page_fault_helper.out && /usr/local/bin/fast_page_fault_helper -s"
+    )
+
+
+def get_page_fault_duration(vm):
+    """
+    Waits for the performance data to be available and will read the duration
+    """
+    _, duration, _ = vm.ssh.check_output(
+        "while [ ! -f /tmp/fast_page_fault_helper.out ]; do sleep 1; done; cat /tmp/fast_page_fault_helper.out"
+    )
+    return duration
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+@pytest.mark.parametrize("method", ["reporting", "hinting"])
+@pytest.mark.nonci
+def test_hinting_reporting_cpu(
+    microvm_factory,
+    guest_kernel,
+    rootfs,
+    method,
+    metrics,
+    huge_pages,
+):
+    """
+    Measure the CPU usage when running free page reporting and hinting
+    """
+    test_microvm = microvm_factory.build(
+        guest_kernel,
+        rootfs,
+        pci=True,
+        monitor_memory=False,
+    )
+    test_microvm.spawn(emit_metrics=False)
+    test_microvm.basic_config(vcpu_count=2, mem_size_mib=1024, huge_pages=huge_pages)
+    test_microvm.add_net_iface()
+
+    free_page_reporting = method == "reporting"
+    free_page_hinting = method == "hinting"
+    # Add a deflated memory balloon.
+    test_microvm.api.balloon.put(
+        amount_mib=0,
+        deflate_on_oom=False,
+        stats_polling_interval_s=0,
+        free_page_reporting=free_page_reporting,
+        free_page_hinting=free_page_hinting,
+    )
+    test_microvm.start()
+    test_microvm.pin_threads(0)
+
+    metrics.set_dimensions(
+        {
+            "performance_test": "test_balloon_cpu",
+            # "huge_pages": str(huge_pages),
+            "method": method,
+            "huge_pages": str(huge_pages),
+            **test_microvm.dimensions,
+        }
+    )
+
+    # Blocks until the helper has touched its memory and is waiting in sigwait.
+    pid = start_fast_page_fault_helper(test_microvm.ssh)
+    test_microvm.ssh.check_output(f"kill -s {signal.SIGUSR1} {pid}")
+
+    cpu_util = None
+
+    if free_page_reporting:
+        cpu_util = track_cpu_utilization(test_microvm.firecracker_pid, 5, 0)
+    else:
+        test_microvm.ssh.check_output(
+            "while [ ! -f /tmp/fast_page_fault_helper.out ]; do sleep 1; done;"
+        )
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            cpu_load_future = executor.submit(
+                track_cpu_utilization,
+                test_microvm.firecracker_pid,
+                2,
+                omit=0,
+            )
+            test_microvm.api.balloon_hinting_start.patch()
+            cpu_util = cpu_load_future.result()
+
+    for thread_name, values in cpu_util.items():
+        for value in values:
+            metrics.put_metric(f"cpu_utilization_{thread_name}", value, "Percent")
+
+
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+@pytest.mark.parametrize("sleep_duration", [0, 1, 5])
+@pytest.mark.nonci
+def test_hinting_fault_latency(
+    microvm_factory,
+    guest_kernel,
+    rootfs,
+    metrics,
+    sleep_duration,
+    huge_pages,
+):
+    """
+    Measure the overhead of running free page reporting with allocation heavy
+    workloads.
+
+    Test with different sleep intervals to measure the effect
+    depending on frequenecy
+    """
+    runs = 5
+    test_microvm = microvm_factory.build(
+        guest_kernel,
+        rootfs,
+        pci=True,
+        monitor_memory=False,
+    )
+    test_microvm.spawn(emit_metrics=False)
+    test_microvm.basic_config(vcpu_count=2, mem_size_mib=1024, huge_pages=huge_pages)
+    test_microvm.add_net_iface()
+
+    # Add a deflated memory balloon.
+    test_microvm.api.balloon.put(
+        amount_mib=0,
+        deflate_on_oom=False,
+        stats_polling_interval_s=0,
+        free_page_reporting=True,
+    )
+    test_microvm.start()
+    test_microvm.pin_threads(0)
+
+    metrics.set_dimensions(
+        {
+            "performance_test": "test_hinting_fault_latency",
+            "sleep_duration": str(sleep_duration),
+            **test_microvm.dimensions,
+        }
+    )
+
+    for i in range(runs):
+        trigger_page_fault_run(test_microvm)
+        reporting_duration = int(get_page_fault_duration(test_microvm)) / NS_IN_MSEC
+        metrics.put_metric("latency", reporting_duration, "Milliseconds")
+
+        if sleep_duration > 0 and (i + 1 < runs):
+            time.sleep(sleep_duration)
+
+
+
+def _diag(test_microvm):
+    """Throwaway: print what the balloon discarded and the host's THP settings."""
+    # pylint: disable=import-outside-toplevel
+    import json
+    from pathlib import Path
+
+    from framework.utils_memory import is_guest_mem
+
+    thp = Path("/sys/kernel/mm/transparent_hugepage")
+    settings = {}
+    for name in (
+        "enabled",
+        "defrag",
+        "khugepaged/defrag",
+        "khugepaged/max_ptes_none",
+        "khugepaged/pages_to_scan",
+        "khugepaged/scan_sleep_millisecs",
+    ):
+        try:
+            settings[name] = (thp / name).read_text("utf-8").strip()
+        except OSError as err:
+            settings[name] = repr(err)
+    print("DIAG thp", json.dumps(settings))
+    test_microvm.flush_metrics()
+    totals = {}
+    for line in test_microvm.get_all_metrics():
+        for key, value in line.get("balloon", {}).items():
+            if isinstance(value, int):
+                totals[key] = totals.get(key, 0) + value
+    print("DIAG balloon", json.dumps(totals))
+    smaps = Path("/proc", str(test_microvm.firecracker_pid), "smaps").read_text("utf-8")
+    vmas, current = [], None
+    for line in smaps.splitlines():
+        header = re.match(r"^([0-9a-f]+)-([0-9a-f]+) ", line)
+        if header:
+            start, end = (int(x, 16) for x in header.groups())
+            current = {"size_kib": (end - start) // 1024} if end - start >= 64 << 20 else None
+            if current is not None:
+                current["guest"] = is_guest_mem(end - start, test_microvm.mem_size_bytes)
+                vmas.append(current)
+        elif current is not None and line.split(":")[0] in (
+            "Rss",
+            "AnonHugePages",
+            "THPeligible",
+        ):
+            current[line.split(":")[0]] = line.split(":")[1].strip()
+    print("DIAG vmas", json.dumps(vmas))
+    _, out, _ = test_microvm.ssh.run(
+        "cat /proc/buddyinfo; grep -E 'MemFree|MemAvailable|AnonHugePages' /proc/meminfo"
+    )
+    print("DIAG guest", out.replace("\n", " | "))
+
+
+# pylint: disable=C0103
+@pytest.mark.parametrize("backing", ["anonymous", "memfd"])
+@pytest.mark.parametrize("method", ["traditional", "hinting", "reporting"])
+def test_size_reduction(uvm, rootfs, method, backing, huge_pages):
+    """
+    Verify that ballooning reduces RSS usage on a newly booted guest.
+    """
+    traditional_balloon = method == "traditional"
+    free_page_reporting = method == "reporting"
+    free_page_hinting = method == "hinting"
+    memfd_backing = backing == "memfd"
+
+    if huge_pages != HugePagesConfig.NONE:
+        if not memfd_backing and not supports_hugetlbfs_discard():
+            pytest.skip("Host does not support hugetlb discard")
+
+        if traditional_balloon:
+            pytest.skip("Traditional balloon device won't reduce RSS")
+
+    test_microvm = uvm
+    test_microvm.spawn()
+    test_microvm.basic_config(huge_pages=huge_pages, add_root_device=not memfd_backing)
+    if memfd_backing:
+        # Guest memory is only backed by a memfd when a vhost-user device is attached.
+        test_microvm.add_vhost_user_drive(
+            "rootfs", rootfs, is_root_device=True, is_read_only=True
+        )
+    test_microvm.add_net_iface()
+
+    # Add a memory balloon.
+    test_microvm.api.balloon.put(
+        amount_mib=0,
+        deflate_on_oom=True,
+        stats_polling_interval_s=0,
+        free_page_reporting=free_page_reporting,
+        free_page_hinting=free_page_hinting,
+    )
+
+    # Start the microvm.
+    test_microvm.start()
+
+    get_stable_rss_mem(test_microvm)
+
+    # Blocks until the helper has touched its 128 MiB and is waiting in sigwait.
+    pid = start_fast_page_fault_helper(test_microvm.ssh)
+
+    first_reading = get_stable_rss_mem(test_microvm)
+
+    # Kill the application which will free the held memory
+    test_microvm.ssh.check_output(f"kill -s {signal.SIGUSR1} {pid}")
+
+    # Sleep to allow guest to clean up
+    time.sleep(1)
+    # Have the guest drop its caches.
+    test_microvm.ssh.run("sync; echo 3 > /proc/sys/vm/drop_caches")
+    time.sleep(2)
+
+    # We take the initial reading of the RSS, then calculate the amount
+    # we need to inflate the balloon with by subtracting it from the
+    # VM size and adding an offset of 10 MiB in order to make sure we
+    # get a lower reading than the initial one.
+    inflate_size = 256 - int(first_reading / 1024) + 10
+
+    if traditional_balloon:
+        # Now inflate the balloon
+        test_microvm.api.balloon.patch(amount_mib=inflate_size)
+    elif free_page_hinting:
+        test_microvm.api.balloon_hinting_start.patch()
+
+    _ = get_stable_rss_mem(test_microvm)
+
+    if traditional_balloon:
+        # Deflate the balloon completely.
+        test_microvm.api.balloon.patch(amount_mib=0)
+
+    # Check memory usage again.
+    second_reading = get_stable_rss_mem(test_microvm)
+    _diag(test_microvm)
+
+    # There should be a reduction of at least 10MB.
+    assert first_reading - second_reading >= 10000
