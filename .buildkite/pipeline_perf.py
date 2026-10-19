@@ -121,6 +121,10 @@ BKPipeline.parser.add_argument(
     action="append",
 )
 
+# Snapshot restore split A/B: the personal pipeline's upload command can't be
+# changed, so default to the snapshot latency tests on the full instance matrix.
+BKPipeline.parser.set_defaults(test=["snapshot-latency"])
+
 pipeline = BKPipeline(
     # Boost priority from 1 to 2 so these jobs are preferred by ag=1 agents
     priority=2,
