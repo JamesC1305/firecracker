@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use super::TapError;
 use super::device::Net;
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
 use crate::mmds::data_store::Mmds;
@@ -61,8 +60,6 @@ pub enum NetPersistError {
     VirtioState(#[from] VirtioStateError),
     /// Indicator that no MMDS is associated with this device.
     NoMmdsDataStore,
-    /// Setting tap interface offload flags failed: {0}
-    TapSetOffload(TapError),
 }
 
 impl<'a> Persist<'a> for Net {
