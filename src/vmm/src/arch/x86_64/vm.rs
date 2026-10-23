@@ -12,7 +12,6 @@ use kvm_ioctls::Cap;
 use serde::{Deserialize, Serialize};
 
 use crate::arch::x86_64::msr::MsrError;
-use crate::snapshot::Persist;
 use crate::utils::u64_to_usize;
 use crate::vstate::bus::Bus;
 use crate::vstate::kvm::Kvm;
@@ -163,7 +162,7 @@ impl KvmVm {
             .set_irqchip(&state.ioapic)
             .map_err(KvmVmError::SetIrqChipIoAPIC)?;
         self.common.resource_allocator =
-            Mutex::new(ResourceAllocator::restore((), &state.resource_allocator)?);
+            Mutex::new(ResourceAllocator::from_state(&state.resource_allocator)?);
         Ok(())
     }
 

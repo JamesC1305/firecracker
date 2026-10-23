@@ -876,6 +876,7 @@ mod tests {
     use super::super::super::csm::defs as csm_defs;
     use super::*;
     use crate::devices::virtio::vsock::device::{RXQ_INDEX, TXQ_INDEX};
+    use crate::devices::virtio::vsock::persist::VsockBackendState;
     use crate::devices::virtio::vsock::test_utils;
     use crate::devices::virtio::vsock::test_utils::TestContext as VsockTestContext;
 
@@ -1791,5 +1792,19 @@ mod tests {
 
         // Check that the connection was removed.
         assert_eq!(METRICS.conns_removed.count(), conns_removed + 1);
+    }
+
+    #[test]
+    fn test_apply_state() {
+        let mut ctx = MuxerTestContext::new("apply_state");
+        let state = VsockBackendState {
+            uds_path: ctx.muxer.host_sock_path.clone(),
+            local_port_last: 0x5000_1234,
+        };
+
+        crate::snapshot::assert_apply_restores(&mut ctx.muxer, &state, ());
+
+        let (_stream, local_port) = ctx.local_connect(1026);
+        assert_eq!(local_port, state.local_port_last + 1);
     }
 }

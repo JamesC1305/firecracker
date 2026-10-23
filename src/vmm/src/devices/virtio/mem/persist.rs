@@ -8,13 +8,12 @@ use std::sync::Arc;
 use bitvec::vec::BitVec;
 use serde::{Deserialize, Serialize};
 
-use crate::devices::virtio::device::VirtioDeviceType;
 use crate::devices::virtio::generated::virtio_mem::virtio_mem_config;
-use crate::devices::virtio::mem::{MEM_NUM_QUEUES, VirtioMem, VirtioMemError};
+use crate::devices::virtio::mem::{VirtioMem, VirtioMemError};
 use crate::devices::virtio::persist::{PersistError as VirtioStateError, VirtioDeviceState};
-use crate::devices::virtio::queue::FIRECRACKER_MAX_QUEUE_SIZE;
-use crate::snapshot::Persist;
+use crate::snapshot::{Persist, Provision};
 use crate::utils::usize_to_u64;
+use crate::vstate::memory::GuestMemoryMmap;
 use crate::vstate::vm::KvmVm;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,11 +29,11 @@ pub struct VirtioMemState {
 }
 
 #[derive(Debug)]
-pub struct VirtioMemConstructorArgs {
+pub struct VirtioMemProvisionArgs {
     vm: Arc<KvmVm>,
 }
 
-impl VirtioMemConstructorArgs {
+impl VirtioMemProvisionArgs {
     pub fn new(vm: Arc<KvmVm>) -> Self {
         Self { vm }
     }
@@ -48,9 +47,9 @@ pub enum VirtioMemPersistError {
     VirtioState(#[from] VirtioStateError),
 }
 
-impl Persist<'_> for VirtioMem {
+impl<'a> Persist<'a> for VirtioMem {
     type State = VirtioMemState;
-    type ConstructorArgs = VirtioMemConstructorArgs;
+    type ApplyArgs = &'a GuestMemoryMmap;
     type Error = VirtioMemPersistError;
 
     fn save(&self) -> Self::State {
@@ -66,48 +65,58 @@ impl Persist<'_> for VirtioMem {
         }
     }
 
-    fn restore(
-        constructor_args: Self::ConstructorArgs,
+    /// Keeps the VM and eventfds. The guest-memory owner restores the KVM slot map.
+    fn apply_state(
+        &mut self,
         state: &Self::State,
-    ) -> Result<Self, Self::Error> {
-        let queues = state.virtio_state.build_queues_checked(
-            constructor_args.vm.guest_memory(),
-            VirtioDeviceType::Mem,
-            MEM_NUM_QUEUES,
-            FIRECRACKER_MAX_QUEUE_SIZE,
-        )?;
-
-        let plugged_blocks = BitVec::from_iter(state.plugged_blocks.iter());
-
-        let config = virtio_mem_config {
+        mem: &GuestMemoryMmap,
+    ) -> Result<(), Self::Error> {
+        state.virtio_state.apply_to(self, mem)?;
+        self.plugged_blocks.clear();
+        self.plugged_blocks.extend(state.plugged_blocks.iter());
+        self.config = virtio_mem_config {
             addr: state.addr,
             region_size: state.region_size,
             block_size: state.block_size,
             usable_region_size: state.usable_region_size,
-            plugged_size: usize_to_u64(plugged_blocks.count_ones()) * state.block_size,
+            plugged_size: usize_to_u64(self.plugged_blocks.count_ones()) * state.block_size,
             requested_size: state.requested_size,
             ..Default::default()
         };
+        self.slot_size = state.slot_size;
+        self.set_avail_features(state.virtio_state.avail_features);
+        Ok(())
+    }
+}
 
-        let mut virtio_mem = VirtioMem::from_state(
-            constructor_args.vm,
-            queues,
-            config,
+impl Provision<'_> for VirtioMem {
+    type ProvisionArgs = VirtioMemProvisionArgs;
+
+    fn provision(args: Self::ProvisionArgs, state: &Self::State) -> Result<Self, Self::Error> {
+        // Fixed geometry is also needed by the manager's load-time resource bookkeeping.
+        Ok(VirtioMem::from_state(
+            args.vm,
+            virtio_mem_config {
+                addr: state.addr,
+                region_size: state.region_size,
+                block_size: state.block_size,
+                ..Default::default()
+            },
             state.slot_size,
-            plugged_blocks,
-        )?;
-        virtio_mem.set_avail_features(state.virtio_state.avail_features);
-        virtio_mem.set_acked_features(state.virtio_state.acked_features);
-
-        Ok(virtio_mem)
+            BitVec::new(),
+        )?)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
+
     use super::*;
     use crate::devices::virtio::device::VirtioDevice;
     use crate::devices::virtio::mem::device::test_utils::default_virtio_mem;
+    use crate::snapshot::assert_apply_restores;
+    use crate::utils::u32_mib_to_bytes;
     use crate::vstate::vm::tests::setup_vm_with_memory;
 
     #[test]
@@ -129,19 +138,24 @@ mod tests {
 
     #[test]
     fn test_save_restore_state() {
-        let mut original_dev = default_virtio_mem();
-        original_dev.set_acked_features(original_dev.avail_features());
-        let state = original_dev.save();
+        let mut original = default_virtio_mem();
+        original.set_acked_features(original.avail_features());
+        original.queues_mut()[0].size = 128;
+        original.queues_mut()[0].ready = true;
+        original.config.requested_size = u32_mib_to_bytes(128);
+        original.config.usable_region_size = u32_mib_to_bytes(512);
+        original.plugged_blocks.set(1, true);
+        original.config.plugged_size = u32_mib_to_bytes(2);
+        let state = bitcode::deserialize(&bitcode::serialize(&original.save()).unwrap()).unwrap();
+        let vm = Arc::new(setup_vm_with_memory(0x1000));
 
-        // Create a "new" VM for restore
-        let vm = setup_vm_with_memory(0x1000);
-        let vm = Arc::new(vm);
-        let constructor_args = VirtioMemConstructorArgs::new(vm);
-        let restored_dev = VirtioMem::restore(constructor_args, &state).unwrap();
-
-        assert_eq!(original_dev.config, restored_dev.config);
-        assert_eq!(original_dev.slot_size, restored_dev.slot_size);
-        assert_eq!(original_dev.avail_features(), restored_dev.avail_features());
-        assert_eq!(original_dev.acked_features(), restored_dev.acked_features());
+        let mut restored =
+            VirtioMem::provision(VirtioMemProvisionArgs::new(Arc::clone(&vm)), &state).unwrap();
+        let activate_fd = restored.activate_event().as_raw_fd();
+        let queue_fd = restored.queue_events()[0].as_raw_fd();
+        assert_apply_restores(&mut restored, &state, vm.guest_memory());
+        assert_eq!(restored.config.plugged_size, u32_mib_to_bytes(2));
+        assert_eq!(restored.activate_event().as_raw_fd(), activate_fd);
+        assert_eq!(restored.queue_events()[0].as_raw_fd(), queue_fd);
     }
 }

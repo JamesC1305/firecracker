@@ -190,9 +190,8 @@ impl MMIOVirtioDevices {
         &mut self,
         vm: &KvmVm,
         device_id: String,
-        mut device: MMIODevice<MmioTransport>,
-        event_manager: &mut EventManager,
-    ) -> Result<(), MmioError> {
+        device: MMIODevice<MmioTransport>,
+    ) -> Result<&mut MMIODevice<MmioTransport>, MmioError> {
         // Our virtio devices are currently hardcoded to use a single IRQ.
         // Validate that requirement.
         let gsi = device.resources.gsi.ok_or(MmioError::InvalidIrqConfig)?;
@@ -219,13 +218,20 @@ impl MMIOVirtioDevices {
             device.resources.len,
         )?;
 
+        Ok(self
+            .virtio_devices
+            .entry(identifier)
+            .insert_entry(device)
+            .into_mut())
+    }
+
+    pub(crate) fn subscribe_device(
+        device: &mut MMIODevice<MmioTransport>,
+        event_manager: &mut EventManager,
+    ) {
         let sub_id =
             event_manager.add_subscriber(device.inner.lock().expect("Poisoned lock").device());
         device.sub_id = Some(sub_id);
-
-        self.virtio_devices.insert(identifier, device);
-
-        Ok(())
     }
 
     /// Append a registered virtio-over-MMIO device to the kernel cmdline.
@@ -277,7 +283,8 @@ impl MMIOVirtioDevices {
                 device.resources.gsi.unwrap(),
             )?;
         }
-        self.register_mmio_virtio(vm, device_id, device, event_manager)?;
+        let device = self.register_mmio_virtio(vm, device_id, device)?;
+        Self::subscribe_device(device, event_manager);
         Ok(())
     }
 

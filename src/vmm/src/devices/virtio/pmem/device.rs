@@ -299,16 +299,13 @@ impl Pmem {
 
     /// Create a new Pmem device with a backing file at `disk_image_path` path.
     pub fn new(vm: Arc<KvmVm>, config: PmemConfig) -> Result<Self, PmemError> {
-        Self::new_with_queues(vm, config, vec![Queue::new(PMEM_QUEUE_SIZE)], 0u64, None)
+        Self::new_with_config_space(vm, config, None)
     }
 
-    /// Create a new Pmem device with a backing file at `disk_image_path` path using a pre-created
-    /// set of queues.
-    pub fn new_with_queues(
+    /// Create a new Pmem device, optionally retaining the saved guest address and size.
+    pub fn new_with_config_space(
         vm: Arc<KvmVm>,
         config: PmemConfig,
-        queues: Vec<Queue>,
-        acked_features: u64,
         config_space: Option<ConfigSpace>,
     ) -> Result<Self, PmemError> {
         let mmap = PmemMmap::new(&config.path_on_host, config.read_only)?;
@@ -338,10 +335,10 @@ impl Pmem {
 
         Ok(Self {
             avail_features: 1u64 << VIRTIO_F_VERSION_1,
-            acked_features,
+            acked_features: 0,
             activate_event: EventFd::new(libc::EFD_NONBLOCK).map_err(PmemError::EventFd)?,
             device_state: DeviceState::Inactive,
-            queues,
+            queues: vec![Queue::new(PMEM_QUEUE_SIZE)],
             queue_events: vec![EventFd::new(libc::EFD_NONBLOCK).map_err(PmemError::EventFd)?],
             guest_region,
             metrics: PmemMetricsPerDevice::alloc(config.id.clone()),

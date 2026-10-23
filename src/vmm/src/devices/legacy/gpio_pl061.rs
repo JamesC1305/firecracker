@@ -9,6 +9,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::devices::legacy::EventFdTrigger;
 use crate::logger::{IncMetric, SharedIncMetric, warn};
+use crate::snapshot::Persist;
 use crate::utils::u64_to_usize;
 use crate::vstate::bus::BusDevice;
 
@@ -147,25 +148,6 @@ impl PL061Device {
             ),
             state: PL061State::default(),
         })
-    }
-
-    /// Captures the current register state for snapshotting.
-    pub fn state(&self) -> PL061State {
-        self.state.clone()
-    }
-
-    /// Rebuilds a device from a previously saved register state, with a fresh interrupt eventfd.
-    ///
-    /// The saved state may carry an interrupt the guest had not acknowledged yet. The new
-    /// eventfd starts empty, so re-assert the line here: otherwise the restored guest would
-    /// wait forever for an interrupt that was consumed by the pre-snapshot eventfd.
-    pub fn from_state(state: &PL061State) -> Result<Self, PL061Error> {
-        let mut device = Self {
-            state: state.clone(),
-            ..Self::new()?
-        };
-        device.refresh_masked_interrupt(0)?;
-        Ok(device)
     }
 
     /// Presses the virtual power button.
@@ -401,6 +383,24 @@ impl PL061Device {
     }
 }
 
+impl Persist<'_> for PL061Device {
+    type State = PL061State;
+    type ApplyArgs = ();
+    type Error = PL061Error;
+
+    fn save(&self) -> Self::State {
+        self.state.clone()
+    }
+
+    /// Applies saved registers while retaining the provisioned interrupt eventfd.
+    fn apply_state(&mut self, state: &Self::State, _: Self::ApplyArgs) -> Result<(), Self::Error> {
+        self.state = state.clone();
+        // The fresh eventfd is empty. Reassert a saved, unacknowledged interrupt so the
+        // restored guest can observe it, as the original snapshot load did.
+        self.refresh_masked_interrupt(0)
+    }
+}
+
 /// Single-bit mask for a GPIO `line`.
 fn line_mask(line: u8) -> u8 {
     1u8 << line
@@ -631,7 +631,8 @@ mod tests {
         device.trigger_power_button().unwrap();
         assert_eq!(device.interrupt_evt.read().unwrap(), 1);
 
-        let mut restored = PL061Device::from_state(&device.state()).unwrap();
+        let mut restored = PL061Device::new().unwrap();
+        restored.apply_state(&device.save(), ()).unwrap();
 
         // The restored device gets a brand new eventfd, so the still-unacknowledged interrupt
         // has to be re-raised on it, and the button must still read as pressed.
@@ -742,16 +743,19 @@ mod tests {
         write_u32(&mut device, PL061_IEV, 0b0000_0001);
         write_u32(&mut device, PL061_IE, 0b0000_0001);
         device.set_input_level(line_mask(0), true).unwrap();
-        let state = device.state();
+        let state = device.save();
 
         // Round-trip through the same serializer Firecracker uses for snapshots.
         let bytes = bitcode::serialize(&state).unwrap();
         let decoded: PL061State = bitcode::deserialize(&bytes).unwrap();
         assert_eq!(decoded, state);
 
-        // A device rebuilt from the restored state must expose identical registers.
-        let mut restored = PL061Device::from_state(&decoded).unwrap();
-        assert_eq!(restored.state(), state);
+        // Applying the saved state preserves the provisioned interrupt resource.
+        let mut restored = PL061Device::new().unwrap();
+        let interrupt = Arc::clone(&restored.interrupt_evt.0);
+        restored.apply_state(&decoded, ()).unwrap();
+        assert_eq!(restored.save(), state);
+        assert!(Arc::ptr_eq(&interrupt, &restored.interrupt_evt.0));
         assert_eq!(read_u32(&mut restored, PL061_DIR), 0b0000_0010);
         assert_eq!(read_u32(&mut restored, PL061_IE), 0b0000_0001);
         assert_eq!(read_u32(&mut restored, PL061_RIS), 0b0000_0001);
