@@ -814,6 +814,37 @@ impl GuestRegionMmapExt {
         Ok((start..end, backing_aligned_start..backing_aligned_end))
     }
 
+    pub(crate) fn resident_len(
+        &self,
+        caddr: MemoryRegionAddress,
+        len: usize,
+    ) -> Result<usize, GuestMemoryError> {
+        let (_, Range { mut start, end }) = self.validate_discard_range_bounds(caddr, len)?;
+        let page_size = host_page_size();
+        let mut bitmap = [0u8; 1024];
+        let mut resident_pages = 0;
+        while start < end {
+            // mincore reports one byte per host page (4K in most cases),
+            // including for hugetlbfs mappings.
+            let chunk_len = u64_to_usize(end - start).min(bitmap.len() * page_size);
+            let host_addr = self.get_host_address(MemoryRegionAddress(start))?;
+            // SAFETY: `validate_discard_range_bounds` checked that the range is host-page aligned
+            // and lies within this region's userspace mapping. The bitmap has at least one byte
+            // for each host page in this chunk; mincore sets its least significant bit if
+            // the page is in core (in the page cache and resolvable via a minor page fault).
+            let ret = unsafe { libc::mincore(host_addr.cast(), chunk_len, bitmap.as_mut_ptr()) };
+            if ret != 0 {
+                return Err(GuestMemoryError::IOError(std::io::Error::last_os_error()));
+            }
+            resident_pages += bitmap[..chunk_len / page_size]
+                .iter()
+                .filter(|&&byte| byte & 1 != 0)
+                .count();
+            start += chunk_len as u64;
+        }
+        Ok(resident_pages * page_size)
+    }
+
     fn remap_anonymous_range(
         &self,
         caddr: MemoryRegionAddress,
@@ -1207,6 +1238,14 @@ where
     /// Discards a memory range, freeing the whole backing pages inside it and zeroing the rest
     fn discard_range(&self, addr: GuestAddress, range_len: usize) -> Result<(), GuestMemoryError>;
 
+    /// Returns bytes of host memory `discard_range` would free: resident host pages within the
+    /// whole backing pages in the range, measured with mincore(2). This is approximate: it counts
+    /// zero-page mappings left by host reads and page-cache pages of a MAP_PRIVATE snapshot file
+    /// the guest never touched, and misses swapped-out pages and hugetlbfs memfd pages this
+    /// process has not mapped.
+    fn resident_len(&self, addr: GuestAddress, range_len: usize)
+    -> Result<usize, GuestMemoryError>;
+
     /// Check whether the given guest address range falls entirely within plugged memory.
     /// Returns Err if the address is not in any region or is in an unplugged slot.
     fn check_range_plugged(&self, addr: GuestAddress, len: usize) -> Result<(), GuestMemoryError>;
@@ -1392,6 +1431,19 @@ impl GuestMemoryExtension for GuestMemoryMmap {
         self.try_for_each_region_in_range(addr, range_len, |region, start, len| {
             region.discard_range(start, len)
         })
+    }
+
+    fn resident_len(
+        &self,
+        addr: GuestAddress,
+        range_len: usize,
+    ) -> Result<usize, GuestMemoryError> {
+        let mut resident = 0;
+        self.try_for_each_region_in_range(addr, range_len, |region, start, len| {
+            resident += region.resident_len(start, len)?;
+            Ok(())
+        })?;
+        Ok(resident)
     }
 
     fn check_range_plugged(&self, addr: GuestAddress, len: usize) -> Result<(), GuestMemoryError> {
@@ -2123,6 +2175,129 @@ mod tests {
     }
 
     #[test]
+    fn test_resident_len() {
+        let page_size = host_page_size();
+        // More than 1024 pages exercises multiple mincore chunks and a short final chunk.
+        let len = 1026 * page_size;
+        let mem = single_region_mem(len);
+        // Keep individual host pages independent even when the host enables THP by default.
+        mem.iter()
+            .next()
+            .unwrap()
+            .madvise_range(MemoryRegionAddress(0), len, libc::MADV_NOHUGEPAGE)
+            .unwrap();
+        assert_eq!(mem.resident_len(GuestAddress(0), len).unwrap(), 0);
+        assert_eq!(mem.resident_len(GuestAddress(0), 0).unwrap(), 0);
+
+        for (i, page) in [0, 1023, 1024, 1025].into_iter().enumerate() {
+            mem.write_obj::<u8>(1, GuestAddress((page * page_size) as u64))
+                .unwrap();
+            assert_eq!(
+                mem.resident_len(GuestAddress(0), len).unwrap(),
+                (i + 1) * page_size
+            );
+        }
+        mem.discard_range(GuestAddress(0), len).unwrap();
+        assert_eq!(mem.resident_len(GuestAddress(0), len).unwrap(), 0);
+
+        let region = mem.iter().next().unwrap();
+        for (addr, range_len) in [
+            (1, page_size),
+            (0, page_size - 1),
+            (page_size as u64, len),
+            (len as u64, page_size),
+            (u64::MAX - page_size as u64 + 1, page_size),
+        ] {
+            assert_match!(
+                region
+                    .resident_len(MemoryRegionAddress(addr), range_len)
+                    .unwrap_err(),
+                GuestMemoryError::InvalidGuestAddress(_)
+            );
+            assert_match!(
+                mem.resident_len(GuestAddress(addr), range_len).unwrap_err(),
+                GuestMemoryError::InvalidGuestAddress(_)
+            );
+        }
+    }
+
+    #[test]
+    fn test_resident_len_across_regions() {
+        let page_size = host_page_size();
+        let second_region = GuestAddress((2 * page_size) as u64);
+        let mem = into_region_ext(
+            anonymous(
+                &[
+                    (GuestAddress(0), 2 * page_size),
+                    (second_region, 2 * page_size),
+                ],
+                false,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        mem.write_obj::<u8>(1, GuestAddress(page_size as u64))
+            .unwrap();
+        mem.write_obj::<u8>(1, second_region).unwrap();
+        assert_eq!(
+            mem.resident_len(GuestAddress(page_size as u64), 2 * page_size)
+                .unwrap(),
+            2 * page_size
+        );
+        mem.discard_range(GuestAddress(page_size as u64), 2 * page_size)
+            .unwrap();
+        assert_eq!(mem.resident_len(GuestAddress(0), 4 * page_size).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_resident_len_on_file() {
+        let page_size = host_page_size();
+        let mut memory_file = TempFile::new().unwrap().into_file();
+        memory_file.set_len(2 * page_size as u64).unwrap();
+        memory_file.write_all(&vec![2; 2 * page_size]).unwrap();
+        let mem = into_region_ext(
+            snapshot_file(
+                memory_file,
+                &[(GuestAddress(0), 2 * page_size)],
+                false,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        // Do not assert residency of untouched file pages: they may be in the page cache.
+        mem.write_obj::<u8>(1, GuestAddress(0)).unwrap();
+        assert_eq!(
+            mem.resident_len(GuestAddress(0), page_size).unwrap(),
+            page_size
+        );
+        mem.discard_range(GuestAddress(0), page_size).unwrap();
+        assert_eq!(mem.resident_len(GuestAddress(0), page_size).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_resident_len_on_memfd() {
+        let page_size = host_page_size();
+        let second_region = GuestAddress((4 * page_size) as u64);
+        let addr = second_region.unchecked_add(page_size as u64);
+        let regions = [(GuestAddress(0), page_size), (second_region, 2 * page_size)];
+        let mem = into_region_ext(
+            MemfdBacking::new(3 * page_size as u64, HugePageConfig::None)
+                .unwrap()
+                .allocate(&regions, false, HugePageConfig::None)
+                .unwrap(),
+        );
+        mem.write_obj::<u8>(1, addr).unwrap();
+        assert_eq!(mem.resident_len(addr, page_size).unwrap(), page_size);
+        mem.discard_range(addr, page_size).unwrap();
+        assert_eq!(mem.resident_len(addr, page_size).unwrap(), 0);
+        assert_match!(
+            mem.resident_len(GuestAddress(0), 5 * page_size)
+                .unwrap_err(),
+            GuestMemoryError::InvalidGuestAddress(_)
+        );
+    }
+
+    #[test]
     fn test_discard_range() {
         let page_size: usize = 0x1000;
         let mem = single_region_mem(2 * page_size);
@@ -2242,6 +2417,19 @@ mod tests {
             .unwrap(),
         );
         mem.write(&vec![1; 2 * page_size], GuestAddress(0)).unwrap();
+        assert_eq!(
+            mem.resident_len(GuestAddress(0), 2 * page_size).unwrap(),
+            2 * page_size
+        );
+        assert_eq!(
+            mem.resident_len(GuestAddress(0), host_page_size()).unwrap(),
+            0
+        );
+        assert_eq!(
+            mem.resident_len(GuestAddress(host_page_size() as u64), page_size)
+                .unwrap(),
+            0
+        );
 
         mem.discard_range(GuestAddress(0), host_page_size())
             .unwrap();
