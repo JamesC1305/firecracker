@@ -41,6 +41,11 @@ and this project adheres to
   exceed the vCPU count. Custom seccomp filters must include the new
   `blk_worker` thread category. See
   [block documentation](docs/block.md#threaded-mode-and-multiqueue).
+- Added the `free_page_report_resident_freed` and
+  `free_page_hint_resident_freed` balloon metrics, which count only the resident
+  host memory that free page reporting and hinting free. The existing
+  `free_page_report_freed` and `free_page_hint_freed` metrics count the full
+  length of every discarded range, including memory the host never backed.
 
 ### Changed
 

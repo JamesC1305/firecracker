@@ -65,14 +65,22 @@ pub(super) struct BalloonDeviceMetrics {
     pub event_fails: SharedIncMetric,
     /// Number of times when free page repoting was triggered
     pub free_page_report_count: SharedIncMetric,
-    /// Total memory freed by the reporting driver
+    /// Total length in bytes of the ranges the reporting driver discarded, including memory the
+    /// host never backed.
     pub free_page_report_freed: SharedIncMetric,
+    /// Host memory freed by the reporting driver, in bytes: only the resident part of each
+    /// discarded range.
+    pub free_page_report_resident_freed: SharedIncMetric,
     /// Number of errors occurred while reporting
     pub free_page_report_fails: SharedIncMetric,
     /// Number of times when free page hinting was triggered
     pub free_page_hint_count: SharedIncMetric,
-    /// Total memory freed by the hinting driver
+    /// Total length in bytes of the ranges the hinting driver discarded, including memory the host
+    /// never backed.
     pub free_page_hint_freed: SharedIncMetric,
+    /// Host memory freed by the hinting driver, in bytes: only the resident part of each discarded
+    /// range.
+    pub free_page_hint_resident_freed: SharedIncMetric,
     /// Number of errors occurred while hinting
     pub free_page_hint_fails: SharedIncMetric,
 }
@@ -88,9 +96,11 @@ impl BalloonDeviceMetrics {
             event_fails: SharedIncMetric::new(),
             free_page_report_count: SharedIncMetric::new(),
             free_page_report_freed: SharedIncMetric::new(),
+            free_page_report_resident_freed: SharedIncMetric::new(),
             free_page_report_fails: SharedIncMetric::new(),
             free_page_hint_count: SharedIncMetric::new(),
             free_page_hint_freed: SharedIncMetric::new(),
+            free_page_hint_resident_freed: SharedIncMetric::new(),
             free_page_hint_fails: SharedIncMetric::new(),
         }
     }

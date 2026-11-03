@@ -330,6 +330,17 @@ RSS. Reporting can only be enabled pre-boot and will run continually with no
 option to stop it running. The feature also requires the guest to have the Linux
 kernel config option `PAGE_REPORTING` enabled.
 
+Firecracker has two metrics for the memory that reporting frees.
+`free_page_report_freed` counts the full length of every discarded range,
+including memory the host never backed, such as memory the guest has not touched
+since boot. `free_page_report_resident_freed` counts only the host memory that
+was freed: before discarding a reported range, Firecracker uses `mincore(2)` to
+find which of its pages are resident. This count is approximate. It includes
+pages that only map the shared zero page, such as untouched pages read by a full
+snapshot, and, after restoring from a snapshot file, pages of that file in the
+host page cache. It misses swapped-out pages, and hugetlbfs pages of a memfd
+that only another process, such as a vhost-user backend, has touched.
+
 To enable free page reporting when creating the balloon device, the
 `free_page_reporting` attribute should be set in the JSON object.
 
@@ -375,6 +386,10 @@ host memory and reduce the Firecracker process's RSS. Hugetlbfs memory is
 accounted separately from RSS. Free page hinting differs from reporting as this
 is instead initiated from the host side, giving more flexibility on when to
 reclaim memory.
+
+As with reporting, `free_page_hint_freed` counts the full length of every
+discarded range, and `free_page_hint_resident_freed` counts only the resident
+host memory that hinting frees.
 
 To enable free page hinting when creating the balloon device, the
 `free_page_hinting` attribute should be set in the JSON object.
