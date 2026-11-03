@@ -9,7 +9,7 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::io;
 use std::io::{Seek, SeekFrom};
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
@@ -742,6 +742,53 @@ impl GuestRegionMmapExt {
         caddr: MemoryRegionAddress,
         len: usize,
     ) -> Result<(), GuestMemoryError> {
+        let (requested, backing_aligned) = self.validate_discard_range_bounds(caddr, len)?;
+        let backing_aligned_addr = MemoryRegionAddress(backing_aligned.start);
+        let backing_aligned_len = u64_to_usize(backing_aligned.end - backing_aligned.start);
+        match (self.inner.file_offset(), self.inner.flags()) {
+            _ if backing_aligned_len == 0 => (),
+            // If and only if we are resuming from a snapshot file, we have a file and it's mapped
+            // private
+            (Some(_), flags) if flags & libc::MAP_PRIVATE != 0 => {
+                self.remap_anonymous_range(backing_aligned_addr, backing_aligned_len)?
+            }
+            // MADV_REMOVE frees the backing pages of a shared file mapping and, unlike fallocate,
+            // sends UFFD_EVENT_REMOVE to a registered userfaultfd.
+            (Some(_), _) => {
+                self.madvise_range(backing_aligned_addr, backing_aligned_len, libc::MADV_REMOVE)?
+            }
+            (None, _) => self.madvise_range(
+                backing_aligned_addr,
+                backing_aligned_len,
+                libc::MADV_DONTNEED,
+            )?,
+        }
+
+        for edge in [
+            requested.start..backing_aligned.start,
+            backing_aligned.end..requested.end,
+        ] {
+            let edge_addr = MemoryRegionAddress(edge.start);
+            let edge_len = u64_to_usize(edge.end - edge.start);
+            // Unplugged slots are PROT_NONE, and snapshots store them as holes.
+            if edge_len == 0 || self.check_range_plugged(edge_addr, edge_len).is_err() {
+                continue;
+            }
+            let edge = self.get_slice(edge_addr, edge_len)?;
+            // SAFETY: `get_slice` bounds `edge` within this region's mapping,
+            // and plugged memory is writable.
+            unsafe { std::ptr::write_bytes(edge.ptr_guard_mut().as_ptr(), 0, edge.len()) };
+        }
+        Ok(())
+    }
+
+    /// Validates a range to discard and returns it along with its part covering whole backing
+    /// pages, which is what `discard_range` frees.
+    fn validate_discard_range_bounds(
+        &self,
+        caddr: MemoryRegionAddress,
+        len: usize,
+    ) -> Result<(Range<u64>, Range<u64>), GuestMemoryError> {
         // The address and length can come straight from a guest descriptor (balloon), so reject
         // ranges that are not host page aligned or that run past the end of the region.
         let page_size = host_page_size() as u64;
@@ -764,40 +811,7 @@ impl GuestRegionMmapExt {
         let backing_page_size = RawGuestRegionMmap::page_size(self.inner.flags()) as u64;
         let backing_aligned_start = align_up!(start, backing_page_size).min(end);
         let backing_aligned_end = align_down!(end, backing_page_size).max(backing_aligned_start);
-        let backing_aligned_addr = MemoryRegionAddress(backing_aligned_start);
-        let backing_aligned_len = u64_to_usize(backing_aligned_end - backing_aligned_start);
-        match (self.inner.file_offset(), self.inner.flags()) {
-            _ if backing_aligned_len == 0 => (),
-            // If and only if we are resuming from a snapshot file, we have a file and it's mapped
-            // private
-            (Some(_), flags) if flags & libc::MAP_PRIVATE != 0 => {
-                self.remap_anonymous_range(backing_aligned_addr, backing_aligned_len)?
-            }
-            // MADV_REMOVE frees the backing pages of a shared file mapping and, unlike fallocate,
-            // sends UFFD_EVENT_REMOVE to a registered userfaultfd.
-            (Some(_), _) => {
-                self.madvise_range(backing_aligned_addr, backing_aligned_len, libc::MADV_REMOVE)?
-            }
-            (None, _) => self.madvise_range(
-                backing_aligned_addr,
-                backing_aligned_len,
-                libc::MADV_DONTNEED,
-            )?,
-        }
-
-        for (edge_start, edge_end) in [(start, backing_aligned_start), (backing_aligned_end, end)] {
-            let edge_addr = MemoryRegionAddress(edge_start);
-            let edge_len = u64_to_usize(edge_end - edge_start);
-            // Unplugged slots are PROT_NONE, and snapshots store them as holes.
-            if edge_len == 0 || self.check_range_plugged(edge_addr, edge_len).is_err() {
-                continue;
-            }
-            let edge = self.get_slice(edge_addr, edge_len)?;
-            // SAFETY: `get_slice` bounds `edge` within this region's mapping,
-            // and plugged memory is writable.
-            unsafe { std::ptr::write_bytes(edge.ptr_guard_mut().as_ptr(), 0, edge.len()) };
-        }
-        Ok(())
+        Ok((start..end, backing_aligned_start..backing_aligned_end))
     }
 
     fn remap_anonymous_range(
