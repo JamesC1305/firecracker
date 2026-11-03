@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use utils::time::TimerFd;
+use vm_memory::GuestMemoryError;
 use vmm_sys_util::eventfd::EventFd;
 
 use super::super::ActivateError;
@@ -36,6 +37,26 @@ use crate::vstate::memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestMemoryExtension, GuestMemoryMmap,
 };
 use crate::{impl_device_type, mem_size_mib};
+
+/// Discards a range the guest reported free and returns the resident-byte estimate counted
+/// before the discard, not an exact number of bytes freed.
+///
+/// Guests also report memory they never touched, which the host never backed, so count what is
+/// resident before discarding. A failure to count is logged and never prevents the discard.
+/// Residency can change while counting or before the discard, so the count is not guaranteed to
+/// equal the bytes actually freed.
+fn discard_free_range(
+    mem: &GuestMemoryMmap,
+    addr: GuestAddress,
+    len: usize,
+) -> Result<usize, GuestMemoryError> {
+    let resident = mem.resident_len(addr, len);
+    mem.discard_range(addr, len)?;
+    Ok(resident.unwrap_or_else(|err| {
+        error!("balloon: failed to count resident memory: {err:?}");
+        0
+    }))
+}
 
 const SIZE_OF_U32: usize = std::mem::size_of::<u32>();
 const SIZE_OF_STAT: usize = std::mem::size_of::<BalloonStat>();
@@ -590,11 +611,15 @@ impl Balloon {
                 }
 
                 METRICS.free_page_hint_count.inc();
-                if let Err(err) = mem.discard_range(desc.addr, desc.len as usize) {
-                    METRICS.free_page_hint_fails.inc();
-                    error!("balloon hinting: failed to remove range: {err:?}");
-                } else {
-                    METRICS.free_page_hint_freed.add(desc.len as u64);
+                match discard_free_range(mem, desc.addr, desc.len as usize) {
+                    Ok(resident) => {
+                        METRICS.free_page_hint_freed.add(desc.len as u64);
+                        METRICS.free_page_hint_resident_freed.add(resident as u64);
+                    }
+                    Err(err) => {
+                        METRICS.free_page_hint_fails.inc();
+                        error!("balloon hinting: failed to remove range: {err:?}");
+                    }
                 }
             }
 
@@ -630,11 +655,15 @@ impl Balloon {
             let mut last_desc = Some(head);
             while let Some(desc) = last_desc {
                 METRICS.free_page_report_count.inc();
-                if let Err(err) = mem.discard_range(desc.addr, desc.len as usize) {
-                    METRICS.free_page_report_fails.inc();
-                    error!("balloon: failed to remove range: {err:?}");
-                } else {
-                    METRICS.free_page_report_freed.add(desc.len as u64);
+                match discard_free_range(mem, desc.addr, desc.len as usize) {
+                    Ok(resident) => {
+                        METRICS.free_page_report_freed.add(desc.len as u64);
+                        METRICS.free_page_report_resident_freed.add(resident as u64);
+                    }
+                    Err(err) => {
+                        METRICS.free_page_report_fails.inc();
+                        error!("balloon: failed to remove range: {err:?}");
+                    }
                 }
                 last_desc = desc.next_descriptor();
             }
@@ -1615,14 +1644,37 @@ pub(crate) mod tests {
 
         let safe_addr = align_up!(th.data_address(), page_size);
 
+        // An untouched page counts its full reported length, but frees no resident host memory.
         th.add_scatter_gather(reporting_idx, &[(0, safe_addr, page_size_chain, 0)]);
         check_metric_after_block!(
             METRICS.free_page_report_freed,
             page_size,
-            invoke_handler_for_queue_event(&mut th.device(), reporting_idx)
+            check_metric_after_block!(
+                METRICS.free_page_report_resident_freed,
+                0,
+                invoke_handler_for_queue_event(&mut th.device(), reporting_idx)
+            )
         );
 
-        // Test with multiple items
+        // A written page counts its full reported length and frees one page of resident host
+        // memory.
+        mem.write_obj::<u8>(1, GuestAddress(safe_addr)).unwrap();
+        th.add_scatter_gather(reporting_idx, &[(0, safe_addr, page_size_chain, 0)]);
+        check_metric_after_block!(
+            METRICS.free_page_report_freed,
+            page_size,
+            check_metric_after_block!(
+                METRICS.free_page_report_resident_freed,
+                page_size,
+                invoke_handler_for_queue_event(&mut th.device(), reporting_idx)
+            )
+        );
+
+        // Three written pages count three reported pages and free three resident host pages.
+        for i in 0..3 {
+            mem.write_obj::<u8>(1, GuestAddress(safe_addr + page_size * i))
+                .unwrap();
+        }
         th.add_scatter_gather(
             reporting_idx,
             &[
@@ -1635,7 +1687,36 @@ pub(crate) mod tests {
         check_metric_after_block!(
             METRICS.free_page_report_freed,
             page_size * 3,
-            invoke_handler_for_queue_event(&mut th.device(), reporting_idx)
+            check_metric_after_block!(
+                METRICS.free_page_report_resident_freed,
+                page_size * 3,
+                invoke_handler_for_queue_event(&mut th.device(), reporting_idx)
+            )
+        );
+
+        // Writing only the first and last pages counts three reported pages, but frees two resident
+        // host pages.
+        for i in [0, 2] {
+            mem.write_obj::<u8>(1, GuestAddress(safe_addr + page_size * i))
+                .unwrap();
+        }
+        th.add_scatter_gather(
+            reporting_idx,
+            &[
+                (0, safe_addr, page_size_chain, 0),
+                (1, safe_addr + page_size, page_size_chain, 0),
+                (2, safe_addr + (page_size * 2), page_size_chain, 0),
+            ],
+        );
+
+        check_metric_after_block!(
+            METRICS.free_page_report_freed,
+            page_size * 3,
+            check_metric_after_block!(
+                METRICS.free_page_report_resident_freed,
+                page_size * 2,
+                invoke_handler_for_queue_event(&mut th.device(), reporting_idx)
+            )
         );
 
         // Test with unaligned length
@@ -1646,6 +1727,29 @@ pub(crate) mod tests {
             1,
             invoke_handler_for_queue_event(&mut th.device(), reporting_idx)
         );
+    }
+
+    #[test]
+    fn test_discard_free_range_returns_resident_bytes() {
+        let mem = create_virtio_mem();
+        let page_size = host_page_size();
+        let addr = GuestAddress(page_size as u64);
+
+        // A range the guest never touched has no host backing, so nothing is freed.
+        assert_eq!(discard_free_range(&mem, addr, page_size).unwrap(), 0);
+
+        // A written page is resident and its whole page is freed.
+        mem.write_obj::<u8>(1, addr).unwrap();
+        assert_eq!(
+            discard_free_range(&mem, addr, page_size).unwrap(),
+            page_size
+        );
+
+        // The page was discarded above, so discarding it again frees nothing.
+        assert_eq!(discard_free_range(&mem, addr, page_size).unwrap(), 0);
+
+        // An unaligned range fails the discard and is not counted.
+        discard_free_range(&mem, addr.unchecked_add(1), page_size).unwrap_err();
     }
 
     struct HintingTestHelper<'a> {
