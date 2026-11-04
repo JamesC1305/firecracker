@@ -99,7 +99,7 @@ perf_test = {
     },
     "balloon": {
         "label": "balloon",
-        "tests": "integration_tests/performance/test_balloon.py::test_hinting_fault_latency",
+        "tests": "integration_tests/performance/test_balloon.py::test_reporting_churn",
         "devtool_opts": "-c 1-10 -m 0",
     },
 }
