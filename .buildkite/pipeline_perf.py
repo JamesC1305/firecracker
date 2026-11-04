@@ -97,6 +97,11 @@ perf_test = {
         # accounting for all the additional test overheads.
         "max_iterations": 30,
     },
+    "balloon": {
+        "label": "balloon",
+        "tests": "integration_tests/performance/test_balloon.py::test_hinting_fault_latency",
+        "devtool_opts": "-c 1-10 -m 0",
+    },
 }
 
 REVISION_A = os.environ.get("REVISION_A")
@@ -120,6 +125,8 @@ BKPipeline.parser.add_argument(
     help="performance test",
     action="append",
 )
+
+BKPipeline.parser.set_defaults(test=["balloon"])
 
 pipeline = BKPipeline(
     # Boost priority from 1 to 2 so these jobs are preferred by ag=1 agents

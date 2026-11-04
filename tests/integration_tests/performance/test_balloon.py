@@ -160,6 +160,7 @@ def test_hinting_fault_latency(
         {
             "performance_test": "test_hinting_fault_latency",
             "sleep_duration": str(sleep_duration),
+            "huge_pages": str(huge_pages),
             **test_microvm.dimensions,
         }
     )
