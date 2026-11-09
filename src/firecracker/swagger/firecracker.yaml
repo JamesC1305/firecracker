@@ -1976,6 +1976,26 @@ definitions:
           in the host page cache, so same-host reads still see the full
           contents. Block device backing files are always fsync'd regardless of
           this setting.
+      vcpu_registers:
+        type: string
+        enum:
+          - Inherit
+          - Pin
+          - Unpin
+        default: Inherit
+        description:
+          "Selects the vCPU registers this snapshot saves and whether it is
+          pinned. A microVM loaded from a pinned snapshot saves exactly the vCPU
+          registers that snapshot contains (on aarch64, CPU feature ID registers
+          also keep its values) instead of the ones its host reports. Inherit
+          saves the registers this microVM already saves, and the snapshot is
+          pinned if the microVM was loaded from a pinned snapshot. Pin saves the
+          host's full register set and pins the snapshot. Unpin saves the host's
+          full register set and does not pin the snapshot. Pin and Unpin do not
+          change the registers the running microVM saves afterwards. State held
+          in registers outside a pinned set is not saved. On x86_64, the set is
+          the MSR list; other vCPU state is always saved in full. This does not
+          guarantee that snapshots can be restored on a different host kernel."
 
   NetworkOverride:
     type: object

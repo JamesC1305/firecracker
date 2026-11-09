@@ -23,6 +23,7 @@
     - [Creating full snapshots](#creating-full-snapshots)
     - [Creating diff snapshots](#creating-diff-snapshots)
     - [Syncing snapshot files](#syncing-snapshot-files)
+    - [Pinning the vCPU register set](#pinning-the-vcpu-register-set)
   - [Resuming the microVM](#resuming-the-microvm)
   - [Loading snapshots](#loading-snapshots)
     - [Overriding host resources](#overriding-host-resources)
@@ -400,6 +401,54 @@ see the full contents; only durability across a host crash is lost. This is
 useful when durability isn't required (e.g. a pipeline further transforms the
 snapshot). Block device backing files are always `fsync`'d regardless of this
 setting.
+
+#### Pinning the vCPU register set
+
+By default, a snapshot saves every vCPU register the host kernel reports. A
+newer host kernel can report registers that an older kernel does not know, so a
+snapshot that is loaded and taken again on the newer kernel may no longer load
+on the older one.
+
+A microVM loaded from a pinned snapshot saves exactly the vCPU registers that
+snapshot contains, in the same order, instead of the ones its host reports. The
+optional `vcpu_registers` field of the `PUT /snapshot/create` API selects the
+registers a snapshot saves and whether the snapshot is pinned:
+
+- `Inherit` (the default) saves the registers this microVM already saves. The
+  snapshot is pinned if the microVM was loaded from a pinned snapshot.
+- `Pin` saves the host's full register set and pins the snapshot.
+- `Unpin` saves the host's full register set and does not pin the snapshot.
+
+The pin is stored in the snapshot file, so nothing has to be passed when loading
+the snapshot, and snapshots taken later with the default stay pinned to the same
+registers.
+
+`Pin` and `Unpin` only apply to the snapshot being created. They do not change
+the running microVM: if it is resumed and snapshotted again without the field,
+it saves the registers it saved before. On a microVM that is not pinned, `Unpin`
+is the same as the default.
+
+Pin a snapshot when it is created on the oldest host kernel it must stay
+loadable on. Registers outside the pinned set are not saved, so state that a
+newer kernel exposes through new registers is not carried in later snapshots.
+
+On a pinned microVM, `Pin` and `Unpin` save the current host's full register set
+in place of the pinned one. The new snapshot can hold registers and register
+values that an older host kernel does not accept, so only use them once the
+snapshot no longer has to load on an older kernel.
+
+On x86_64, the pinned set is the list of MSRs; other vCPU state (registers,
+CPUID, xsave, and so on) is always saved in full. The host's full set is the
+MSRs the host kernel reports together with the ones the microVM was booted or
+restored with, so `Pin` and `Unpin` never drop an MSR the microVM already saves.
+
+On aarch64, CPU feature ID registers also keep the pinned snapshot's values,
+because a newer host kernel may report normalized values that an older kernel
+refuses to restore. `Pin` and `Unpin` read them from the host again.
+
+The destination kernel must still accept the saved register values. Pinning does
+not guarantee cross-kernel snapshot compatibility; restores across different
+host kernels remain without guarantees.
 
 ### Resuming the microVM
 

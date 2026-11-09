@@ -21,6 +21,21 @@ pub enum SnapshotType {
     Full,
 }
 
+/// What creating a snapshot does with the vCPU registers it saves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum VcpuRegisterPinning {
+    /// Save the registers the microVM already saves. The snapshot is pinned if the microVM was
+    /// restored from a pinned snapshot.
+    #[default]
+    Inherit,
+    /// Save the host's registers and pin the snapshot: microVMs restored from it save exactly
+    /// the vCPU registers it contains.
+    Pin,
+    /// Save the host's registers and do not pin the snapshot: microVMs restored from it save
+    /// the registers of their own host.
+    Unpin,
+}
+
 /// Specifies the method through which guest memory will get populated when
 /// resuming from a snapshot:
 /// 1) A file that contains the guest memory to be loaded,
@@ -50,6 +65,10 @@ pub struct CreateSnapshotParams {
     /// Activated virtio-block devices are always fsync'd, independently of this.
     #[serde(default = "default_sync_snapshot_files")]
     pub sync_snapshot_files: bool,
+    /// The vCPU registers to save, and whether microVMs restored from this snapshot are pinned
+    /// to them. The default is `Inherit`.
+    #[serde(default)]
+    pub vcpu_registers: VcpuRegisterPinning,
 }
 
 /// Default value for [CreateSnapshotParams::sync_snapshot_files].

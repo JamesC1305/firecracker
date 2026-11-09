@@ -51,6 +51,12 @@ and this project adheres to
   files of pmem devices when loading a snapshot. See
   [Overriding host resources](docs/snapshotting/snapshot-support.md#overriding-host-resources)
   for more information.
+- Added the `vcpu_registers` option to `PUT /snapshot/create`. With `Pin`,
+  microVMs loaded from the snapshot save exactly that snapshot's vCPU register
+  set in their own snapshots, allowing snapshots taken on an older host kernel
+  to stay loadable on it after a round trip through a newer kernel. `Pin` and
+  `Unpin` on such a microVM save the current host's register set again. The pin
+  is stored in the snapshot, which bumps the snapshot version to `14.0.0`.
 
 ### Changed
 
