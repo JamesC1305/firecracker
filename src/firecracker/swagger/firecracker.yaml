@@ -1976,6 +1976,18 @@ definitions:
           in the host page cache, so same-host reads still see the full
           contents. Block device backing files are always fsync'd regardless of
           this setting.
+      pin_vcpu_registers:
+        type: boolean
+        default: false
+        description:
+          "When set to true, marks the snapshot as pinned. A microVM loaded from
+          a pinned snapshot saves exactly the vCPU registers that snapshot
+          contains (on aarch64, CPU feature ID registers also keep its values),
+          and every snapshot it takes is pinned too, whatever this field is set
+          to. State held in other registers is not saved. On x86_64, the pinned
+          set is the MSR list; other vCPU state is always saved in full. This
+          does not guarantee that snapshots can be restored on a different host
+          kernel."
 
   NetworkOverride:
     type: object

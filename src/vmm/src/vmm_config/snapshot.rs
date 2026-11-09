@@ -50,6 +50,10 @@ pub struct CreateSnapshotParams {
     /// Activated virtio-block devices are always fsync'd, independently of this.
     #[serde(default = "default_sync_snapshot_files")]
     pub sync_snapshot_files: bool,
+    /// Whether to pin the vCPU register set: microVMs restored from this snapshot save exactly
+    /// the vCPU registers it contains, and their snapshots are pinned in turn.
+    #[serde(default)]
+    pub pin_vcpu_registers: bool,
 }
 
 /// Default value for [CreateSnapshotParams::sync_snapshot_files].

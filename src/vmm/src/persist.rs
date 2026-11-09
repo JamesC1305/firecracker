@@ -103,6 +103,8 @@ pub struct MicrovmState {
     pub vcpu_states: Vec<VcpuState>,
     /// Device states.
     pub device_states: DevicesState,
+    /// Whether microVMs restored from this state save exactly its vCPU registers.
+    pub vcpu_registers_pinned: bool,
 }
 
 /// This describes the mapping between Firecracker base virtual address and
@@ -167,7 +169,7 @@ pub enum CreateSnapshotError {
 }
 
 /// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(13, 0, 0);
+pub const SNAPSHOT_VERSION: Version = Version::new(14, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
@@ -175,9 +177,11 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
-    let microvm_state = vmm
+    let mut microvm_state = vmm
         .save_state(vm_info)
         .map_err(CreateSnapshotError::MicrovmState)?;
+    // An inherited pin cannot be cleared by the request.
+    microvm_state.vcpu_registers_pinned |= params.pin_vcpu_registers;
 
     snapshot_state_to_file(
         &microvm_state,
@@ -790,6 +794,7 @@ mod tests {
         let microvm_state = MicrovmState {
             device_states: states,
             vcpu_states,
+            vcpu_registers_pinned: false,
             kvm_state: Default::default(),
             vm_info: VmInfo {
                 mem_size_mib: 1u64,
