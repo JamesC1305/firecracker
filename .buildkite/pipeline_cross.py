@@ -7,11 +7,71 @@
 1. Generate snapshots for each instance and kernel version
 2. wait
 3. Restore snapshots across instances and kernels
+4. Restore and re-snapshot on a newer kernel, then restore on the source kernel
 """
 
 import itertools
 
 from common import DEFAULT_PLATFORMS, BKPipeline
+
+
+def snapshot_roundtrip_steps(pipeline, per_instance, instances, create_step_key):
+    """Steps that take 6.1 snapshots to 6.18 and back.
+
+    The 6.18 step restores with `vcpu_register_set: Snapshot`, runs the guest
+    and re-snapshots it, so the new snapshot keeps the 6.1 vCPU register set.
+    The final step restores that snapshot on 6.1 and runs the full checks.
+    """
+    source_kv = "linux_6.1"
+    middle_kv = "linux_6.18"
+    steps = []
+    for instance in instances:
+        middle_key = f"snap-resnapshot-{instance}-{source_kv}-{middle_kv}".replace(
+            ".", "_"
+        )
+        source_artifact = f"snapshots/{instance}_{source_kv}.tar"
+        roundtrip_artifact = f"snapshots/{instance}_{source_kv}_{middle_kv}.tar"
+        middle_step = {
+            "command": [
+                f"buildkite-agent artifact download {source_artifact} .",
+                f"tar xSvf {source_artifact}",
+                *pipeline.devtool_test(
+                    devtool_opts="--no-archive",
+                    pytest_opts="-m nonci -n4 integration_tests/functional/test_snapshot_resnapshot_cross_kernel.py",
+                ),
+                "find test_results/test_snap_resnapshot_from_artifacts -type f -name mem |xargs -P4 -t -n1 fallocate -d",
+                "rm -rf snapshot_artifacts",
+                "mv -v test_results/test_snap_resnapshot_from_artifacts snapshot_artifacts",
+                "mkdir -pv snapshots",
+                f"tar cSvf {roundtrip_artifact} snapshot_artifacts",
+            ],
+            "label": f"snapshot-resnapshot-{instance}-{source_kv}-{middle_kv}",
+            "key": middle_key,
+            "timeout": 30,
+            "agents": {"instance": instance, "kv": middle_kv, "os": "al2023"},
+            "depends_on": [create_step_key(instance, source_kv)],
+            **per_instance,
+            # Only the new tarball: the downloaded source tarball has the same
+            # name the existing restore steps download.
+            "artifact_paths": roundtrip_artifact,
+        }
+        final_step = {
+            "command": [
+                f"buildkite-agent artifact download {roundtrip_artifact} .",
+                f"tar xSvf {roundtrip_artifact}",
+                *pipeline.devtool_test(
+                    pytest_opts="-m nonci -n8 --dist worksteal integration_tests/functional/test_snapshot_restore_cross_kernel.py",
+                ),
+            ],
+            "label": f"snapshot-roundtrip-{instance}-{source_kv}-{middle_kv}-{source_kv}",
+            "timeout": 30,
+            "agents": {"instance": instance, "kv": source_kv, "os": "al2023"},
+            "depends_on": [middle_key],
+            **per_instance,
+        }
+        steps.extend([middle_step, final_step])
+    return steps
+
 
 if __name__ == "__main__":
     pipeline = BKPipeline()
@@ -136,5 +196,17 @@ if __name__ == "__main__":
         steps.append(step)
     pipeline.add_step(
         {"group": "snapshot-restore-across-instances-and-kernels", "steps": steps}
+    )
+
+    pipeline.add_step(
+        {
+            "group": "snapshot-roundtrip-across-kernels",
+            "steps": snapshot_roundtrip_steps(
+                pipeline,
+                per_instance,
+                instances_x86_64 + instances_aarch64,
+                create_step_key,
+            ),
+        }
     )
     print(pipeline.to_json())
