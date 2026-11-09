@@ -5,6 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use std::collections::HashSet;
 use std::fmt::{Debug, Write};
 use std::mem::offset_of;
 use std::sync::Arc;
@@ -21,7 +22,7 @@ use crate::arch::aarch64::kvm::OptionalCapabilities;
 use crate::arch::aarch64::regs::{Aarch64RegisterVec, KVM_REG_ARM64_SVE_VLS};
 use crate::cpu_config::aarch64::custom_cpu_template::VcpuFeatures;
 use crate::cpu_config::templates::CpuConfiguration;
-use crate::logger::{IncMetric, METRICS, error};
+use crate::logger::{IncMetric, METRICS, error, info};
 use crate::vcpu::{VcpuConfig, VcpuError};
 use crate::vstate::bus::Bus;
 use crate::vstate::memory::{Address, GuestMemoryMmap};
@@ -117,6 +118,8 @@ pub struct KvmVcpu {
     kvi: kvm_vcpu_init,
     /// IPA of steal_time region
     pub pvtime_ipa: Option<GuestAddress>,
+    /// Register IDs to save, in snapshot order, instead of enumerating the host's registers.
+    pinned_reg_ids: Option<Vec<u64>>,
 }
 
 /// Vcpu peripherals
@@ -151,6 +154,7 @@ impl KvmVcpu {
             peripherals: Default::default(),
             kvi,
             pvtime_ipa: None,
+            pinned_reg_ids: None,
         })
     }
 
@@ -229,14 +233,39 @@ impl KvmVcpu {
         Ok(kvi)
     }
 
+    /// Pins subsequent snapshots to the register IDs in `state`, in the same order.
+    pub fn pin_saved_registers(&mut self, state: &VcpuState) -> Result<(), KvmVcpuError> {
+        let mut ids = Vec::with_capacity(state.regs.len());
+        ids.extend(state.regs.iter().map(|reg| reg.id));
+        if self.index == 0 {
+            let pinned_ids: HashSet<_> = ids.iter().copied().collect();
+            let mut omitted_ids = self
+                .get_all_registers_ids()
+                .map_err(KvmVcpuError::RestoreState)?;
+            omitted_ids.retain(|id| !pinned_ids.contains(id));
+            if !omitted_ids.is_empty() {
+                info!(
+                    "Snapshot omits {} host vCPU registers (hex): {omitted_ids:x?}",
+                    omitted_ids.len()
+                );
+            }
+        }
+        self.pinned_reg_ids = Some(ids);
+        Ok(())
+    }
+
     /// Save the KVM internal state.
     pub fn save_state(&self) -> Result<VcpuState, KvmVcpuError> {
         let mut state = VcpuState {
             mp_state: self.get_mpstate().map_err(KvmVcpuError::SaveState)?,
             ..Default::default()
         };
-        self.get_all_registers(&mut state.regs)
-            .map_err(KvmVcpuError::SaveState)?;
+        if let Some(ids) = &self.pinned_reg_ids {
+            get_registers(&self.fd, ids, &mut state.regs).map_err(KvmVcpuError::SaveState)?;
+        } else {
+            self.get_all_registers(&mut state.regs)
+                .map_err(KvmVcpuError::SaveState)?;
+        }
         state.mpidr = self.get_mpidr().map_err(KvmVcpuError::SaveState)?;
 
         state.kvi = self.kvi;
@@ -790,6 +819,57 @@ pub(crate) mod tests {
         assert!(!state.regs.is_empty());
         vcpu.restore_state(&state)
             .expect("Cannot restore state of vcpu");
+    }
+
+    #[test]
+    fn test_vcpu_save_restore_pinned_register_ids() {
+        let (vm, mut vcpu) = setup_vcpu(0x10000);
+        let vcpu_config = VcpuConfig {
+            vcpu_count: 1,
+            smt: false,
+            cpu_config: CpuConfiguration::default(),
+        };
+        vcpu.configure(
+            vm.guest_memory(),
+            EntryPoint {
+                entry_addr: GuestAddress(crate::arch::get_kernel_start()),
+                protocol: BootProtocol::LinuxBoot,
+            },
+            &vcpu_config,
+            &vm.kvm().optional_capabilities(),
+        )
+        .unwrap();
+        let state = vcpu.save_state().unwrap();
+        // TTBR1_EL1 is a system register, not a core or SVE vector-length register.
+        let removed_id = state
+            .regs
+            .iter()
+            .find(|reg| reg.id == TTBR1_EL1)
+            .unwrap()
+            .id;
+        let mut snapshot_state = state.clone();
+        snapshot_state.regs = Aarch64RegisterVec::default();
+        for reg in state.regs.iter().filter(|reg| reg.id != removed_id) {
+            snapshot_state.regs.push(reg);
+        }
+        let snapshot_ids: Vec<_> = snapshot_state.regs.iter().map(|reg| reg.id).collect();
+
+        let (mut restored_vm, mut restored_vcpu) = setup_vcpu_no_init(0x10000);
+        restored_vm.setup_irqchip(1).unwrap();
+        restored_vcpu.restore_state(&snapshot_state).unwrap();
+        assert!(
+            restored_vcpu
+                .save_state()
+                .unwrap()
+                .regs
+                .iter()
+                .any(|reg| reg.id == removed_id)
+        );
+
+        restored_vcpu.pin_saved_registers(&snapshot_state).unwrap();
+        let pinned_state = restored_vcpu.save_state().unwrap();
+        let saved_ids: Vec<_> = pinned_state.regs.iter().map(|reg| reg.id).collect();
+        assert_eq!(saved_ids, snapshot_ids);
     }
 
     #[test]
