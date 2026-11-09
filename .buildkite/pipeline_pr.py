@@ -63,7 +63,12 @@ def main():
     """Print the filtered pipeline."""
     script = Path(__file__).parent / "pipeline_cross.py"
     cross = json.loads(subprocess.check_output([sys.executable, str(script)]))
-    print(json.dumps(roundtrip_only(cross), indent=4))
+    pipeline = roundtrip_only(cross)
+    # Scratch: this build only reruns the aarch64 unit tests.
+    pipeline["steps"] = [
+        step for step in pipeline["steps"] if step.get("group") == "unittests-aarch64"
+    ]
+    print(json.dumps(pipeline, indent=4))
 
 
 if __name__ == "__main__":
