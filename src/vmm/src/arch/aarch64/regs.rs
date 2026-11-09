@@ -7,6 +7,7 @@
 
 use std::fmt::Write;
 use std::mem::offset_of;
+use std::ops::RangeInclusive;
 
 use kvm_bindings::*;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -119,6 +120,31 @@ arm64_sys_reg!(TCR_EL1, 3, 0, 2, 0, 2);
 // AArch64 Memory Model Feature Register
 // https://developer.arm.com/documentation/100798/0400/register-descriptions/aarch64-system-registers/id-aa64mmfr0-el1--aarch64-memory-model-feature-register-0--el1
 arm64_sys_reg!(ID_AA64MMFR0_EL1, 3, 0, 0, 7, 0);
+
+/// The feature ID registers, which describe the vCPU to the guest: every system register with
+/// Op0 == 3, Op1 in {0, 1, 3}, CRn == 0 and CRm in 0..=7. A register ID encodes Op0, Op1, CRn,
+/// CRm and Op2 from the highest bits down, so each Op1 value gives one contiguous range of IDs.
+/// This is the definition of `is_feature_id_reg()` in the kernel's arch/arm64/kvm/sys_regs.c.
+pub const FEATURE_ID_REG_RANGES: [RangeInclusive<u64>; 3] = {
+    arm64_sys_reg!(OP1_0_FIRST, 3, 0, 0, 0, 0);
+    arm64_sys_reg!(OP1_0_LAST, 3, 0, 0, 7, 7);
+    arm64_sys_reg!(OP1_1_FIRST, 3, 1, 0, 0, 0);
+    arm64_sys_reg!(OP1_1_LAST, 3, 1, 0, 7, 7);
+    arm64_sys_reg!(OP1_3_FIRST, 3, 3, 0, 0, 0);
+    arm64_sys_reg!(OP1_3_LAST, 3, 3, 0, 7, 7);
+    [
+        OP1_0_FIRST..=OP1_0_LAST,
+        OP1_1_FIRST..=OP1_1_LAST,
+        OP1_3_FIRST..=OP1_3_LAST,
+    ]
+};
+
+/// Returns whether `id` is a feature ID register.
+pub fn is_feature_id_reg(id: u64) -> bool {
+    FEATURE_ID_REG_RANGES
+        .iter()
+        .any(|range| range.contains(&id))
+}
 
 /// Vector lengths pseudo-register
 /// TODO: this can be removed after https://github.com/rust-vmm/kvm-bindings/pull/89
@@ -533,6 +559,28 @@ mod tests {
         assert_eq!(reg_size(KVM_REG_SIZE_U32), 4);
         // ID_AA64PFR0_EL1 is 64 bit register
         assert_eq!(reg_size(ID_AA64PFR0_EL1), 8);
+    }
+
+    #[test]
+    fn test_is_feature_id_reg() {
+        arm64_sys_reg!(CTR_EL0, 3, 3, 0, 0, 1);
+        arm64_sys_reg!(CSSELR_EL1, 3, 2, 0, 0, 0);
+        // The first encoding after the feature ID registers that have Op1 == 0.
+        arm64_sys_reg!(OP1_0_CRM_8, 3, 0, 0, 8, 0);
+
+        for id in [MIDR_EL1, ID_AA64MMFR2_EL1, CLIDR_EL1, CTR_EL0] {
+            assert!(is_feature_id_reg(id), "{id:#x}");
+        }
+        for id in [
+            CSSELR_EL1,
+            OP1_0_CRM_8,
+            TTBR1_EL1,
+            SYS_CNTV_CVAL_EL0,
+            KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_FW as u64, // KVM_REG_ARM_FW_REG(0)
+            PC,
+        ] {
+            assert!(!is_feature_id_reg(id), "{id:#x}");
+        }
     }
 
     #[test]
