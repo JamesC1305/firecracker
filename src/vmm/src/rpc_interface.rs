@@ -1107,7 +1107,7 @@ mod tests {
     use crate::mmds::data_store::MmdsVersion;
     use crate::seccomp::BpfThreadMap;
     use crate::vmm_config::snapshot::{
-        MemBackendConfig, MemBackendType, SnapshotLoadHugePageConfig,
+        MemBackendConfig, MemBackendType, SnapshotLoadHugePageConfig, VcpuRegisterSet,
     };
 
     fn default_preboot<'a>(
@@ -1422,6 +1422,7 @@ mod tests {
                 network_overrides: vec![],
                 vsock_override: None,
                 clock_realtime: false,
+                vcpu_register_set: VcpuRegisterSet::Host,
                 huge_pages: SnapshotLoadHugePageConfig::Snapshot,
             },
         )));

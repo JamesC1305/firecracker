@@ -101,6 +101,16 @@ impl SnapshotLoadHugePageConfig {
     }
 }
 
+/// Selects which vCPU registers are saved in snapshots taken after a snapshot load.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+pub enum VcpuRegisterSet {
+    /// Save every register the host kernel reports.
+    #[default]
+    Host,
+    /// Save exactly the registers contained in the loaded snapshot.
+    Snapshot,
+}
+
 /// Stores the configuration that will be used for loading a snapshot.
 #[derive(Debug, PartialEq, Eq)]
 pub struct LoadSnapshotParams {
@@ -122,6 +132,8 @@ pub struct LoadSnapshotParams {
     /// advancing kvmclock by the wall-clock time elapsed since the snapshot was taken. When false
     /// (default), kvmclock resumes from where it was at snapshot time.
     pub clock_realtime: bool,
+    /// Selects which vCPU registers are saved in snapshots taken after this load.
+    pub vcpu_register_set: VcpuRegisterSet,
     /// Selects the huge-page configuration to use for the restored microVM.
     pub huge_pages: SnapshotLoadHugePageConfig,
 }
@@ -159,6 +171,9 @@ pub struct LoadSnapshotConfig {
     /// [x86_64 only] When set to true, passes `KVM_CLOCK_REALTIME` to `KVM_SET_CLOCK` on restore.
     #[serde(default)]
     pub clock_realtime: bool,
+    /// Selects which vCPU registers are saved in snapshots taken after this load.
+    #[serde(default)]
+    pub vcpu_register_set: VcpuRegisterSet,
     /// Selects the huge-page configuration to use for the restored microVM.
     #[serde(default)]
     pub huge_pages: SnapshotLoadHugePageConfig,

@@ -55,6 +55,7 @@ use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError};
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::pmem::PmemConfig;
+use crate::vmm_config::snapshot::VcpuRegisterSet;
 use crate::vstate::kvm::{Kvm, KvmError};
 use crate::vstate::memory::GuestRegionMmap;
 #[cfg(target_arch = "aarch64")]
@@ -502,6 +503,7 @@ pub fn build_microvm_from_snapshot(
     seccomp_filters: &BpfThreadMap,
     vm_resources: &mut VmResources,
     clock_realtime: bool,
+    vcpu_register_set: VcpuRegisterSet,
 ) -> Result<Arc<Mutex<Vmm>>, BuildMicrovmFromSnapshotError> {
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
@@ -542,6 +544,12 @@ pub fn build_microvm_from_snapshot(
             .restore_state(state)
             .map_err(VcpuError::VcpuResponse)
             .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
+        if vcpu_register_set == VcpuRegisterSet::Snapshot {
+            vcpu.kvm_vcpu
+                .pin_saved_registers(state)
+                .map_err(VcpuError::VcpuResponse)
+                .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
+        }
     }
 
     // Restoring TSC MSRs separately can leave different offsets on each vCPU.

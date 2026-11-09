@@ -25,6 +25,7 @@
     - [Syncing snapshot files](#syncing-snapshot-files)
   - [Resuming the microVM](#resuming-the-microvm)
   - [Loading snapshots](#loading-snapshots)
+    - [Selecting the vCPU register set](#selecting-the-vcpu-register-set)
 - [Provisioning host disk space for snapshots](#provisioning-host-disk-space-for-snapshots)
 - [Ensure continued network connectivity for clones](#ensure-continued-network-connectivity-for-clones)
 - [Snapshot security and uniqueness](#snapshot-security-and-uniqueness)
@@ -537,6 +538,24 @@ will appear to suddenly jump. The host that creates the snapshot must also use a
 TSC-based clock source (for example `tsc`). Otherwise KVM does not save the
 realtime clock in the snapshot, and loading it with `clock_realtime: true` fails
 with `clock_realtime requested but not present in the snapshot state`.
+
+#### Selecting the vCPU register set
+
+The `vcpu_register_set` field defaults to `Host`: snapshots taken after the load
+save every vCPU register reported by the host kernel. Setting it to `Snapshot`
+instead saves exactly the register IDs contained in the loaded snapshot, in the
+same order. On x86_64, the pinned set is the list of MSRs; other vCPU state
+(registers, CPUID, xsave, and so on) is always saved in full.
+
+Use `Snapshot` when a snapshot taken on an older host kernel is loaded on a
+newer kernel and subsequent snapshots must stay restorable on the older kernel.
+Registers outside the loaded set are not saved, so state the newer kernel
+exposes through new registers is not carried in subsequent snapshots. Pass this
+option on every load; it is not stored as a snapshot setting.
+
+The destination kernel must still accept the saved register values. This option
+does not guarantee cross-kernel snapshot compatibility; restores across
+different host kernels remain without guarantees.
 
 ## Provisioning host disk space for snapshots
 

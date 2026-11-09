@@ -35,7 +35,7 @@ use vmm::vmm_config::machine_config::{HugePageConfig, MachineConfig, MachineConf
 use vmm::vmm_config::net::NetworkInterfaceConfig;
 use vmm::vmm_config::snapshot::{
     CreateSnapshotParams, LoadSnapshotParams, MemBackendConfig, MemBackendType,
-    SnapshotLoadHugePageConfig, SnapshotType,
+    SnapshotLoadHugePageConfig, SnapshotType, VcpuRegisterSet,
 };
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 use vmm::vstate::memory::test_utils::into_region_ext;
@@ -388,6 +388,7 @@ fn verify_load_snapshot(
             network_overrides: vec![],
             vsock_override: None,
             clock_realtime: false,
+            vcpu_register_set: VcpuRegisterSet::Host,
             huge_pages,
         }))
         .unwrap();
@@ -460,6 +461,7 @@ fn test_load_snapshot_rejects_hugetlbfs_with_file_backend() {
             network_overrides: vec![],
             vsock_override: None,
             clock_realtime: false,
+            vcpu_register_set: VcpuRegisterSet::Host,
             huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
         }))
         .unwrap_err();
@@ -533,6 +535,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
         network_overrides: vec![],
         vsock_override: None,
         clock_realtime: false,
+        vcpu_register_set: VcpuRegisterSet::Host,
         huge_pages: SnapshotLoadHugePageConfig::Snapshot,
     });
     let err = preboot_api_controller.handle_preboot_request(req);

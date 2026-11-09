@@ -41,6 +41,10 @@ and this project adheres to
   exceed the vCPU count. Custom seccomp filters must include the new
   `blk_worker` thread category. See
   [block documentation](docs/block.md#threaded-mode-and-multiqueue).
+- Added the `vcpu_register_set: Snapshot` option to `PUT /snapshot/load`.
+  Subsequent snapshots save exactly the loaded snapshot's vCPU register set,
+  allowing snapshots taken on an older host kernel to retain that register set
+  after a round trip through a newer kernel.
 
 ### Changed
 

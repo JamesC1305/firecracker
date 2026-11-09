@@ -112,6 +112,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
         network_overrides: snapshot_config.network_overrides,
         vsock_override: snapshot_config.vsock_override,
         clock_realtime: snapshot_config.clock_realtime,
+        vcpu_register_set: snapshot_config.vcpu_register_set,
         huge_pages: snapshot_config.huge_pages,
     };
 
@@ -130,6 +131,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
 mod tests {
     use vmm::vmm_config::snapshot::{
         MemBackendConfig, MemBackendType, NetworkOverride, SnapshotLoadHugePageConfig,
+        VcpuRegisterSet,
     };
 
     use super::*;
@@ -214,6 +216,7 @@ mod tests {
             network_overrides: vec![],
             vsock_override: None,
             clock_realtime: false,
+            vcpu_register_set: VcpuRegisterSet::Host,
             huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
@@ -247,6 +250,7 @@ mod tests {
             network_overrides: vec![],
             vsock_override: None,
             clock_realtime: false,
+            vcpu_register_set: VcpuRegisterSet::Host,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
@@ -268,7 +272,8 @@ mod tests {
                 "backend_type": "Uffd"
             },
             "resume_vm": true,
-            "huge_pages": "Snapshot"
+            "huge_pages": "Snapshot",
+            "vcpu_register_set": "Snapshot"
         }"#;
         let expected_config = LoadSnapshotParams {
             snapshot_path: PathBuf::from("foo"),
@@ -281,6 +286,7 @@ mod tests {
             network_overrides: vec![],
             vsock_override: None,
             clock_realtime: false,
+            vcpu_register_set: VcpuRegisterSet::Snapshot,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
@@ -323,6 +329,7 @@ mod tests {
             }],
             vsock_override: None,
             clock_realtime: false,
+            vcpu_register_set: VcpuRegisterSet::Host,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
         };
         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
@@ -353,6 +360,7 @@ mod tests {
             network_overrides: vec![],
             vsock_override: None,
             clock_realtime: false,
+            vcpu_register_set: VcpuRegisterSet::Host,
             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
         };
         let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();

@@ -2062,6 +2062,20 @@ definitions:
           elapsed since the snapshot was taken. When false (default), kvmclock resumes
           from where it was at snapshot time. This option may be extended to other clock
           sources and CPU architectures in the future."
+      vcpu_register_set:
+        type: string
+        enum:
+          - Host
+          - Snapshot
+        default: Host
+        description:
+          "Selects which vCPU register IDs snapshots taken after this load
+          contain. `Host` saves every register the host kernel reports.
+          `Snapshot` saves exactly the register IDs in the loaded snapshot; their
+          values are read from the running microVM, and state held in other
+          registers is not saved. On x86_64, the selected set is the MSR list;
+          other vCPU state is always saved in full. This does not guarantee that
+          snapshots can be restored on a different host kernel."
       huge_pages:
         type: string
         enum:
