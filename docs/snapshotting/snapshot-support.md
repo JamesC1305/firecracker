@@ -23,6 +23,7 @@
     - [Creating full snapshots](#creating-full-snapshots)
     - [Creating diff snapshots](#creating-diff-snapshots)
     - [Syncing snapshot files](#syncing-snapshot-files)
+    - [Pinning the vCPU register set](#pinning-the-vcpu-register-set)
   - [Resuming the microVM](#resuming-the-microvm)
   - [Loading snapshots](#loading-snapshots)
 - [Provisioning host disk space for snapshots](#provisioning-host-disk-space-for-snapshots)
@@ -399,6 +400,35 @@ see the full contents; only durability across a host crash is lost. This is
 useful when durability isn't required (e.g. a pipeline further transforms the
 snapshot). Block device backing files are always `fsync`'d regardless of this
 setting.
+
+#### Pinning the vCPU register set
+
+By default, a snapshot saves every vCPU register the host kernel reports. A
+newer host kernel can report registers that an older kernel does not know, so a
+snapshot that is loaded and taken again on the newer kernel may no longer load
+on the older one.
+
+Setting the optional `pin_vcpu_registers` field of the `PUT /snapshot/create`
+API to `true` marks the snapshot as pinned. A microVM loaded from a pinned
+snapshot saves exactly the vCPU registers that snapshot contains, in the same
+order, and every snapshot it takes is pinned in turn. The pin is stored in the
+snapshot file, so nothing has to be passed when loading the snapshot or when
+taking later snapshots, and it cannot be removed from a microVM that was loaded
+from a pinned snapshot. To pick up a newer register set, take a new snapshot
+from a booted microVM.
+
+On x86_64, the pinned set is the list of MSRs; other vCPU state (registers,
+CPUID, xsave, and so on) is always saved in full. On aarch64, CPU feature ID
+registers also keep the pinned snapshot's values, because a newer host kernel
+may report normalized values that an older kernel refuses to restore.
+
+Pin a snapshot when it is created on the oldest host kernel it must stay
+loadable on. Registers outside the pinned set are not saved, so state that a
+newer kernel exposes through new registers is not carried in later snapshots.
+
+The destination kernel must still accept the saved register values. Pinning does
+not guarantee cross-kernel snapshot compatibility; restores across different
+host kernels remain without guarantees.
 
 ### Resuming the microVM
 

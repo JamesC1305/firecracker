@@ -10,9 +10,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(target_arch = "x86_64")]
+use kvm_bindings::Msrs;
 use userfaultfd::{Event, FeatureFlags, UffdBuilder};
 use vm_memory::GuestMemoryBackend;
+#[cfg(target_arch = "aarch64")]
+use vmm::arch::aarch64::regs::Aarch64RegisterVec;
 use vmm::arch::host_page_size;
+#[cfg(target_arch = "x86_64")]
+use vmm::arch::x86_64::generated::msr_index::MSR_STAR;
 use vmm::builder::build_and_boot_microvm;
 use vmm::devices::virtio::block::CacheType;
 use vmm::persist::{
@@ -283,6 +289,29 @@ fn test_disallow_dump_cpu_config_without_pausing() {
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }
 
+fn boot_and_pause_microvm(
+    track_dirty_pages: bool,
+    pci_enabled: bool,
+    memory_hotplug: bool,
+) -> (Arc<Mutex<Vmm>>, EventManager) {
+    let (vmm, mut event_manager) = create_vmm(
+        Some(NOISY_KERNEL_IMAGE),
+        track_dirty_pages,
+        true,
+        pci_enabled,
+        memory_hotplug,
+    );
+
+    // Be sure that the microVM is running.
+    thread::sleep(Duration::from_millis(200));
+
+    RuntimeApiController::new(vmm.clone())
+        .handle_request(VmmAction::Pause, &mut event_manager)
+        .unwrap();
+
+    (vmm, event_manager)
+}
+
 fn verify_create_snapshot(
     is_diff: bool,
     pci_enabled: bool,
@@ -291,25 +320,10 @@ fn verify_create_snapshot(
     let snapshot_file = TempFile::new().unwrap();
     let memory_file = TempFile::new().unwrap();
 
-    let (vmm, _) = create_vmm(
-        Some(NOISY_KERNEL_IMAGE),
-        is_diff,
-        true,
-        pci_enabled,
-        memory_hotplug,
-    );
+    let (vmm, mut event_manager) = boot_and_pause_microvm(is_diff, pci_enabled, memory_hotplug);
 
     let vm_info = VmInfo::from(&*vmm.lock().unwrap());
     let mut controller = RuntimeApiController::new(vmm.clone());
-    let mut event_manager = EventManager::new().unwrap();
-
-    // Be sure that the microVM is running.
-    thread::sleep(Duration::from_millis(200));
-
-    // Pause microVM.
-    controller
-        .handle_request(VmmAction::Pause, &mut event_manager)
-        .unwrap();
 
     // Create snapshot.
     let snapshot_type = match is_diff {
@@ -321,6 +335,7 @@ fn verify_create_snapshot(
         snapshot_path: snapshot_file.as_path().to_path_buf(),
         mem_file_path: memory_file.as_path().to_path_buf(),
         sync_snapshot_files: true,
+        pin_vcpu_registers: false,
     };
 
     controller
@@ -337,6 +352,7 @@ fn verify_create_snapshot(
         Snapshot::load(&mut snapshot_file.as_file()).unwrap().data;
 
     assert_eq!(restored_microvm_state.vm_info, vm_info);
+    assert!(!restored_microvm_state.vcpu_registers_pinned);
 
     // Verify deserialized data.
     // The default vmm has no devices and one vCPU.
@@ -422,6 +438,138 @@ fn test_create_and_load_snapshot() {
             }
         }
     }
+}
+
+/// IDs of the registers that pinning applies to, as saved for the first vCPU.
+fn saved_vcpu_register_ids(microvm_state: &MicrovmState) -> Vec<u64> {
+    let vcpu_state = &microvm_state.vcpu_states[0];
+    #[cfg(target_arch = "x86_64")]
+    {
+        vcpu_state
+            .saved_msrs
+            .iter()
+            .flat_map(|msrs| msrs.as_slice())
+            .map(|entry| u64::from(entry.index))
+            .collect()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        vcpu_state.regs.iter().map(|reg| reg.id).collect()
+    }
+}
+
+/// Removes one register that the host saves from every vCPU state.
+fn remove_saved_vcpu_register(microvm_state: &mut MicrovmState) {
+    for vcpu_state in &mut microvm_state.vcpu_states {
+        #[cfg(target_arch = "x86_64")]
+        for msrs in &mut vcpu_state.saved_msrs {
+            let entries: Vec<_> = msrs
+                .as_slice()
+                .iter()
+                .filter(|entry| entry.index != MSR_STAR)
+                .copied()
+                .collect();
+            *msrs = Msrs::from_entries(&entries).unwrap();
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // TTBR1_EL1: op0=3, op1=0, CRn=2, CRm=0, op2=1.
+            const TTBR1_EL1: u64 = 0x6030_0000_0013_c101;
+            let mut regs = Aarch64RegisterVec::default();
+            for reg in vcpu_state.regs.iter().filter(|reg| reg.id != TTBR1_EL1) {
+                regs.push(reg);
+            }
+            vcpu_state.regs = regs;
+        }
+    }
+}
+
+#[test]
+fn test_pinned_vcpu_registers_are_inherited() {
+    let snapshot_file = TempFile::new().unwrap();
+    let memory_file = TempFile::new().unwrap();
+    let (vmm, mut event_manager) = boot_and_pause_microvm(false, false, false);
+    let mut controller = RuntimeApiController::new(vmm.clone());
+
+    controller
+        .handle_request(
+            VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::Full,
+                snapshot_path: snapshot_file.as_path().to_path_buf(),
+                mem_file_path: memory_file.as_path().to_path_buf(),
+                sync_snapshot_files: true,
+                pin_vcpu_registers: true,
+            }),
+            &mut event_manager,
+        )
+        .unwrap();
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+
+    let mut microvm_state: MicrovmState =
+        Snapshot::load(&mut snapshot_file.as_file()).unwrap().data;
+    assert!(microvm_state.vcpu_registers_pinned);
+
+    // Remove a register from the pinned snapshot. The host still saves it, so it only stays
+    // out of the next snapshot if loading the snapshot pinned the vCPUs.
+    let host_register_count = saved_vcpu_register_ids(&microvm_state).len();
+    remove_saved_vcpu_register(&mut microvm_state);
+    let pinned_register_ids = saved_vcpu_register_ids(&microvm_state);
+    assert_eq!(pinned_register_ids.len(), host_register_count - 1);
+    let pinned_snapshot_file = TempFile::new().unwrap();
+    Snapshot::new(&microvm_state)
+        .save(&mut pinned_snapshot_file.as_file())
+        .unwrap();
+
+    let empty_seccomp_filters = get_empty_filters();
+    let mut vm_resources = VmResources::default();
+    let mut preboot_controller = PrebootApiController::new(
+        &empty_seccomp_filters,
+        InstanceInfo::default(),
+        &mut vm_resources,
+        &mut event_manager,
+    );
+    preboot_controller
+        .handle_preboot_request(VmmAction::LoadSnapshot(LoadSnapshotParams {
+            snapshot_path: pinned_snapshot_file.as_path().to_path_buf(),
+            mem_backend: MemBackendConfig {
+                backend_path: memory_file.as_path().to_path_buf(),
+                backend_type: MemBackendType::File,
+            },
+            track_dirty_pages: false,
+            resume_vm: false,
+            network_overrides: vec![],
+            vsock_override: None,
+            clock_realtime: false,
+            huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+        }))
+        .unwrap();
+
+    let vmm = preboot_controller.built_vmm.take().unwrap();
+    let mut controller = RuntimeApiController::new(vmm.clone());
+    let second_snapshot_file = TempFile::new().unwrap();
+    let second_memory_file = TempFile::new().unwrap();
+    controller
+        .handle_request(
+            VmmAction::CreateSnapshot(CreateSnapshotParams {
+                snapshot_type: SnapshotType::Full,
+                snapshot_path: second_snapshot_file.as_path().to_path_buf(),
+                mem_file_path: second_memory_file.as_path().to_path_buf(),
+                sync_snapshot_files: true,
+                pin_vcpu_registers: false,
+            }),
+            &mut event_manager,
+        )
+        .unwrap();
+    vmm.lock().unwrap().stop(FcExitCode::Ok);
+
+    let second_microvm_state: MicrovmState = Snapshot::load(&mut second_snapshot_file.as_file())
+        .unwrap()
+        .data;
+    assert!(second_microvm_state.vcpu_registers_pinned);
+    assert_eq!(
+        saved_vcpu_register_ids(&second_microvm_state),
+        pinned_register_ids
+    );
 }
 
 #[test]

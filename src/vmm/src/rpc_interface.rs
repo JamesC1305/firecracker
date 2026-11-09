@@ -1328,6 +1328,7 @@ mod tests {
                 snapshot_path: PathBuf::new(),
                 mem_file_path: PathBuf::new(),
                 sync_snapshot_files: true,
+                pin_vcpu_registers: false,
             },
         )));
         check_unsupported(preboot_request(VmmAction::SendCtrlAltDel));

@@ -41,6 +41,11 @@ and this project adheres to
   exceed the vCPU count. Custom seccomp filters must include the new
   `blk_worker` thread category. See
   [block documentation](docs/block.md#threaded-mode-and-multiqueue).
+- Added the `pin_vcpu_registers` option to `PUT /snapshot/create`. MicroVMs
+  loaded from a pinned snapshot save exactly that snapshot's vCPU register set
+  in their own snapshots, allowing snapshots taken on an older host kernel to
+  stay loadable on it after a round trip through a newer kernel. The pin is
+  stored in the snapshot, which bumps the snapshot version to `14.0.0`.
 
 ### Changed
 
