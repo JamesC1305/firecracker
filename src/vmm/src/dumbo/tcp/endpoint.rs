@@ -818,21 +818,18 @@ mod tests {
             error_response(parse_request_bytes(request_bytes, mock_callback).unwrap_err());
         assert_eq!(actual_response, expected_response);
 
-        // Test invalid HTTP headers.
+        // Test invalid HTTP headers. micro_http decodes no transfer coding, so it rejects
+        // Transfer-Encoding instead of ignoring the body it would frame.
         let request_bytes = b"PATCH http://localhost/home HTTP/1.1\r\n\
                                  Expect: 100-continue\r\n\
                                  Transfer-Encoding: identity; q=0\r\n\
                                  Content-Length: 26\r\n\r\nthis is not\n\r\na json \nbody";
-        assert!(
-            parse_request_bytes(request_bytes, mock_callback)
-                .unwrap()
-                .body()
-                .is_none()
-        );
+        let actual_response =
+            error_response(parse_request_bytes(request_bytes, mock_callback).unwrap_err());
+        assert_eq!(actual_response.status(), StatusCode::BadRequest);
 
         let request_bytes = b"PATCH http://localhost/home HTTP/1.1\r\n\
                                  Expect: 100-continue\r\n\
-                                 Transfer-Encoding: identity; q=0\r\n\
                                  Content-Length: alpha\r\n\r\nthis is not\n\r\na json \nbody";
         let mut expected_response = Response::new(Version::Http11, StatusCode::BadRequest);
         expected_response.set_body(Body::new(
@@ -844,7 +841,6 @@ mod tests {
 
         let request_bytes = b"PATCH http://localhost/home HTTP/1.1\r\n\
                                  Expect: 100-continue\r\n\
-                                 Transfer-Encoding: identity; q=0\r\n\
                                  Content-Length: 67\r\n\
                                  Accept-Encoding: deflate, compress, *;q=0\r\n\r\nthis is not\n\r\na json \nbody";
         let mut expected_response = Response::new(Version::Http11, StatusCode::BadRequest);
@@ -1128,6 +1124,25 @@ mod tests {
             "Content-Length\r\n",
         ] {
             assert_rejected(&[request(rejected).as_bytes()], "400");
+        }
+    }
+
+    #[test]
+    fn test_header_value_control_characters_close_connection() {
+        let request =
+            |value: &str| format!("GET http://169.254.169.254/ HTTP/1.1\r\nX-A: {value}\r\n\r\n");
+
+        // RFC 9110, Section 5.5: a field value may contain HTAB but no other control character.
+        let exchange = exchange(&[request("a\tb").as_bytes()]);
+        assert_eq!(exchange.requests, 1, "{exchange:?}");
+        assert!(
+            exchange.responses[0].starts_with("HTTP/1.1 200 "),
+            "{exchange:?}"
+        );
+        assert!(!exchange.fin && !exchange.rst, "{exchange:?}");
+
+        for value in ["a\0b", "a\u{1}b", "a\u{7f}b"] {
+            assert_rejected(&[request(value).as_bytes()], "400");
         }
     }
 

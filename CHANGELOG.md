@@ -115,6 +115,17 @@ and this project adheres to
   other than a single `Content-Length: 0`, or a header name that is not an HTTP
   token. MMDS requests never carry a body, so no valid request needs any of
   these. Such a request receives a `400` response, and the connection is closed.
+- [#XXXX](https://github.com/firecracker-microvm/firecracker/pull/XXXX): MMDS
+  now rejects a guest request with a control character other than HTAB, such as
+  NUL, in a header value. Such a request receives a `400` response, and the
+  connection is closed.
+- [#XXXX](https://github.com/firecracker-microvm/firecracker/pull/XXXX): The API
+  server now rejects a request whose request line or header lines contain a bare
+  CR or LF, that has a header name which is not an HTTP token, that carries
+  `Content-Length` more than once or with a value that is not a decimal number,
+  that carries any `Transfer-Encoding` header, which Firecracker never decoded,
+  or that has a control character other than HTAB in a header value. Such a
+  request receives a `400` response.
 
 ### Deprecated
 

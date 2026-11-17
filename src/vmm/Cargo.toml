@@ -42,7 +42,7 @@ linux-loader = { version = "0.14.0", features = ["bzimage"] }
 log = { version = "0.4.31", features = ["std", "serde"] }
 log-instrument = { path = "../log-instrument", optional = true }
 memfd = "0.6.5"
-micro_http = { git = "https://github.com/firecracker-microvm/micro-http" }
+micro_http = { git = "https://github.com/JamesC1305/micro-http", branch = "request-parser" }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.150"
 slab = "0.4.12"

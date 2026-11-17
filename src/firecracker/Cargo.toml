@@ -25,7 +25,7 @@ displaydoc = "0.2.6"
 event-manager = "0.4.2"
 libc = "0.2.186"
 log-instrument = { path = "../log-instrument", optional = true }
-micro_http = { git = "https://github.com/firecracker-microvm/micro-http" }
+micro_http = { git = "https://github.com/JamesC1305/micro-http", branch = "request-parser" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_derive = "1.0.136"
 serde_json = "1.0.150"

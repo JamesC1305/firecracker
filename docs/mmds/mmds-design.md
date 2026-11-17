@@ -217,7 +217,8 @@ handler):
 1. If no response is pending, and we can identify a request in the receive
    buffer, parse it, free up the associated buffer space (also update the
    connection receive window), and build an HTTP response, which becomes the
-   current pending response.
+   current pending response. A header value containing a control character other
+   than HTAB also makes the request one that cannot be parsed.
 1. If the request cannot be parsed, the error response becomes the pending
    response instead, and nothing else received on the connection is ever parsed:
    the bytes that follow could belong to the malformed request, such as a body
