@@ -447,7 +447,7 @@ mod tests {
 
         // Test with empty `Accept` header. micro-http defaults to `Accept: text/plain`.
         let (request, expected_response) = generate_request_and_expected_response(
-            b"GET http://169.254.169.254/ HTTP/1.0\r\n\"
+            b"GET http://169.254.169.254/ HTTP/1.0\r\n\
               Accept:\r\n\r\n",
             MediaType::PlainText,
         );
@@ -458,7 +458,7 @@ mod tests {
 
         // Test with `Accept: */*` header.
         let (request, expected_response) = generate_request_and_expected_response(
-            b"GET http://169.254.169.254/ HTTP/1.0\r\n\"
+            b"GET http://169.254.169.254/ HTTP/1.0\r\n\
               Accept: */*\r\n\r\n",
             MediaType::PlainText,
         );
