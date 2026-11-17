@@ -286,7 +286,7 @@ impl Vcpu {
                     .expect("vcpu channel unexpectedly closed");
             }
             // SaveState cannot be performed on a running Vcpu.
-            Ok(VcpuEvent::SaveState) => {
+            Ok(VcpuEvent::SaveState(_)) => {
                 self.response_sender
                     .send(VcpuResponse::NotAllowed(String::from(
                         "save/restore unavailable while running",
@@ -338,10 +338,10 @@ impl Vcpu {
                     .expect("vcpu channel unexpectedly closed");
                 VcpuRunState::Paused
             }
-            Ok(VcpuEvent::SaveState) => {
+            Ok(VcpuEvent::SaveState(register_pin)) => {
                 // Save vcpu state.
                 self.kvm_vcpu
-                    .save_state()
+                    .save_state(register_pin)
                     .map(|vcpu_state| {
                         self.response_sender
                             .send(VcpuResponse::SavedState(Box::new(vcpu_state)))
@@ -523,6 +523,16 @@ fn handle_kvm_exit(
     }
 }
 
+/// What a vCPU does with its register pin when its state is saved. A vCPU has a pin if it was
+/// restored from a pinned snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterPin {
+    /// Save the registers the vCPU is pinned to. A vCPU that has no pin saves the host's.
+    Keep,
+    /// Save the host's registers, as a vCPU that has no pin does.
+    Ignore,
+}
+
 /// List of events that the Vcpu can receive.
 #[derive(Debug, Clone)]
 pub enum VcpuEvent {
@@ -533,7 +543,7 @@ pub enum VcpuEvent {
     /// Event to resume the Vcpu.
     Resume,
     /// Event to save the state of a paused Vcpu.
-    SaveState,
+    SaveState(RegisterPin),
     /// Event to dump CPU configuration of a paused Vcpu.
     DumpCpuConfig,
 }
@@ -1122,7 +1132,7 @@ pub(crate) mod tests {
         // Queue a SaveState event, expect a response.
         queue_event_expect_response(
             &mut vcpu_handle,
-            VcpuEvent::SaveState,
+            VcpuEvent::SaveState(RegisterPin::Keep),
             VcpuResponse::NotAllowed(String::new()),
         );
 
@@ -1131,7 +1141,7 @@ pub(crate) mod tests {
 
         // Queue a SaveState event, get the response.
         vcpu_handle
-            .send_event(VcpuEvent::SaveState)
+            .send_event(VcpuEvent::SaveState(RegisterPin::Keep))
             .expect("failed to send event to vcpu");
         match vcpu_handle
             .response_receiver()

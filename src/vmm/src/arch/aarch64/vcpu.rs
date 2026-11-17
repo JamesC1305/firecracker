@@ -26,7 +26,7 @@ use crate::logger::{IncMetric, METRICS, error, info};
 use crate::vcpu::{VcpuConfig, VcpuError};
 use crate::vstate::bus::Bus;
 use crate::vstate::memory::{Address, GuestMemoryMmap};
-use crate::vstate::vcpu::VcpuEmulation;
+use crate::vstate::vcpu::{RegisterPin, VcpuEmulation};
 use crate::vstate::vm::KvmVm;
 
 /// Errors thrown while setting aarch64 registers.
@@ -118,7 +118,9 @@ pub struct KvmVcpu {
     kvi: kvm_vcpu_init,
     /// IPA of steal_time region
     pub pvtime_ipa: Option<GuestAddress>,
-    /// Register IDs to save, in snapshot order, and feature ID register values to preserve.
+    /// The registers of the snapshot this vCPU is pinned to, in snapshot order. A pinned vCPU
+    /// saves these IDs, and their values for feature ID registers, unless it is told to ignore
+    /// the pin.
     pinned_regs: Option<Aarch64RegisterVec>,
 }
 
@@ -268,14 +270,16 @@ impl KvmVcpu {
     }
 
     /// Save the KVM internal state.
-    pub fn save_state(&self) -> Result<VcpuState, KvmVcpuError> {
+    pub fn save_state(&self, register_pin: RegisterPin) -> Result<VcpuState, KvmVcpuError> {
         let mut state = VcpuState {
             mp_state: self.get_mpstate().map_err(KvmVcpuError::SaveState)?,
             ..Default::default()
         };
-        match &self.pinned_regs {
-            Some(pinned_regs) => self.get_pinned_registers(pinned_regs, &mut state.regs),
-            None => self.get_all_registers(&mut state.regs),
+        match (&self.pinned_regs, register_pin) {
+            (Some(pinned_regs), RegisterPin::Keep) => {
+                self.get_pinned_registers(pinned_regs, &mut state.regs)
+            }
+            _ => self.get_all_registers(&mut state.regs),
         }
         .map_err(KvmVcpuError::SaveState)?;
         state.mpidr = self.get_mpidr().map_err(KvmVcpuError::SaveState)?;
@@ -819,7 +823,7 @@ pub(crate) mod tests {
         vm.setup_irqchip(1).unwrap();
 
         // Calling KVM_GET_REGLIST before KVM_VCPU_INIT will result in error.
-        let res = vcpu.save_state();
+        let res = vcpu.save_state(RegisterPin::Keep);
         assert!(matches!(
             res.unwrap_err(),
             KvmVcpuError::SaveState(VcpuArchError::GetRegList(_))
@@ -846,7 +850,9 @@ pub(crate) mod tests {
         ));
 
         vcpu.init(&[]).unwrap();
-        let state = vcpu.save_state().expect("Cannot save state of vcpu");
+        let state = vcpu
+            .save_state(RegisterPin::Keep)
+            .expect("Cannot save state of vcpu");
         assert!(!state.regs.is_empty());
         vcpu.restore_state(&state)
             .expect("Cannot restore state of vcpu");
@@ -870,7 +876,7 @@ pub(crate) mod tests {
             &vm.kvm().optional_capabilities(),
         )
         .unwrap();
-        let state = vcpu.save_state().unwrap();
+        let state = vcpu.save_state(RegisterPin::Keep).unwrap();
         // TTBR1_EL1 is a system register, not a core or SVE vector-length register.
         let removed_id = state
             .regs
@@ -888,17 +894,19 @@ pub(crate) mod tests {
         let (restored_vm, mut restored_vcpu) = setup_vcpu_no_init(0x10000);
         restored_vm.setup_irqchip(1).unwrap();
         restored_vcpu.restore_state(&snapshot_state).unwrap();
-        assert!(
-            restored_vcpu
-                .save_state()
-                .unwrap()
-                .regs
-                .iter()
-                .any(|reg| reg.id == removed_id)
-        );
+        let unpinned_state = restored_vcpu.save_state(RegisterPin::Keep).unwrap();
+        let unpinned_ids: Vec<_> = unpinned_state.regs.iter().map(|reg| reg.id).collect();
+        assert!(unpinned_ids.contains(&removed_id));
 
         restored_vcpu.pin_saved_registers(&snapshot_state).unwrap();
-        let pinned_state = restored_vcpu.save_state().unwrap();
+        let pinned_state = restored_vcpu.save_state(RegisterPin::Keep).unwrap();
+        let saved_ids: Vec<_> = pinned_state.regs.iter().map(|reg| reg.id).collect();
+        assert_eq!(saved_ids, snapshot_ids);
+
+        let host_state = restored_vcpu.save_state(RegisterPin::Ignore).unwrap();
+        let host_ids: Vec<_> = host_state.regs.iter().map(|reg| reg.id).collect();
+        assert_eq!(host_ids, unpinned_ids);
+        let pinned_state = restored_vcpu.save_state(RegisterPin::Keep).unwrap();
         let saved_ids: Vec<_> = pinned_state.regs.iter().map(|reg| reg.id).collect();
         assert_eq!(saved_ids, snapshot_ids);
     }
@@ -906,7 +914,7 @@ pub(crate) mod tests {
     #[test]
     fn test_vcpu_pinned_registers_keep_feature_id_values() {
         let (_vm, vcpu) = setup_vcpu(0x10000);
-        let state = vcpu.save_state().unwrap();
+        let state = vcpu.save_state(RegisterPin::Keep).unwrap();
         let (restored_vm, mut restored_vcpu) = setup_vcpu_no_init(0x10000);
         restored_vm.setup_irqchip(1).unwrap();
         restored_vcpu.restore_state(&state).unwrap();
@@ -922,7 +930,7 @@ pub(crate) mod tests {
         }
         // The changed values are only pinned; neither is written into KVM.
         restored_vcpu.pin_saved_registers(&snapshot_state).unwrap();
-        let pinned_state = restored_vcpu.save_state().unwrap();
+        let pinned_state = restored_vcpu.save_state(RegisterPin::Keep).unwrap();
         let value = |state: &VcpuState, id| {
             state
                 .regs
@@ -939,6 +947,15 @@ pub(crate) mod tests {
         assert_ne!(
             value(&pinned_state, TCR_EL1),
             value(&snapshot_state, TCR_EL1)
+        );
+        let host_state = restored_vcpu.save_state(RegisterPin::Ignore).unwrap();
+        assert_eq!(
+            value(&host_state, ID_AA64PFR0_EL1),
+            value(&state, ID_AA64PFR0_EL1)
+        );
+        assert_ne!(
+            value(&host_state, ID_AA64PFR0_EL1),
+            value(&snapshot_state, ID_AA64PFR0_EL1)
         );
     }
 

@@ -888,6 +888,8 @@ pub(crate) mod tests {
     use crate::vmm_config::pmem::{PmemBuilder, PmemConfig};
     use crate::vmm_config::vsock::tests::default_config;
     use crate::vmm_config::vsock::{VsockBuilder, VsockDeviceConfig};
+    #[cfg(target_arch = "x86_64")]
+    use crate::vstate::vcpu::RegisterPin;
     use crate::vstate::vm::Vm;
     use crate::vstate::vm::tests::setup_vm_with_memory;
 
@@ -959,7 +961,7 @@ pub(crate) mod tests {
             let vm_state = source_vm.save_state().unwrap();
             let states: Vec<_> = source_vcpus
                 .iter()
-                .map(|vcpu| vcpu.kvm_vcpu.save_state().unwrap())
+                .map(|vcpu| vcpu.kvm_vcpu.save_state(RegisterPin::Keep).unwrap())
                 .collect();
 
             let vm = setup_vm_with_memory(0x1000);

@@ -45,7 +45,7 @@ use crate::vstate::kvm::KvmState;
 use crate::vstate::memory::{
     self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
 };
-use crate::vstate::vcpu::{VcpuSendEventError, VcpuState};
+use crate::vstate::vcpu::{RegisterPin, VcpuSendEventError, VcpuState};
 use crate::vstate::vm::{VmError, VmState};
 use crate::{EventManager, Vmm, vstate};
 
@@ -179,7 +179,7 @@ pub fn create_snapshot(
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
     let microvm_state = vmm
-        .save_state(vm_info)
+        .save_state(vm_info, RegisterPin::Keep)
         .map_err(CreateSnapshotError::MicrovmState)?;
 
     snapshot_state_to_file(

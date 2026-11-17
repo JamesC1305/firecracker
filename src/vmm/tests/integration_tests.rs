@@ -42,7 +42,7 @@ use vmm::vstate::memory::test_utils::into_region_ext;
 use vmm::vstate::memory::{
     Bytes, GuestAddress, GuestMemoryExtension, GuestMemoryRegion, MemfdBacking,
 };
-use vmm::{DumpCpuConfigError, EventManager, FcExitCode, Vmm};
+use vmm::{DumpCpuConfigError, EventManager, FcExitCode, RegisterPin, Vmm};
 use vmm_sys_util::tempfile::TempFile;
 
 #[allow(unused_mut, unused_variables)]
@@ -251,14 +251,17 @@ fn test_disallow_snapshots_without_pausing() {
 
     // Verify saving state while running is not allowed.
     assert!(matches!(
-        vmm.lock().unwrap().save_state(&vm_info),
+        vmm.lock().unwrap().save_state(&vm_info, RegisterPin::Keep),
         Err(MicrovmStateError::NotAllowed(_))
     ));
 
     // Pause microVM.
     vmm.lock().unwrap().pause_vm().unwrap();
     // It is now allowed.
-    vmm.lock().unwrap().save_state(&vm_info).unwrap();
+    vmm.lock()
+        .unwrap()
+        .save_state(&vm_info, RegisterPin::Keep)
+        .unwrap();
     // Stop.
     vmm.lock().unwrap().stop(FcExitCode::Ok);
 }

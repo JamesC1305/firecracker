@@ -169,7 +169,7 @@ pub use crate::vstate::kvm::Kvm;
 use crate::vstate::memory::{GuestMemoryMmap, GuestMemoryRegion};
 #[cfg(target_arch = "aarch64")]
 use crate::vstate::vcpu::VcpuState;
-pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
+pub use crate::vstate::vcpu::{RegisterPin, Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
 pub use crate::vstate::vm::{StartVcpusError, Vm};
 
 /// Shorthand type for the EventManager flavour used by Firecracker.
@@ -543,8 +543,13 @@ impl Vmm {
         }
     }
 
-    /// Saves the state of a paused Microvm.
-    pub fn save_state(&mut self, vm_info: &VmInfo) -> Result<MicrovmState, MicrovmStateError> {
+    /// Saves the state of a paused Microvm. `register_pin` says whether pinned vCPUs save the
+    /// registers they are pinned to.
+    pub fn save_state(
+        &mut self,
+        vm_info: &VmInfo,
+        register_pin: RegisterPin,
+    ) -> Result<MicrovmState, MicrovmStateError> {
         self.check_unsnapshottable_devices()?;
 
         if self.instance_info.state != VmState::Paused {
@@ -563,7 +568,7 @@ impl Vmm {
             .vm
             .as_kvm()
             .ok_or_else(|| MicrovmStateError::NotAllowed("save_state requires KVM".into()))?;
-        let vcpu_states = kvm_vm.save_vcpu_states()?;
+        let vcpu_states = kvm_vm.save_vcpu_states(register_pin)?;
         let kvm_state = kvm_vm.kvm().save_state();
         let vm_state = {
             #[cfg(target_arch = "x86_64")]

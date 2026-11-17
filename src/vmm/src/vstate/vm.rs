@@ -42,7 +42,7 @@ use crate::vstate::memory::{
     GuestRegionMmapExt, MemoryError,
 };
 use crate::vstate::resources::ResourceAllocator;
-use crate::vstate::vcpu::{StartThreadedError, VcpuError, VcpuHandle};
+use crate::vstate::vcpu::{RegisterPin, StartThreadedError, VcpuError, VcpuHandle};
 use crate::{DirtyBitmap, Vcpu, mem_size_mib};
 
 /// Maximum number of vCPUs supported by a KVM microVM.
@@ -362,13 +362,14 @@ impl KvmVm {
     /// Saves vCPU states by requesting each vCPU thread to serialize its state.
     pub fn save_vcpu_states(
         &self,
+        register_pin: RegisterPin,
     ) -> Result<Vec<crate::vstate::vcpu::VcpuState>, crate::persist::MicrovmStateError> {
         use crate::persist::MicrovmStateError;
 
         let mut handles = self.vcpus_handles();
         for handle in handles.iter_mut() {
             handle
-                .send_event(crate::VcpuEvent::SaveState)
+                .send_event(crate::VcpuEvent::SaveState(register_pin))
                 .map_err(MicrovmStateError::SignalVcpu)?;
         }
 

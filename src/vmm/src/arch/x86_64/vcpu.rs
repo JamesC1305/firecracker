@@ -30,7 +30,7 @@ use crate::cpu_config::x86_64::{CpuConfiguration, cpuid};
 use crate::logger::{IncMetric, METRICS, error, info, warn};
 use crate::vstate::bus::Bus;
 use crate::vstate::memory::GuestMemoryMmap;
-use crate::vstate::vcpu::{VcpuEmulation, VcpuError};
+use crate::vstate::vcpu::{RegisterPin, VcpuEmulation, VcpuError};
 use crate::vstate::vm::KvmVm;
 
 // Tolerance for TSC frequency expected variation.
@@ -165,7 +165,7 @@ pub struct KvmVcpu {
     /// restored with.
     msrs_to_save: Vec<u32>,
     /// The MSRs of the snapshot this vCPU is pinned to, in snapshot order. A pinned vCPU saves
-    /// these instead of `msrs_to_save`.
+    /// these instead of `msrs_to_save` unless it is told to ignore the pin.
     pinned_msrs: Option<Vec<u32>>,
     /// Size in bytes requiring to hold the dynamically-sized `kvm_xsave` struct.
     ///
@@ -684,7 +684,7 @@ impl KvmVcpu {
     }
 
     /// Save the KVM internal state.
-    pub fn save_state(&self) -> Result<VcpuState, KvmVcpuError> {
+    pub fn save_state(&self, register_pin: RegisterPin) -> Result<VcpuState, KvmVcpuError> {
         // Ordering requirements:
         //
         // KVM_GET_MP_STATE calls kvm_apic_accept_events(), which might modify
@@ -721,7 +721,10 @@ impl KvmVcpu {
             None
         });
         let cpuid = self.get_cpuid()?;
-        let msrs_to_save = self.pinned_msrs.as_ref().unwrap_or(&self.msrs_to_save);
+        let msrs_to_save = match (&self.pinned_msrs, register_pin) {
+            (Some(pinned_msrs), RegisterPin::Keep) => pinned_msrs,
+            _ => &self.msrs_to_save,
+        };
         let saved_msrs = self.get_msr_chunks(msrs_to_save.iter().copied())?;
         let vcpu_events = self
             .fd
@@ -1158,7 +1161,7 @@ pub(crate) mod tests {
 
         // Mutate the CPUID.
         // Leaf 0x3 / EAX that is an unused (reserved to be accurate) register, so it's harmless.
-        let mut state = vcpu.save_state().unwrap();
+        let mut state = vcpu.save_state(RegisterPin::Keep).unwrap();
         state.cpuid.as_mut_slice().iter_mut().for_each(|entry| {
             if entry.function == 3 && entry.index == 0 {
                 entry.eax = 0x1234_5678;
@@ -1176,7 +1179,7 @@ pub(crate) mod tests {
         assert!(result2.is_ok(), "{}", result2.unwrap_err());
 
         // Validate the mutated cpuid is restored correctly.
-        let state = vcpu.save_state().unwrap();
+        let state = vcpu.save_state(RegisterPin::Keep).unwrap();
         let cpuid = Cpuid::try_from(state.cpuid).unwrap();
         let leaf3 = cpuid
             .inner()
@@ -1204,7 +1207,7 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
-        let state = vcpu.save_state().unwrap();
+        let state = vcpu.save_state(RegisterPin::Keep).unwrap();
         let mut snapshot_state = VcpuState {
             saved_msrs: state.saved_msrs.clone(),
             ..state
@@ -1239,11 +1242,16 @@ pub(crate) mod tests {
 
         let (_restored_vm, mut restored_vcpu) = setup_vcpu(0x10000);
         restored_vcpu.restore_state(&snapshot_state).unwrap();
-        let unpinned_state = restored_vcpu.save_state().unwrap();
+        let unpinned_state = restored_vcpu.save_state(RegisterPin::Keep).unwrap();
         assert!(msr_indices(&unpinned_state).contains(&removed_index));
 
         restored_vcpu.pin_saved_registers(&snapshot_state).unwrap();
-        let pinned_state = restored_vcpu.save_state().unwrap();
+        let pinned_state = restored_vcpu.save_state(RegisterPin::Keep).unwrap();
+        assert_eq!(msr_indices(&pinned_state), snapshot_indices);
+
+        let host_state = restored_vcpu.save_state(RegisterPin::Ignore).unwrap();
+        assert_eq!(msr_indices(&host_state), msr_indices(&unpinned_state));
+        let pinned_state = restored_vcpu.save_state(RegisterPin::Keep).unwrap();
         assert_eq!(msr_indices(&pinned_state), snapshot_indices);
     }
 
@@ -1265,7 +1273,7 @@ pub(crate) mod tests {
         .unwrap();
         // Booting adds MSRs that the host does not list, such as the MTRR ones that follow from
         // CPUID.
-        let state = vcpu.save_state().unwrap();
+        let state = vcpu.save_state(RegisterPin::Keep).unwrap();
 
         let (_restored_vm, mut restored_vcpu) = setup_vcpu(0x10000);
         // Make sure of one such MSR, whatever this host lists.
@@ -1273,7 +1281,7 @@ pub(crate) mod tests {
             .msrs_to_save
             .retain(|index| *index != MSR_STAR);
         restored_vcpu.restore_state(&state).unwrap();
-        let restored_state = restored_vcpu.save_state().unwrap();
+        let restored_state = restored_vcpu.save_state(RegisterPin::Keep).unwrap();
 
         let msr_indices = |state: &VcpuState| {
             state
@@ -1375,7 +1383,7 @@ pub(crate) mod tests {
 
         {
             // The frequency difference is within tolerance.
-            let mut state = vcpu.save_state().unwrap();
+            let mut state = vcpu.save_state(RegisterPin::Keep).unwrap();
             state.tsc_khz = Some(
                 state.tsc_khz.unwrap()
                     + state.tsc_khz.unwrap() * u32::try_from(TSC_KHZ_TOL_NUMERATOR).unwrap()
@@ -1391,7 +1399,7 @@ pub(crate) mod tests {
 
         {
             // The frequency difference is over the tolerance.
-            let mut state = vcpu.save_state().unwrap();
+            let mut state = vcpu.save_state(RegisterPin::Keep).unwrap();
             state.tsc_khz = Some(
                 state.tsc_khz.unwrap()
                     + state.tsc_khz.unwrap() * u32::try_from(TSC_KHZ_TOL_NUMERATOR).unwrap()
@@ -1414,7 +1422,7 @@ pub(crate) mod tests {
     #[test]
     fn test_set_tsc() {
         let (vm, vcpu) = setup_vcpu(0x1000);
-        let mut state = vcpu.save_state().unwrap();
+        let mut state = vcpu.save_state(RegisterPin::Keep).unwrap();
         state.tsc_khz = Some(
             state.tsc_khz.unwrap()
                 + state.tsc_khz.unwrap() * u32::try_from(TSC_KHZ_TOL_NUMERATOR).unwrap()
