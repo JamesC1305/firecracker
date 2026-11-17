@@ -968,6 +968,170 @@ mod tests {
     }
 
     #[test]
+    fn test_request_parse_error_responses() {
+        for (request, status, body) in [
+            (
+                b"GET http://169.254.169.255/ HTTP/2.0\r\n\r\n".as_slice(),
+                "501",
+                "Unsupported HTTP version.",
+            ),
+            (
+                b"GET   HTTP/1.0\r\n\r\n".as_slice(),
+                "400",
+                "Empty URI not allowed.",
+            ),
+        ] {
+            let exchange = assert_rejected(&[request], status);
+            assert_eq!(
+                exchange.responses[0].split_once("\r\n\r\n").unwrap().1,
+                body,
+                "{exchange:?}"
+            );
+        }
+
+        for method in ["POST", "HEAD", "CONNECT", "OPTIONS", "TRACE"] {
+            let request = format!("{method} http://169.254.169.255/ HTTP/1.0\r\n\r\n");
+            let exchange = assert_rejected(&[request.as_bytes()], "501");
+            assert_eq!(
+                exchange.responses[0].split_once("\r\n\r\n").unwrap().1,
+                "Unsupported HTTP method.",
+                "{exchange:?}"
+            );
+        }
+
+        for method in ["PUT", "PATCH", "GET"] {
+            let request = format!("{method} http://169.254.169.255/ HTTP/1.0\r\n\r\n");
+            let exchange = exchange(&[request.as_bytes()]);
+            assert_eq!(exchange.requests, 1, "{exchange:?}");
+            assert_eq!(exchange.responses.len(), 1, "{exchange:?}");
+            assert!(
+                exchange.responses[0].starts_with("HTTP/1.1 200 "),
+                "{exchange:?}"
+            );
+            assert!(!exchange.fin && !exchange.rst, "{exchange:?}");
+        }
+
+        assert_rejected(
+            &[b"PATCH http://localhost/home HTTP/1.1\r\nContent-Length: alpha\r\n\r\n"],
+            "400",
+        );
+
+        let exchange = assert_rejected(
+            &[b"GET http://localhost/home HTTP/1.1\r\n\
+                Accept-Encoding: deflate, compress, *;q=0\r\n\r\n"],
+            "400",
+        );
+        assert_eq!(
+            exchange.responses[0].split_once("\r\n\r\n").unwrap().1,
+            "Invalid value. Key:Accept-Encoding; Value: *;q=0",
+            "{exchange:?}"
+        );
+    }
+
+    #[test]
+    fn test_request_framing_across_segments() {
+        let get = b"GET http://169.254.169.254/ HTTP/1.1\r\nAccept: text/plain\r\n\r\n";
+        let byte_segments = get.chunks(1).collect::<Vec<_>>();
+        for segments in [&[get.as_slice()][..], byte_segments.as_slice()] {
+            let exchange = exchange(segments);
+            assert_eq!(exchange.requests, 1, "{exchange:?}");
+            assert_eq!(exchange.responses.len(), 1, "{exchange:?}");
+            assert!(
+                exchange.responses[0].starts_with("HTTP/1.1 200 "),
+                "{exchange:?}"
+            );
+            assert!(!exchange.fin && !exchange.rst, "{exchange:?}");
+        }
+
+        // No response is sent until the full request has arrived, even after a trailing CR.
+        for len in 0..get.len() {
+            let segments = [&get[..len]];
+            let exchange = exchange(if len == 0 { &[] } else { &segments });
+            assert_eq!(exchange.requests, 0, "prefix {len}: {exchange:?}");
+            assert!(exchange.responses.is_empty(), "prefix {len}: {exchange:?}");
+            assert!(!exchange.fin && !exchange.rst, "prefix {len}: {exchange:?}");
+        }
+
+        // Complete pipelined requests are answered separately.
+        let exchange = exchange(&[&[get.as_slice(), get].concat()]);
+        assert_eq!(exchange.requests, 2, "{exchange:?}");
+        assert_eq!(exchange.responses.len(), 2, "{exchange:?}");
+        for response in &exchange.responses {
+            assert!(response.starts_with("HTTP/1.1 200 "), "{exchange:?}");
+        }
+        assert!(!exchange.fin && !exchange.rst, "{exchange:?}");
+    }
+
+    #[test]
+    fn test_incomplete_second_request_preserves_first_response() {
+        let get = b"GET http://169.254.169.254/ HTTP/1.1\r\nAccept: text/plain\r\n\r\n";
+        let incomplete = b"GET http://169.254.169.254/ HTTP/1.1\r";
+        let exchange = exchange(&[&[get.as_slice(), incomplete].concat()]);
+        assert_eq!(exchange.requests, 1, "{exchange:?}");
+        assert_eq!(exchange.responses.len(), 1, "{exchange:?}");
+        assert!(
+            exchange.responses[0].starts_with("HTTP/1.1 200 "),
+            "{exchange:?}"
+        );
+        assert!(!exchange.fin && !exchange.rst, "{exchange:?}");
+    }
+
+    #[test]
+    fn test_invalid_request_framing_closes_connection() {
+        for invalid in [
+            b"\n".as_slice(),
+            b"GET http://169.254.169.254/ HTTP/1.1\n\n",
+            b"GET http://169.254.169.254/ HTTP/1.1\r\n\n",
+            b"GET http://169.254.169.254/ HTTP/1.1\r\r\n\r\n",
+            b"GET http://169.254.169.254/ HTTP/1.1\r\nX-A: a\nb\r\n\r\n",
+            b"GET http://169.254.169.254/ HTTP/1.1\r\nX-A: a\rb\r\n\r\n",
+        ] {
+            assert_rejected(&[invalid], "400");
+        }
+    }
+
+    #[test]
+    fn test_request_body_headers() {
+        let request = |headers: &str| {
+            format!("PUT http://169.254.169.254/latest/api/token HTTP/1.1\r\n{headers}\r\n")
+        };
+
+        for accepted in [
+            "",
+            "Content-Length: 0\r\n",
+            "content-length:  0 \r\n",
+            "X-metadata-token-ttl-seconds: 60\r\nAccept: text/plain\r\n",
+        ] {
+            let request = request(accepted);
+            let exchange = exchange(&[request.as_bytes()]);
+            assert_eq!(exchange.requests, 1, "{accepted:?}: {exchange:?}");
+            assert_eq!(exchange.responses.len(), 1, "{accepted:?}: {exchange:?}");
+            assert!(
+                exchange.responses[0].starts_with("HTTP/1.1 200 "),
+                "{accepted:?}: {exchange:?}"
+            );
+            assert!(!exchange.fin && !exchange.rst, "{accepted:?}: {exchange:?}");
+        }
+
+        for rejected in [
+            "Content-Length: 1\r\n",
+            "Content-Length: 5\r\nContent-Length: 0\r\n",
+            "Content-Length: 0\r\nContent-Length: 0\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "transfer-encoding: Chunked\r\n",
+            "Transfer-Encoding: gzip, chunked\r\n",
+            "Transfer-Encoding: identity\r\n",
+            "Transfer-Encoding : chunked\r\n",
+            " Transfer-Encoding: chunked\r\n",
+            "Content-Length\u{a0}: 5\r\n",
+            ": 5\r\n",
+            "Content-Length\r\n",
+        ] {
+            assert_rejected(&[request(rejected).as_bytes()], "400");
+        }
+    }
+
+    #[test]
     fn test_unparsable_request_closes_connection() {
         let get = b"GET http://169.254.169.254/ HTTP/1.1\r\n\r\n";
 
