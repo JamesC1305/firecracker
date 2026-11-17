@@ -203,22 +203,24 @@ handler):
 
 1. Invoke the receive functionality of the inner connection object, and append
    any new data to the receive buffer.
-1. If no response is currently pending, attempt to identify the end of the first
-   request in the receive buffer: read its request line, then its header lines
-   until the first empty line, as MMDS requests have no body. Framing does not
-   inspect bytes belonging to the next request. Lines must end with CRLF; a lone
-   CR or LF makes the request one that cannot be parsed (see below). So does any
-   header that could make another HTTP implementation expect a body: a
-   `Transfer-Encoding`, a `Content-Length` other than a single
-   `Content-Length: 0`, or a header name that is not an HTTP token. If no such
-   boundary can be found, and the buffer is full, reset the inner connection
-   (which also causes the endpoint itself to be subsequently removed) because
-   the guest exceeded the maximum allowed request size.
-1. If no response is pending, and we can identify a request in the receive
-   buffer, parse it, free up the associated buffer space (also update the
-   connection receive window), and build an HTTP response, which becomes the
-   current pending response. A header value containing a control character other
-   than HTAB also makes the request one that cannot be parsed.
+1. If no response is currently pending, pass the bytes in the receive buffer
+   that have not been parsed yet to `micro_http`'s `RequestParser`. The parser
+   consumes the request line and header lines as they complete. The endpoint
+   keeps the consumed bytes in the buffer until the whole request has arrived,
+   so the buffer still bounds the size of a request, and framing never inspects
+   bytes belonging to the next request. MMDS requests have no body: the parser
+   is configured to accept none, so a request ends at its first empty line, and
+   one that declares a body cannot be parsed (see below). Neither can a request
+   with a line that does not end with CRLF (a lone CR or LF), a
+   `Transfer-Encoding` header, more than one `Content-Length`, a header name
+   that is not an HTTP token, or a header value containing a control character
+   other than HTAB. If the request is still incomplete and the buffer is full,
+   reset the inner connection (which also causes the endpoint itself to be
+   subsequently removed) because the guest exceeded the maximum allowed request
+   size.
+1. If no response is pending, and the parser returns a complete request, free up
+   the associated buffer space (also update the connection receive window), and
+   build an HTTP response, which becomes the current pending response.
 1. If the request cannot be parsed, the error response becomes the pending
    response instead, and nothing else received on the connection is ever parsed:
    the bytes that follow could belong to the malformed request, such as a body

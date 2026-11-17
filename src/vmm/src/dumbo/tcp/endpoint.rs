@@ -14,7 +14,7 @@
 use std::fmt::Debug;
 use std::num::{NonZeroU16, NonZeroU64, Wrapping};
 
-use micro_http::{Body, Request, RequestError, Response, StatusCode, Version};
+use micro_http::{Body, Request, RequestError, RequestParser, Response, StatusCode, Version};
 use utils::time::timestamp_cycles;
 
 use crate::dumbo::pdu::Incomplete;
@@ -77,6 +77,13 @@ pub struct Endpoint {
     eviction_threshold: u64,
     // Decides what happens to the bytes we receive.
     state: State,
+    // Frames and parses the request at the start of receive_buf. MMDS requests have no body, so
+    // the parser rejects a request that declares one as soon as its headers end.
+    parser: RequestParser,
+    // How many bytes at the start of receive_buf the parser has consumed for the request in
+    // progress. They stay in the buffer, and keep the receive window closed, until the request is
+    // complete, so RCV_BUF_MAX_SIZE still bounds the whole request.
+    parsed_len: usize,
 }
 
 // The "contract" for the Endpoint (if it implemented a trait or something) is something along
@@ -116,6 +123,9 @@ impl Endpoint {
             connection_rto_count_max,
         )?;
 
+        let mut parser = RequestParser::new();
+        parser.set_payload_max_size(0);
+
         Ok(Endpoint {
             receive_buf: [0u8; RCV_BUF_MAX_SIZE as usize],
             receive_buf_left: 0,
@@ -125,6 +135,8 @@ impl Endpoint {
             last_segment_received_timestamp: timestamp_cycles(),
             eviction_threshold: eviction_threshold.get(),
             state: State::Open,
+            parser,
+            parsed_len: 0,
         })
     }
 
@@ -204,11 +216,15 @@ impl Endpoint {
                 if self.response_buf.is_empty() {
                     // There's no pending response currently, so we're back to waiting for a request
                     // to be available in self.receive_buf.
-                    match parse_next_request(&self.receive_buf[..self.receive_buf_left], callback) {
-                        Ok(None) => {}
-                        Ok(Some((len, response))) => {
-                            self.queue_response(&response);
-                            self.consume_request(len);
+                    match self
+                        .parser
+                        .parse(&self.receive_buf[self.parsed_len..self.receive_buf_left])
+                    {
+                        Ok((len, None)) => self.parsed_len += len,
+                        Ok((len, Some(request))) => {
+                            self.queue_response(&callback(request));
+                            self.consume_request(self.parsed_len + len);
+                            self.parsed_len = 0;
                         }
                         Err(err) => {
                             self.queue_response(&error_response(err));
@@ -342,116 +358,6 @@ fn build_response(status_code: StatusCode, body: Body) -> Response {
     response
 }
 
-/// Reads one CRLF-terminated line. Returns `Ok(None)` while the terminator has not arrived, and
-/// an error for a bare CR or LF. On success, returns the line without its CRLF and advances
-/// `input` past the terminator.
-fn read_crlf_line<'a>(input: &mut &'a [u8]) -> Result<Option<&'a [u8]>, RequestError> {
-    let buf = *input;
-
-    // This closure takes a line without a terminating CRLF. Therefore, any matches for CR or LF
-    // represent invalid lines.
-    let contains_invalid_terminator = |line: &[u8]| line.iter().any(|&b| b == b'\r' || b == b'\n');
-
-    match buf.windows(2).position(|w| w == b"\r\n") {
-        Some(end) => {
-            let line = &buf[..end];
-            if contains_invalid_terminator(line) {
-                return Err(RequestError::InvalidRequest);
-            }
-            *input = &buf[end + 2..];
-            Ok(Some(line))
-        }
-        None => {
-            // No CRLF has arrived yet. The last byte may be a CR whose following LF has yet to
-            // arrive. Strip a trailing CR and check that there are no other contained CR or LF
-            // characters, as they would be invalid.
-            let partial = buf.strip_suffix(b"\r").unwrap_or(buf);
-            if contains_invalid_terminator(partial) {
-                return Err(RequestError::InvalidRequest);
-            }
-            Ok(None)
-        }
-    }
-}
-
-/// Finds the end of the HTTP request at the start of `buf`. Request bodies are not supported, so
-/// the request ends with the first empty line. `Ok(None)` means that more bytes are needed.
-///
-/// Lines must end with CRLF. A lone CR or LF is invalid: other HTTP implementations may end a line
-/// there, while micro_http does not, so the two would disagree on which headers the request has.
-/// Headers must be valid for a bodyless MMDS request; see `is_valid_mmds_header`.
-fn frame_request(buf: &[u8]) -> Result<Option<usize>, RequestError> {
-    let mut remaining_input = buf;
-    let Some(_request_line) = read_crlf_line(&mut remaining_input)? else {
-        return Ok(None);
-    };
-    let mut seen_content_length = false;
-    while let Some(line) = read_crlf_line(&mut remaining_input)? {
-        if line.is_empty() {
-            return Ok(Some(buf.len() - remaining_input.len()));
-        }
-        if !is_valid_mmds_header(line, &mut seen_content_length) {
-            return Err(RequestError::InvalidRequest);
-        }
-    }
-    Ok(None)
-}
-
-/// Checks whether one header line is valid for a bodyless MMDS request.
-///
-/// micro_http keeps the last of several `Content-Length` headers, ignores `Transfer-Encoding`
-/// values it does not support, and trims Unicode whitespace from header names, so it may see no
-/// body where an intermediary does. Accept at most one `Content-Length`, which must be `0`, no
-/// `Transfer-Encoding`, and only header names made of RFC 9110 token characters.
-fn is_valid_mmds_header(line: &[u8], seen_content_length: &mut bool) -> bool {
-    let Some(colon) = line.iter().position(|&b| b == b':') else {
-        return false;
-    };
-    let name = &line[..colon];
-    if name.is_empty() || !name.iter().all(|&b| is_token_char(b)) {
-        return false;
-    }
-    if name.eq_ignore_ascii_case(b"transfer-encoding") {
-        return false;
-    }
-    if name.eq_ignore_ascii_case(b"content-length") {
-        if *seen_content_length || line[colon + 1..].trim_ascii() != b"0" {
-            return false;
-        }
-        *seen_content_length = true;
-    }
-    true
-}
-
-/// `tchar` from RFC 9110, section 5.6.2.
-fn is_token_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
-}
-
-/// Parses the request at the start of `buf`, once all of it has arrived, and builds its response
-/// with `callback`. Returns the length of the request and the response, `Ok(None)` if more bytes
-/// are needed, or the error if the request cannot be framed or parsed.
-fn parse_next_request<F: FnOnce(Request) -> Response>(
-    buf: &[u8],
-    callback: F,
-) -> Result<Option<(usize, Response)>, RequestError> {
-    let Some(len) = frame_request(buf)? else {
-        return Ok(None);
-    };
-    let response = parse_request_bytes(&buf[..len], callback)?;
-    Ok(Some((len, response)))
-}
-/// Parses the request bytes and builds a `micro_http::Response` by the given callback function.
-///
-/// If the bytes are not a valid request, `callback` is not called and the parsing error is
-/// returned instead.
-fn parse_request_bytes<F: FnOnce(Request) -> Response>(
-    byte_stream: &[u8],
-    callback: F,
-) -> Result<Response, RequestError> {
-    Request::try_from(byte_stream, None).map(callback)
-}
-
 /// Builds the response for a request that could not be parsed.
 fn error_response(err: RequestError) -> Response {
     match err {
@@ -470,13 +376,13 @@ fn error_response(err: RequestError) -> Response {
         RequestError::HeaderError(err_msg) => {
             build_response(StatusCode::BadRequest, Body::new(err_msg.to_string()))
         }
-        RequestError::InvalidRequest => build_response(
+        // The parser accepts no body, so a request that declares one exceeds its payload limit.
+        // MMDS requests never carry a body, and MMDS answers one that does like any other invalid
+        // request.
+        RequestError::InvalidRequest | RequestError::SizeLimitExceeded(_, _) => build_response(
             StatusCode::BadRequest,
             Body::new("Invalid request.".to_string()),
         ),
-        RequestError::SizeLimitExceeded(_, _) => {
-            build_response(StatusCode::PayloadTooLarge, Body::new(err.to_string()))
-        }
     }
 }
 
@@ -768,88 +674,6 @@ mod tests {
         endpoint.receive_segment(&ack, mock_callback);
         assert!(endpoint.response_buf.is_empty());
         assert_eq!(endpoint.next_segment_status(), NextSegmentStatus::Nothing);
-    }
-
-    #[test]
-    fn test_parse_request_bytes_error() {
-        // Test unsupported HTTP version.
-        let request_bytes = b"GET http://169.254.169.255/ HTTP/2.0\r\n\r\n";
-        let mut expected_response = Response::new(Version::Http11, StatusCode::NotImplemented);
-        expected_response.set_body(Body::new("Unsupported HTTP version.".to_string()));
-        let actual_response =
-            error_response(parse_request_bytes(request_bytes, mock_callback).unwrap_err());
-        assert_eq!(actual_response, expected_response);
-
-        // Test invalid URI (empty URI).
-        let request_bytes = b"GET   HTTP/1.0\r\n\r\n";
-        let mut expected_response = Response::new(Version::Http11, StatusCode::BadRequest);
-        expected_response.set_body(Body::new("Empty URI not allowed.".to_string()));
-        let actual_response =
-            error_response(parse_request_bytes(request_bytes, mock_callback).unwrap_err());
-        assert_eq!(actual_response, expected_response);
-
-        // Test invalid HTTP methods.
-        let invalid_methods = ["POST", "HEAD", "CONNECT", "OPTIONS", "TRACE"];
-        for method in invalid_methods.iter() {
-            let request_bytes = format!("{} http://169.254.169.255/ HTTP/1.0\r\n\r\n", method);
-            let mut expected_response = Response::new(Version::Http11, StatusCode::NotImplemented);
-            expected_response.set_body(Body::new("Unsupported HTTP method.".to_string()));
-            let actual_response = error_response(
-                parse_request_bytes(request_bytes.as_bytes(), mock_callback).unwrap_err(),
-            );
-            assert_eq!(actual_response, expected_response);
-        }
-
-        // Test valid methods.
-        let valid_methods = ["PUT", "PATCH", "GET"];
-        for method in valid_methods.iter() {
-            let request_bytes = format!("{} http://169.254.169.255/ HTTP/1.0\r\n\r\n", method);
-            let expected_response = Response::new(Version::Http11, StatusCode::OK);
-            let actual_response =
-                parse_request_bytes(request_bytes.as_bytes(), mock_callback).unwrap();
-            assert_eq!(actual_response, expected_response);
-        }
-
-        // Test invalid HTTP format.
-        let request_bytes = b"GET / HTTP/1.1\r\n";
-        let mut expected_response = Response::new(Version::Http11, StatusCode::BadRequest);
-        expected_response.set_body(Body::new("Invalid request.".to_string()));
-        let actual_response =
-            error_response(parse_request_bytes(request_bytes, mock_callback).unwrap_err());
-        assert_eq!(actual_response, expected_response);
-
-        // Test invalid HTTP headers. micro_http decodes no transfer coding, so it rejects
-        // Transfer-Encoding instead of ignoring the body it would frame.
-        let request_bytes = b"PATCH http://localhost/home HTTP/1.1\r\n\
-                                 Expect: 100-continue\r\n\
-                                 Transfer-Encoding: identity; q=0\r\n\
-                                 Content-Length: 26\r\n\r\nthis is not\n\r\na json \nbody";
-        let actual_response =
-            error_response(parse_request_bytes(request_bytes, mock_callback).unwrap_err());
-        assert_eq!(actual_response.status(), StatusCode::BadRequest);
-
-        let request_bytes = b"PATCH http://localhost/home HTTP/1.1\r\n\
-                                 Expect: 100-continue\r\n\
-                                 Content-Length: alpha\r\n\r\nthis is not\n\r\na json \nbody";
-        let mut expected_response = Response::new(Version::Http11, StatusCode::BadRequest);
-        expected_response.set_body(Body::new(
-            "Invalid value. Key:Content-Length; Value: alpha".to_string(),
-        ));
-        let actual_response =
-            error_response(parse_request_bytes(request_bytes, mock_callback).unwrap_err());
-        assert_eq!(actual_response, expected_response);
-
-        let request_bytes = b"PATCH http://localhost/home HTTP/1.1\r\n\
-                                 Expect: 100-continue\r\n\
-                                 Content-Length: 67\r\n\
-                                 Accept-Encoding: deflate, compress, *;q=0\r\n\r\nthis is not\n\r\na json \nbody";
-        let mut expected_response = Response::new(Version::Http11, StatusCode::BadRequest);
-        expected_response.set_body(Body::new(
-            "Invalid value. Key:Accept-Encoding; Value: *;q=0".to_string(),
-        ));
-        let actual_response =
-            error_response(parse_request_bytes(request_bytes, mock_callback).unwrap_err());
-        assert_eq!(actual_response, expected_response);
     }
 
     // What a client saw while talking to an endpoint.
@@ -1193,55 +1017,6 @@ mod tests {
     }
 
     #[test]
-    fn test_frame_request() {
-        let get = b"GET http://169.254.169.254/ HTTP/1.1\r\nAccept: text/plain\r\n\r\n";
-        assert_eq!(frame_request(get), Ok(Some(get.len())));
-        // Only the first of several requests is framed.
-        assert_eq!(
-            frame_request(&[get.as_slice(), get].concat()),
-            Ok(Some(get.len()))
-        );
-        for len in 0..get.len() {
-            assert_eq!(frame_request(&get[..len]), Ok(None), "{len}");
-        }
-
-        // The next request is framed separately, even if it is malformed or incomplete.
-        for (next, expected) in [
-            (
-                b"GET http://169.254.169.254/ HTTP/1.1\n\n".as_slice(),
-                Err(RequestError::InvalidRequest),
-            ),
-            (
-                b"GET http://169.254.169.254/ HTTP/1.1\rX\r\n\r\n".as_slice(),
-                Err(RequestError::InvalidRequest),
-            ),
-            (
-                b"GET http://169.254.169.254/ HTTP/1.1\r".as_slice(),
-                Ok(None),
-            ),
-        ] {
-            let pipelined = [get.as_slice(), next].concat();
-            assert_eq!(frame_request(&pipelined), Ok(Some(get.len())), "{next:?}");
-            assert_eq!(frame_request(&pipelined[get.len()..]), expected, "{next:?}");
-        }
-
-        for invalid in [
-            b"\n".as_slice(),
-            b"GET http://169.254.169.254/ HTTP/1.1\n\n",
-            b"GET http://169.254.169.254/ HTTP/1.1\r\n\n",
-            b"GET http://169.254.169.254/ HTTP/1.1\r\r\n\r\n",
-            b"GET http://169.254.169.254/ HTTP/1.1\r\nX-A: a\nb\r\n\r\n",
-            b"GET http://169.254.169.254/ HTTP/1.1\r\nX-A: a\rb\r\n\r\n",
-        ] {
-            assert_eq!(
-                frame_request(invalid),
-                Err(RequestError::InvalidRequest),
-                "{invalid:?}"
-            );
-        }
-    }
-
-    #[test]
     fn test_malformed_second_request_preserves_first_response() {
         let get = b"GET http://169.254.169.254/ HTTP/1.1\r\n\r\n";
         for invalid in [
@@ -1274,8 +1049,7 @@ mod tests {
 
     #[test]
     fn test_lone_line_feed_closes_connection() {
-        // micro_http only ends header lines at CRLF, so it reads this Content-Length as part of
-        // the X-A value, while an implementation that ends lines at LF sees a body.
+        // An implementation that ends lines at LF sees this Content-Length, and so a body.
         let get = b"GET http://169.254.169.254/ HTTP/1.1\r\n\r\n";
         let hidden_body = format!(
             "PUT http://169.254.169.254/latest/api/token HTTP/1.1\r\n\
@@ -1286,55 +1060,12 @@ mod tests {
     }
 
     #[test]
-    fn test_frame_request_body_headers() {
-        let request = |headers: &str| {
-            format!("PUT http://169.254.169.254/latest/api/token HTTP/1.1\r\n{headers}\r\n")
-        };
-
-        for accepted in [
-            "",
-            "Content-Length: 0\r\n",
-            "content-length:  0 \r\n",
-            "X-metadata-token-ttl-seconds: 60\r\nAccept: text/plain\r\n",
-        ] {
-            let request = request(accepted);
-            assert_eq!(
-                frame_request(request.as_bytes()),
-                Ok(Some(request.len())),
-                "{accepted:?}"
-            );
-        }
-
-        for rejected in [
-            "Content-Length: 1\r\n",
-            "Content-Length: 5\r\nContent-Length: 0\r\n",
-            "Content-Length: 0\r\nContent-Length: 0\r\n",
-            "Transfer-Encoding: chunked\r\n",
-            "transfer-encoding: Chunked\r\n",
-            "Transfer-Encoding: gzip, chunked\r\n",
-            "Transfer-Encoding: identity\r\n",
-            // Header names must be tokens, without whitespace around them.
-            "Transfer-Encoding : chunked\r\n",
-            " Transfer-Encoding: chunked\r\n",
-            "Content-Length\u{a0}: 5\r\n",
-            ": 5\r\n",
-            "Content-Length\r\n",
-        ] {
-            assert_eq!(
-                frame_request(request(rejected).as_bytes()),
-                Err(RequestError::InvalidRequest),
-                "{rejected:?}"
-            );
-        }
-    }
-
-    #[test]
     fn test_body_headers_close_connection() {
         let get = b"GET http://169.254.169.254/ HTTP/1.1\r\n\r\n";
         let put = "PUT http://169.254.169.254/latest/api/token HTTP/1.1\r\n";
 
-        // micro_http accepts this request and ignores its chunked body. The chunk data starts
-        // with CRLF so that, once the chunk size line is skipped, it reads as a request.
+        // A parser that ignored Transfer-Encoding would take the chunk data, which starts with
+        // CRLF after the chunk size line, for a request of its own.
         let mut chunked = format!(
             "{put}Transfer-Encoding: chunked\r\n\r\n{:x}\r\n\r\n",
             get.len() + 2
@@ -1344,7 +1075,7 @@ mod tests {
         chunked.extend_from_slice(b"\r\n0\r\n\r\n");
         assert_rejected(&[&chunked], "400");
 
-        // micro_http keeps the last Content-Length, an intermediary may use the first one.
+        // Implementations disagree on which of several Content-Length headers applies.
         let mut duplicate = format!(
             "{put}Content-Length: {}\r\nContent-Length: 0\r\n\r\n",
             get.len()

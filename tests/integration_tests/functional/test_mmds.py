@@ -495,14 +495,14 @@ def rejected_request(framing, body):
         f"X-metadata-token-ttl-seconds: 60\r\n"
     ).encode()
     if framing == "bare_lf":
-        # micro_http ends header lines only at CRLF, so it reads the whole of
-        # this as the X-Pad value and sees no Content-Length at all.
+        # An implementation that ends lines at LF sees a Content-Length here,
+        # and so `body`.
         return (
             headers + f"X-Pad: pad\nContent-Length: {len(body)}\r\n\r\n".encode() + body
         )
     if framing == "duplicate_content_length":
-        # micro_http keeps the last Content-Length and so sees no body, while
-        # an implementation that keeps the first one sees `body`.
+        # An implementation that keeps the first of several Content-Length
+        # headers sees `body`; one that keeps the last sees no body.
         return (
             headers
             + f"Content-Length: {len(body)}\r\nContent-Length: 0\r\n\r\n".encode()
