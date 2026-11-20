@@ -367,6 +367,7 @@ pub fn build_microvm_for_boot(
         machine_config: vm_resources.machine_config.clone(),
         boot_source_config: vm_resources.boot_source.config.clone(),
         shutdown_exit_code: None,
+        vcpu_registers_pinned: false,
         vm,
         device_manager,
     };
@@ -557,6 +558,9 @@ pub fn build_microvm_from_snapshot(
             .restore_state(state)
             .map_err(VcpuError::VcpuResponse)
             .map_err(BuildMicrovmFromSnapshotError::RestoreVcpus)?;
+        if microvm_state.vcpu_registers_pinned {
+            vcpu.kvm_vcpu.pin_saved_registers(state);
+        }
     }
 
     // Restoring TSC MSRs separately can leave different offsets on each vCPU.
@@ -607,6 +611,7 @@ pub fn build_microvm_from_snapshot(
         machine_config: vm_resources.machine_config.clone(),
         boot_source_config: vm_resources.boot_source.config.clone(),
         shutdown_exit_code: None,
+        vcpu_registers_pinned: microvm_state.vcpu_registers_pinned,
         vm,
         device_manager,
     };
@@ -1016,6 +1021,7 @@ pub(crate) mod tests {
             machine_config: MachineConfig::default(),
             boot_source_config: BootSourceConfig::default(),
             shutdown_exit_code: None,
+            vcpu_registers_pinned: false,
             vm: Vm::Kvm(Arc::new(vm)),
             device_manager: default_device_manager(),
         }
@@ -1038,6 +1044,7 @@ pub(crate) mod tests {
             machine_config: MachineConfig::default(),
             boot_source_config: BootSourceConfig::default(),
             shutdown_exit_code: None,
+            vcpu_registers_pinned: false,
             vm: Vm::Kvm(vm),
             device_manager,
         }

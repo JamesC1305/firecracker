@@ -142,35 +142,21 @@ mod tests {
     fn test_parse_put_snapshot() {
         use std::path::PathBuf;
 
-        use vmm::vmm_config::snapshot::SnapshotType;
-
-        let body = r#"{
-            "snapshot_type": "Diff",
-            "snapshot_path": "foo",
-            "mem_file_path": "bar"
-        }"#;
-        let expected_config = CreateSnapshotParams {
-            snapshot_type: SnapshotType::Diff,
-            snapshot_path: PathBuf::from("foo"),
-            mem_file_path: PathBuf::from("bar"),
-            sync_snapshot_files: true,
-        };
-        assert_eq!(
-            vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
-            VmmAction::CreateSnapshot(expected_config)
-        );
+        use vmm::vmm_config::snapshot::{SnapshotType, VcpuRegisterPinning};
 
         let body = r#"{
             "snapshot_type": "Diff",
             "snapshot_path": "foo",
             "mem_file_path": "bar",
-            "sync_snapshot_files": false
+            "sync_snapshot_files": false,
+            "vcpu_registers": "Pin"
         }"#;
         let expected_config = CreateSnapshotParams {
             snapshot_type: SnapshotType::Diff,
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
             sync_snapshot_files: false,
+            vcpu_registers: VcpuRegisterPinning::Pin,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
@@ -186,11 +172,19 @@ mod tests {
             snapshot_path: PathBuf::from("foo"),
             mem_file_path: PathBuf::from("bar"),
             sync_snapshot_files: true,
+            vcpu_registers: VcpuRegisterPinning::Inherit,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
             VmmAction::CreateSnapshot(expected_config)
         );
+
+        let body = r#"{
+            "snapshot_path": "foo",
+            "mem_file_path": "bar",
+            "vcpu_registers": "Unpin"
+        }"#;
+        parse_put_snapshot(&Body::new(body), Some("create")).unwrap_err();
 
         let invalid_body = r#"{
             "invalid_field": "foo",
