@@ -5,7 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -160,8 +160,9 @@ pub struct KvmVcpu {
     pub fd: VcpuFd,
     /// Vcpu peripherals, such as buses
     pub peripherals: Peripherals,
-    /// The list of MSRs to include in a VM snapshot, in the same order as KVM returned them
-    /// from KVM_GET_MSR_INDEX_LIST
+    /// The list of MSRs to include in a VM snapshot: the ones KVM returned from
+    /// KVM_GET_MSR_INDEX_LIST, in the same order, followed by the ones this vCPU was booted or
+    /// restored with.
     msrs_to_save: Vec<u32>,
     /// Size in bytes requiring to hold the dynamically-sized `kvm_xsave` struct.
     ///
@@ -737,7 +738,7 @@ impl KvmVcpu {
     }
 
     /// Use provided state to populate KVM internal state.
-    pub fn restore_state(&self, state: &VcpuState) -> Result<(), KvmVcpuError> {
+    pub fn restore_state(&mut self, state: &VcpuState) -> Result<(), KvmVcpuError> {
         // Ordering requirements:
         //
         // KVM_GET_VCPU_EVENTS/KVM_SET_VCPU_EVENTS is unsafe if other vCPUs are
@@ -795,6 +796,20 @@ impl KvmVcpu {
             let nmsrs = self.fd.set_msrs(msrs).map_err(KvmVcpuError::VcpuSetMsrs)?;
             if nmsrs < msrs.as_fam_struct_ref().nmsrs as usize {
                 return Err(KvmVcpuError::VcpuSetMsrsIncomplete);
+            }
+        }
+        // Booting adds MSRs that the host does not list, from the CPU template and the guest
+        // CPUID. Keep saving the ones this vCPU was restored with, or its next snapshot loses
+        // them.
+        let mut seen: HashSet<u32> = self.msrs_to_save.iter().copied().collect();
+        let restored_indices = state
+            .saved_msrs
+            .iter()
+            .flat_map(|msrs| msrs.as_slice())
+            .map(|entry| entry.index);
+        for index in restored_indices {
+            if seen.insert(index) {
+                self.msrs_to_save.push(index);
             }
         }
         self.fd
@@ -1098,7 +1113,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_vcpu_cpuid_restore() {
-        let (vm, vcpu) = setup_vcpu(0x10000);
+        let (vm, mut vcpu) = setup_vcpu(0x10000);
         vcpu.fd.set_cpuid2(&vm.kvm().supported_cpuid).unwrap();
 
         // Mutate the CPUID.
@@ -1116,7 +1131,7 @@ pub(crate) mod tests {
         drop(vcpu);
 
         // Restore the state into a new vcpu.
-        let (_vm, vcpu) = setup_vcpu(0x10000);
+        let (_vm, mut vcpu) = setup_vcpu(0x10000);
         let result2 = vcpu.restore_state(&state);
         assert!(result2.is_ok(), "{}", result2.unwrap_err());
 
@@ -1131,6 +1146,53 @@ pub(crate) mod tests {
             })
             .unwrap();
         assert!(leaf3.result.eax == 0x1234_5678);
+    }
+
+    #[test]
+    fn test_vcpu_restore_keeps_saved_msrs() {
+        use crate::arch::x86_64::generated::msr_index::MSR_STAR;
+
+        let (vm, mut vcpu) = setup_vcpu(0x10000);
+        configure_vcpu(
+            &vm,
+            &mut vcpu,
+            &CustomCpuTemplate::default(),
+            EntryPoint {
+                entry_addr: GuestAddress(0),
+                protocol: BootProtocol::LinuxBoot,
+                setup_header: None,
+            },
+        )
+        .unwrap();
+        // Booting adds MSRs that the host does not list, such as the MTRR ones that follow from
+        // CPUID.
+        let state = vcpu.save_state().unwrap();
+
+        let (_restored_vm, mut restored_vcpu) = setup_vcpu(0x10000);
+        // Make sure of one such MSR, whatever this host lists.
+        restored_vcpu
+            .msrs_to_save
+            .retain(|index| *index != MSR_STAR);
+        restored_vcpu.restore_state(&state).unwrap();
+        let restored_state = restored_vcpu.save_state().unwrap();
+
+        let msr_indices = |state: &VcpuState| {
+            state
+                .saved_msrs
+                .iter()
+                .flat_map(|msrs| msrs.as_slice())
+                .map(|entry| entry.index)
+                .collect::<HashSet<_>>()
+        };
+        let mut dropped: Vec<_> = msr_indices(&state)
+            .difference(&msr_indices(&restored_state))
+            .copied()
+            .collect();
+        dropped.sort_unstable();
+        assert!(
+            dropped.is_empty(),
+            "MSRs missing from the snapshot of the restored vCPU: {dropped:x?}"
+        );
     }
 
     #[test]
