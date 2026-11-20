@@ -54,9 +54,10 @@ and this project adheres to
 - Added `vcpu_registers` to `PUT /snapshot/create`. Use `Pin` on the oldest
   supported host to pin Firecracker's normal snapshot register set (on x86_64,
   its snapshot MSRs, not every KVM MSR). After restore, both `Inherit` (the
-  default) and `Pin` preserve the ordered register IDs. Without a pin, `Inherit`
-  leaves the snapshot unpinned. Neither mode changes the running microVM's pin.
-  Storing the pin in the snapshot bumps the snapshot version to `14.0.0`.
+  default) and `Pin` preserve the ordered register IDs and any pinned aarch64
+  CPU feature ID values. Without a pin, `Inherit` leaves the snapshot unpinned.
+  Neither mode changes the running microVM's pin. Storing the pin in the
+  snapshot bumps the snapshot version to `14.0.0`.
 
 ### Changed
 

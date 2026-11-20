@@ -420,7 +420,9 @@ the **output snapshot** pins the register set:
 
 On x86_64, the pin covers only the MSR list. The normal set is the MSRs
 Firecracker would save for this microVM on this host, not every MSR KVM reports.
-Other vCPU state, such as CPUID and xsave, is saved as usual.
+Other vCPU state, such as CPUID and xsave, is saved as usual. On aarch64, an
+inherited pin also preserves the snapshot's CPU feature ID register **values**:
+a newer kernel may report values an older kernel rejects.
 
 Create the base snapshot with `Pin` on the oldest host kernel you need to
 support. Descendants of a pinned snapshot keep its register set; no load option
