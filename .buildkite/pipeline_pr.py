@@ -1,139 +1,46 @@
 #!/usr/bin/env python3
-# Copyright 2022 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generate Buildkite pipelines dynamically"""
+"""Scratch: run only the cross-kernel snapshot round trip. Not for merging.
 
-from common import (
-    BKPipeline,
-    ci_artifacts_change_mode,
-    get_changed_files,
-    run_all_tests,
-)
+The personal PR pipeline always uploads this script's output, so it emits the
+cross-kernel pipeline instead, keeping the build step, the round-trip group and
+the snapshot create steps the round trip depends on.
+"""
 
-# Buildkite default job priority is 0. Setting this to 1 prioritizes PRs over
-# scheduled jobs and other batch jobs.
-DEFAULT_PRIORITY = 1
-DEFAULTS_PERF = {
-    "priority": DEFAULT_PRIORITY + 1,
-    "agents": {"ag": 1},
-}
+import json
+import subprocess
+import sys
+from pathlib import Path
 
-changed_files = get_changed_files()
-DOC_ONLY_CHANGE = False
-if changed_files and all(f.suffix == ".md" for f in changed_files):
-    DOC_ONLY_CHANGE = True
-pipeline = BKPipeline(
-    priority=DEFAULT_PRIORITY,
-    timeout_in_minutes=45,
-    with_build_step=not DOC_ONLY_CHANGE,
-)
-
-pipeline.add_step(
-    {
-        "command": "./tools/devtool -y checkstyle",
-        "label": "style",
-    },
-    depends_on_build=False,
-)
-
-# run sanity build of devtool if Dockerfile is changed
-if any(x.parent.name == "devctr" for x in changed_files):
-    pipeline.build_group_per_arch(
-        "dev-container-sanity-build",
-        "./tools/devtool -y build_devctr && DEVCTR_IMAGE_TAG=latest ./tools/devtool test --no-build -- integration_tests/functional/test_api.py",
-    )
-
-# run sanity build of the CI guest artifacts (kernels/rootfs) if any of their
-# source files changed. Rebuild only the affected half when possible, pulling
-# the unchanged half from S3 so a guest can still boot.
-artifacts_mode = ci_artifacts_change_mode(changed_files)
-if artifacts_mode is not None:
-    pipeline.build_group_per_arch(
-        "ci-artifacts-sanity-build",
-        f"./tools/devtool -y build_ci_artifacts {artifacts_mode} && "
-        f"./tools/devtool -y stage_ci_artifacts {artifacts_mode} && "
-        "./tools/devtool -y test --no-build -- integration_tests/functional/test_api.py",
-        timeout_in_minutes=75,
-    )
-
-if any(
-    x.parent.name == "tools" and ("release" in x.name or x.name == "devtool")
-    for x in changed_files
-):
-    pipeline.build_group_per_arch(
-        "release-sanity-build",
-        "./tools/devtool -y make_release",
-        depends_on_build=False,
-    )
-
-if not pipeline.args.no_kani and (
-    not changed_files
-    or any(x.suffix in [".rs", ".toml", ".lock"] for x in changed_files)
-    or any(x.parent.name == "devctr" for x in changed_files)
-    or any(x.name == "test_kani.py" for x in changed_files)
-):
-    kani_grp = pipeline.build_group(
-        "kani",
-        "./tools/devtool -y test --no-build -- ../tests/integration_tests/test_kani.py -n auto",
-        # Kani step default
-        # Kani runs fastest on m6a.metal (x86) and m9g.metal-48xl (aarch64)
-        instances=["m6a.metal", "m9g.metal-48xl"],
-        platforms=[("al2023", "linux_6.1")],
-        timeout_in_minutes=300,
-        **DEFAULTS_PERF,
-        depends_on_build=False,
-    )
+ROUNDTRIP_GROUP = "snapshot-roundtrip-across-kernels"
+CREATE_GROUPS = ("snapshot-create", "snapshot-create-aarch64")
+DROPPED_GROUPS = ("snapshot-restore-across-instances-and-kernels",)
 
 
-def build_suite(label, tests, devtool_opts=None, enclave=False, **kwargs):
-    """Build a test suite group on metal and, if `enclave`, on enclave hosts.
+def roundtrip_only(cross):
+    """Filter the cross-kernel pipeline down to the round trip."""
+    roundtrip = next(s for s in cross["steps"] if s.get("group") == ROUNDTRIP_GROUP)
+    needed = {key for step in roundtrip["steps"] for key in step["depends_on"]}
+    kept = []
+    for step in cross["steps"]:
+        group = step.get("group")
+        if group in DROPPED_GROUPS:
+            continue
+        if group in CREATE_GROUPS:
+            step["steps"] = [s for s in step["steps"] if s["key"] in needed]
+        kept.append(step)
+    cross["steps"] = kept
+    return cross
 
-    The `<label>-enclave` group runs the same tests, without the metal devtool
-    options. KVM-pinned tests are deselected at collection on enclave hosts.
-    """
-    pipeline.build_group(
-        label,
-        pipeline.devtool_test(devtool_opts=devtool_opts, pytest_opts=tests),
-        **kwargs,
-    )
-    if enclave:
-        pipeline.build_group_enclave(label, tests, **kwargs)
+
+def main():
+    """Print the filtered pipeline."""
+    script = Path(__file__).parent / "pipeline_cross.py"
+    cross = json.loads(subprocess.check_output([sys.executable, str(script)]))
+    print(json.dumps(roundtrip_only(cross), indent=4))
 
 
-if run_all_tests(changed_files):
-    pipeline.build_group(
-        "build",
-        pipeline.devtool_test(pytest_opts="integration_tests/build/"),
-        depends_on_build=False,
-    )
-
-    build_suite(
-        "functional-and-security",
-        "-n 32 --dist worksteal integration_tests/{{functional,security}}",
-        enclave=True,
-    )
-
-    # Tests marked `serial` need the host to themselves (timing assertions,
-    # CPU pinning); the rest run in parallel on the regular agents, in a group
-    # of their own so the two overlap. They need a hugetlbfs pool, which
-    # `--huge-pages` sets up once per host. `-m` on the command line replaces
-    # the one in pytest.ini, so repeat its exclusions.
-    PR_MARKERS = "not nonci and not no_block_pr"
-    build_suite(
-        "performance",
-        f"-m 'serial and {PR_MARKERS}' ../tests/integration_tests/performance/",
-        devtool_opts="--performance -c 1-10 -m 0",
-        enclave=True,
-        **DEFAULTS_PERF,
-    )
-
-    # No enclave hosts: none of the parallel PR performance tests supports the
-    # enclave backend, so they would collect no tests.
-    build_suite(
-        "performance-parallel",
-        f"-m 'not serial and {PR_MARKERS}' -n 12 --dist worksteal ../tests/integration_tests/performance/",
-        devtool_opts="--huge-pages",
-    )
-
-print(pipeline.to_json())
+if __name__ == "__main__":
+    main()
